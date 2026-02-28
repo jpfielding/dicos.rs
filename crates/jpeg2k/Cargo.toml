@@ -1,0 +1,13 @@
+[package]
+name = "jpeg2k"
+description = "JPEG 2000 Part-1 lossless codec (ITU-T T.800)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

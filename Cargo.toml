@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dicos",
+    "crates/jpegrle",
+    "crates/jpegls",
+    "crates/jpegli",
+    "crates/jpeg2k",
+    "crates/roxel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+thiserror = "2"
+byteorder = "1"
+log = "0.4"
+env_logger = "0.11"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Workspace crates
+dicos = { path = "crates/dicos" }
+jpegrle = { path = "crates/jpegrle" }
+jpegls = { path = "crates/jpegls" }
+jpegli = { path = "crates/jpegli" }
+jpeg2k = { path = "crates/jpeg2k" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Viewer
+wgpu = "27"
+winit = "0.30"
+egui = "0.33"
+egui-wgpu = { version = "0.33", features = ["winit"] }
+egui-winit = "0.33"
+glam = "0.29"
+pollster = "0.4"
+rfd = "0.15"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Benchmarks
+criterion = { version = "0.5", features = ["html_reports"] }

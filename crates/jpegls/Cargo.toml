@@ -1,0 +1,13 @@
+[package]
+name = "jpegls"
+description = "JPEG-LS lossless codec (ISO/IEC 14495-1 / ITU-T T.87)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

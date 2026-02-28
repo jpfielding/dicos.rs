@@ -1,0 +1,108 @@
+{
+  "threats": [
+    {
+      "label": "Grenade 0",
+      "category": "EXPLOSIVE",
+      "flag": "HIGH_THREAT",
+      "probability": 0.95,
+      "blender_objects": [
+        "CT_Grenade_0_Body",
+        "CT_Grenade_0_Filler",
+        "CT_Grenade_0_Fuse",
+        "CT_Grenade_0_Pin",
+        "CT_Grenade_0_Spoon"
+      ],
+      "bbox_mm": {
+        "min": [
+          -197.26189970970154,
+          -12.766451574862003,
+          56.09972029924393
+        ],
+        "max": [
+          -147.26190268993378,
+          37.23354637622833,
+          132.0997178554535
+        ]
+      }
+    },
+    {
+      "label": "Grenade 1",
+      "category": "EXPLOSIVE",
+      "flag": "HIGH_THREAT",
+      "probability": 0.95,
+      "blender_objects": [
+        "CT_Grenade_1_Body",
+        "CT_Grenade_1_Filler",
+        "CT_Grenade_1_Fuse",
+        "CT_Grenade_1_Pin",
+        "CT_Grenade_1_Spoon"
+      ],
+      "bbox_mm": {
+        "min": [
+          -147.26190268993378,
+          -31.694822013378143,
+          56.09972029924393
+        ],
+        "max": [
+          -97.26190567016602,
+          18.305178731679916,
+          132.0997178554535
+        ]
+      }
+    },
+    {
+      "label": "Gun 0",
+      "category": "METAL",
+      "flag": "HIGH_THREAT",
+      "probability": 0.95,
+      "blender_objects": [
+        "CT_Gun_0_Barrel",
+        "CT_Gun_0_Frame",
+        "CT_Gun_0_Grip",
+        "CT_Gun_0_Magazine",
+        "CT_Gun_0_Slide",
+        "CT_Gun_0_Spring",
+        "CT_Gun_0_TriggerGuard"
+      ],
+      "bbox_mm": {
+        "min": [
+          1.2669246643781662,
+          -95.59734910726547,
+          22.50000275671482
+        ],
+        "max": [
+          118.36801469326019,
+          -55.02811446785927,
+          90.99999815225601
+        ]
+      }
+    },
+    {
+      "label": "Gun 1",
+      "category": "METAL",
+      "flag": "HIGH_THREAT",
+      "probability": 0.95,
+      "blender_objects": [
+        "CT_Gun_1_Barrel",
+        "CT_Gun_1_Frame",
+        "CT_Gun_1_Grip",
+        "CT_Gun_1_Magazine",
+        "CT_Gun_1_Slide",
+        "CT_Gun_1_Spring",
+        "CT_Gun_1_TriggerGuard"
+      ],
+      "bbox_mm": {
+        "min": [
+          92.48453378677368,
+          -31.884141266345978,
+          62.5000074505806
+        ],
+        "max": [
+          225.26443004608154,
+          96.13221138715744,
+          131.00001215934753
+        ]
+      }
+    }
+  ]
+}

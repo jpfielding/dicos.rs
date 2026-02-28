@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# called from ${HOME}/.bashrc
+
+RESET="\[$(tput sgr0)\]"
+GREEN="\[$(tput setaf 2)\]"
+CYAN="\[$(tput setaf 14)\]"
+WHITE="\[$(tput setaf 15)\]"
+BLUE="\[$(tput setaf 33)\]"
+PURPLE="\[$(tput setaf 125)\]"
+RED="\[$(tput setaf 160)\]"
+YELLOW="\[$(tput setaf 226)\]"
+
+parse_git_branch() {
+     git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/'
+}
+
+function ps1_prompt() {
+    datetime="${CYAN}\D{%Y.%m.%d} T \t${RESET}"
+    user="${GREEN}\u${RESET}"
+    host="${PURPLE}\h${RESET}"
+    arch="${WHITE}$(arch)${RESET}"
+    path="${BLUE}\W${RESET}"
+    git_br="${YELLOW}git(${RED}$(parse_git_branch)${YELLOW})${RESET}"
+    export PS1="| $datetime | $user @ $host ($arch) | $path | $git_br | \n-> "
+}
+# called prior to PS1 being shown
+export PROMPT_COMMAND=ps1_prompt
+
+# update go version in place
+GoToVersion() {
+    VERSION="$1"
+    pushd ${HOME}/sdk && \
+    go install golang.org/dl/go${VERSION}@latest && \
+    go${VERSION} download && \
+    rm go && ln -s go${VERSION} go
+    popd
+}
+
+# personal prefs
+alias ls='ls --color'
+alias ll='ls -al'

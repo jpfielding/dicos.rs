@@ -1,0 +1,32 @@
+[package]
+name = "roxel"
+description = "GPU-accelerated DICOS volume viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "roxel"
+path = "src/main.rs"
+
+[dependencies]
+dicos = { workspace = true, features = ["all-codecs"] }
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+pollster.workspace = true
+
+# GPU
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+
+# File dialog
+rfd.workspace = true
+
+# Data casting
+bytemuck.workspace = true

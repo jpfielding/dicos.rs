@@ -1,0 +1,41 @@
+[package]
+name = "dicos"
+description = "NEMA IIC 1 v04-2023 (DICOS) core library for security screening imaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dicosctl"
+path = "src/bin/dicosctl.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+all-codecs = ["rle", "jpegls", "jpegli", "jpeg2k"]
+rle = ["dep:jpegrle"]
+jpegls = ["dep:jpegls"]
+jpegli = ["dep:jpegli"]
+jpeg2k = ["dep:jpeg2k"]
+cli = ["dep:clap", "dep:env_logger", "dep:serde", "dep:serde_json", "all-codecs"]
+
+[dependencies]
+thiserror.workspace = true
+byteorder.workspace = true
+log.workspace = true
+
+# Optional codec dependencies (behind feature flags)
+jpegrle = { workspace = true, optional = true }
+jpegls = { workspace = true, optional = true }
+jpegli = { workspace = true, optional = true }
+jpeg2k = { workspace = true, optional = true }
+
+# CLI dependencies (behind cli feature)
+clap = { workspace = true, optional = true }
+env_logger = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true

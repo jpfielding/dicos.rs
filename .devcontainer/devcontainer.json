@@ -1,0 +1,78 @@
+{
+  "name": "${localWorkspaceFolderBasename}",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "target": "user",
+    "args": {
+      "USERNAME": "${localEnv:USER:ferris}"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "eamodio.gitlens",
+        "ms-vscode.hexeditor",
+        "Anthropic.claude-code",
+        "openai.chatgpt"
+      ]
+    }
+  },
+  "mounts": [
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.gitconfig",
+      "target": "/home/${localEnv:USER:ferris}/.gitconfig"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.netrc",
+      "target": "/home/${localEnv:USER:ferris}/.netrc"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.git-credentials",
+      "target": "/home/${localEnv:USER:ferris}/.git-credentials"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.ssh",
+      "target": "/home/${localEnv:USER:ferris}/.ssh"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.gemini",
+      "target": "/home/${localEnv:USER:ferris}/.gemini"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.claude",
+      "target": "/home/${localEnv:USER:ferris}/.claude"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.codex",
+      "target": "/home/${localEnv:USER:ferris}/.codex"
+    },
+    {
+      "type": "bind",
+      "source": "${localEnv:HOME}/.bash_history_${localWorkspaceFolderBasename}",
+      "target": "/home/${localEnv:USER:ferris}/.bash_history"
+    }
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workdir/${localWorkspaceFolderBasename},type=bind,consistency=cached",
+  "workspaceFolder": "/workdir/${localWorkspaceFolderBasename}",
+  "initializeCommand": {
+    "netrc": "touch ${localEnv:HOME}/.netrc",
+    "ssh dir": "mkdir -p ${localEnv:HOME}/.ssh",
+    "kube dir": "mkdir -p ${localEnv:HOME}/.kube",
+    "gitconfig": "touch ${localEnv:HOME}/.gitconfig",
+    "git creds": "touch ${localEnv:HOME}/.git-credentials",
+    "gemini": "mkdir -p ${localEnv:HOME}/.gemini || true",
+    "claude": "mkdir -p ${localEnv:HOME}/.claude || true",
+    "codex": "mkdir -p ${localEnv:HOME}/.codex || true",
+    "bash history": "touch ${localEnv:HOME}/.bash_history_${localWorkspaceFolderBasename}"
+  },
+  "forwardPorts": []
+}

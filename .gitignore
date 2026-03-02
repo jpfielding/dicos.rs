@@ -15,6 +15,9 @@
 # Sensitive files
 *.pem
 
+# intermediate from blender to dicos
+voxels.raw
+
 # Editors and IDEs
 # JetBrains IDEs
 .idea/

@@ -1,0 +1,1377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DICOS Image Layout — Binary Structure &amp; Pixel Organization</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ============ THEME — Blueprint: deep navy + gold ============ */
+  :root {
+    --font-body: 'Sora', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+
+    --bg: #f3f5f8;
+    --surface: #ffffff;
+    --surface2: #eaecf1;
+    --surface-elevated: #ffffff;
+    --border: rgba(30, 58, 95, 0.10);
+    --border-bright: rgba(30, 58, 95, 0.20);
+    --text: #1a2a3f;
+    --text-dim: #6b7a8f;
+
+    --navy: #1e3a5f;
+    --navy-dim: rgba(30, 58, 95, 0.08);
+    --gold: #b57a14;
+    --gold-dim: rgba(181, 122, 20, 0.08);
+    --teal: #1a7a6d;
+    --teal-dim: rgba(26, 122, 109, 0.08);
+    --rust: #a0522d;
+    --rust-dim: rgba(160, 82, 45, 0.08);
+    --slate: #4a5c72;
+    --slate-dim: rgba(74, 92, 114, 0.08);
+    --crimson: #8b2942;
+    --crimson-dim: rgba(139, 41, 66, 0.08);
+
+    /* Byte map colors */
+    --byte-preamble: #c9d1dc;
+    --byte-magic: #1e3a5f;
+    --byte-meta: #2d8a7e;
+    --byte-dataset: #b57a14;
+    --byte-pixel: #a0522d;
+    --byte-text-on-dark: #f3f5f8;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1621;
+      --surface: #162030;
+      --surface2: #1c2a3e;
+      --surface-elevated: #1f3048;
+      --border: rgba(200, 215, 235, 0.08);
+      --border-bright: rgba(200, 215, 235, 0.15);
+      --text: #d8e2ef;
+      --text-dim: #7a8da3;
+
+      --navy: #5b9bd5;
+      --navy-dim: rgba(91, 155, 213, 0.12);
+      --gold: #e0a832;
+      --gold-dim: rgba(224, 168, 50, 0.10);
+      --teal: #4ecdc4;
+      --teal-dim: rgba(78, 205, 196, 0.10);
+      --rust: #e8915a;
+      --rust-dim: rgba(232, 145, 90, 0.10);
+      --slate: #8fa3b8;
+      --slate-dim: rgba(143, 163, 184, 0.10);
+      --crimson: #e87191;
+      --crimson-dim: rgba(232, 113, 145, 0.10);
+
+      --byte-preamble: #2a3a50;
+      --byte-magic: #5b9bd5;
+      --byte-meta: #4ecdc4;
+      --byte-dataset: #e0a832;
+      --byte-pixel: #e8915a;
+      --byte-text-on-dark: #0e1621;
+    }
+  }
+
+  /* ============ RESET ============ */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    background-image:
+      /* Subtle grid pattern */
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px),
+      /* Focal glow */
+      radial-gradient(ellipse at 30% 0%, var(--navy-dim) 0%, transparent 50%),
+      radial-gradient(ellipse at 70% 100%, var(--gold-dim) 0%, transparent 40%);
+    background-size: 60px 60px, 60px 60px, 100% 100%, 100% 100%;
+    color: var(--text);
+    font-family: var(--font-body);
+    padding: 40px;
+    min-height: 100vh;
+  }
+
+  /* ============ NAV LAYOUT ============ */
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 170px 1fr;
+    gap: 0 40px;
+  }
+  .main { min-width: 0; }
+
+  .toc {
+    position: sticky;
+    top: 24px;
+    align-self: start;
+    padding: 14px 0;
+    grid-row: 1 / -1;
+    max-height: calc(100dvh - 48px);
+    overflow-y: auto;
+  }
+  .toc::-webkit-scrollbar { width: 3px; }
+  .toc::-webkit-scrollbar-thumb { background: var(--surface-elevated); border-radius: 2px; }
+
+  .toc-title {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    padding: 0 0 10px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .toc a {
+    display: block;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 4px 8px;
+    border-radius: 5px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    line-height: 1.4;
+    margin-bottom: 1px;
+    font-family: var(--font-mono);
+  }
+  .toc a:hover { color: var(--text); background: var(--surface2); }
+  .toc a.active { color: var(--text); border-left-color: var(--gold); }
+
+  @media (max-width: 1000px) {
+    .wrap { grid-template-columns: 1fr; padding-top: 0; }
+    body { padding-top: 0; }
+    .toc {
+      position: sticky; top: 0; z-index: 200;
+      max-height: none; display: flex; gap: 4px; align-items: center;
+      overflow-x: auto; -webkit-overflow-scrolling: touch;
+      background: var(--bg); border-bottom: 1px solid var(--border);
+      padding: 10px 0; margin: 0 -40px; padding-left: 40px; padding-right: 40px;
+      grid-row: auto;
+    }
+    .toc::-webkit-scrollbar { display: none; }
+    .toc-title { display: none; }
+    .toc a {
+      white-space: nowrap; flex-shrink: 0; border-left: none;
+      border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0;
+      padding: 6px 10px; font-size: 10px;
+    }
+    .toc a.active { border-left: none; border-bottom-color: var(--gold); background: var(--surface); }
+    .main { padding-top: 20px; }
+    .sec-head { scroll-margin-top: 52px; }
+  }
+
+  /* ============ ANIMATION ============ */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .anim {
+    animation: fadeUp 0.4s ease-out both;
+    animation-delay: calc(var(--i, 0) * 0.06s);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-delay: 0ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  /* ============ TYPOGRAPHY ============ */
+  h1 {
+    font-size: 36px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 6px;
+    text-wrap: balance;
+    color: var(--navy);
+  }
+
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin-bottom: 36px;
+    font-family: var(--font-mono);
+  }
+
+  .sec-head {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-top: 40px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    scroll-margin-top: 20px;
+  }
+
+  .sec-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  /* ============ CARD ============ */
+  .ve-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+  .ve-card--hero {
+    background: var(--surface-elevated);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+    padding: 28px 32px;
+  }
+  .ve-card--recessed {
+    background: var(--surface2);
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
+  }
+
+  .card-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .card-label .dot {
+    width: 7px; height: 7px; border-radius: 50%; display: inline-block;
+  }
+
+  /* ============ BYTE MAP ============ */
+  .byte-map {
+    display: flex;
+    border-radius: 6px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    border: 1px solid var(--border-bright);
+  }
+
+  .byte-seg {
+    padding: 10px 8px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    transition: filter 0.2s;
+    min-width: 0;
+  }
+  .byte-seg:hover { filter: brightness(1.08); }
+
+  .byte-seg .seg-label {
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .byte-seg .seg-size {
+    font-size: 9px;
+    opacity: 0.7;
+  }
+  .byte-seg .seg-offset {
+    font-size: 8px;
+    opacity: 0.5;
+  }
+
+  .seg-preamble { background: var(--byte-preamble); color: var(--text); flex: 1; }
+  .seg-magic { background: var(--byte-magic); color: var(--byte-text-on-dark); flex: 0.5; }
+  .seg-meta { background: var(--byte-meta); color: #fff; flex: 2; }
+  .seg-dataset { background: var(--byte-dataset); color: #fff; flex: 4; }
+  .seg-pixel { background: var(--byte-pixel); color: #fff; flex: 6; }
+
+  @media (prefers-color-scheme: dark) {
+    .seg-preamble { color: var(--text); }
+    .seg-magic { color: var(--bg); }
+  }
+
+  /* Byte map detail strip below */
+  .byte-detail {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .byte-detail-item {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .byte-detail-item .bdl {
+    font-weight: 600;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 2px;
+  }
+  .byte-detail-item .bds {
+    width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex-shrink: 0;
+  }
+  .byte-detail-item .bdd {
+    color: var(--text-dim);
+    font-size: 10px;
+  }
+
+  /* ============ DUAL PANEL ============ */
+  .dual {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 768px) { .dual { grid-template-columns: 1fr; } }
+
+  .panel-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* ============ CODE BLOCK ============ */
+  .code-block {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    overflow-x: auto;
+    color: var(--text);
+    tab-size: 2;
+  }
+  .code-block .cm { color: var(--text-dim); } /* comment */
+  .code-block .kw { color: var(--navy); font-weight: 600; }  /* keyword */
+  .code-block .ty { color: var(--teal); }  /* type */
+  .code-block .nu { color: var(--rust); }  /* number */
+  .code-block .st { color: var(--gold); }  /* string/tag */
+
+  /* ============ PIXEL GRID — visual memory layout ============ */
+  .pixel-grid-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .pixel-row {
+    display: flex;
+    gap: 2px;
+  }
+  .pixel-cell {
+    width: 44px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .pixel-cell:hover {
+    border-color: var(--gold);
+    background: var(--gold-dim);
+  }
+  .pixel-cell--header {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 9px;
+    font-weight: 600;
+  }
+  .pixel-cell--row-header {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 9px;
+    font-weight: 600;
+    width: 30px;
+  }
+  .pixel-cell--highlight {
+    background: var(--gold-dim);
+    border-color: var(--gold);
+    color: var(--gold);
+    font-weight: 700;
+  }
+
+  /* ============ 3D volume stack ============ */
+  .volume-stack {
+    display: flex;
+    gap: 6px;
+    align-items: flex-end;
+    padding: 8px 0;
+    overflow-x: auto;
+  }
+  .volume-slice {
+    width: 60px;
+    height: 60px;
+    border-radius: 4px;
+    border: 1px solid var(--border-bright);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    position: relative;
+    flex-shrink: 0;
+    transition: all 0.2s;
+  }
+  .volume-slice:hover {
+    transform: translateY(-4px);
+    border-color: var(--gold);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  .volume-slice .slice-z {
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .volume-slice .slice-label {
+    position: absolute;
+    bottom: -16px;
+    font-size: 8px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  /* ============ FLOW ARROW ============ */
+  .flow-arrow {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 6px 0;
+  }
+  .flow-arrow svg {
+    width: 18px; height: 18px;
+    fill: none; stroke: var(--border-bright);
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  }
+
+  /* ============ TAG TABLE ============ */
+  .tag-table-wrap {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+
+  .tag-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .tag-table thead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  .tag-table th {
+    background: var(--surface2);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-bright);
+  }
+  .tag-table td {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    line-height: 1.5;
+  }
+  .tag-table tr:nth-child(even) td {
+    background: var(--surface2);
+  }
+  .tag-table tr:hover td {
+    background: var(--gold-dim);
+  }
+  .tag-table code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: var(--navy-dim);
+    color: var(--navy);
+    padding: 1px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .tag-group {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 6px 14px;
+    background: var(--navy-dim);
+    color: var(--navy);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ============ PIPELINE ============ */
+  .pipeline {
+    display: flex;
+    gap: 0;
+    align-items: stretch;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .pipeline-step {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    min-width: 130px;
+    flex-shrink: 0;
+    text-align: center;
+  }
+  .pipeline-step .step-name {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 3px;
+  }
+  .pipeline-step .step-detail {
+    font-size: 10px;
+    color: var(--text-dim);
+    line-height: 1.4;
+    font-family: var(--font-mono);
+  }
+  .pipeline-arrow {
+    display: flex;
+    align-items: center;
+    padding: 0 4px;
+    color: var(--border-bright);
+    font-size: 16px;
+    flex-shrink: 0;
+  }
+
+  @media (max-width: 768px) {
+    .pipeline { flex-wrap: wrap; gap: 6px; }
+    .pipeline-arrow { display: none; }
+    .byte-detail { grid-template-columns: repeat(2, 1fr); }
+    .byte-map { flex-wrap: wrap; }
+    .byte-seg { min-width: 60px; flex: 1 1 60px; }
+  }
+
+  /* ============ ORIENTATION TABLE ============ */
+  .orient-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 600px) { .orient-grid { grid-template-columns: 1fr; } }
+
+  .orient-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+  }
+  .orient-card .orient-name {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .orient-card .orient-plane {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+    font-family: var(--font-mono);
+  }
+  .orient-card .orient-formula {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    line-height: 1.6;
+  }
+
+  /* ============ CALLOUT ============ */
+  .callout {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--gold);
+    border-radius: 0 8px 8px 0;
+    padding: 14px 18px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-dim);
+    margin-bottom: 16px;
+  }
+  .callout strong { color: var(--text); font-weight: 600; }
+  .callout code {
+    font-family: var(--font-mono); font-size: 11px;
+    background: var(--navy-dim); color: var(--navy);
+    padding: 1px 5px; border-radius: 3px;
+  }
+
+  /* ============ ENCAPSULATED FRAME DIAGRAM ============ */
+  .frame-strip {
+    display: flex;
+    gap: 3px;
+    align-items: stretch;
+    overflow-x: auto;
+    padding: 4px 0;
+  }
+  .frame-item {
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 8px 10px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
+    min-width: 70px;
+    transition: all 0.15s;
+  }
+  .frame-item:hover { border-color: var(--teal); }
+  .frame-item .fi-tag {
+    font-weight: 700;
+    font-size: 10px;
+  }
+  .frame-item .fi-val {
+    color: var(--text-dim);
+  }
+  .frame-item--bot { background: var(--teal-dim); border-color: var(--teal); }
+  .frame-item--bot .fi-tag { color: var(--teal); }
+  .frame-item--data { background: var(--rust-dim); border-color: var(--rust); }
+  .frame-item--data .fi-tag { color: var(--rust); }
+  .frame-item--delim { background: var(--slate-dim); border-color: var(--slate); }
+  .frame-item--delim .fi-tag { color: var(--slate); }
+
+  /* ============ INLINE BADGE ============ */
+  .badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 4px;
+    vertical-align: middle;
+  }
+  .badge--navy { background: var(--navy-dim); color: var(--navy); }
+  .badge--teal { background: var(--teal-dim); color: var(--teal); }
+  .badge--gold { background: var(--gold-dim); color: var(--gold); }
+  .badge--rust { background: var(--rust-dim); color: var(--rust); }
+  .badge--crimson { background: var(--crimson-dim); color: var(--crimson); }
+
+  /* ============ LEGEND ============ */
+  .legend {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-dim);
+    margin-top: 6px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-sw { width: 10px; height: 10px; border-radius: 2px; }
+
+  /* ============ HELPERS ============ */
+  .mt-0 { margin-top: 0; }
+  .mb-sm { margin-bottom: 8px; }
+  .mb-md { margin-bottom: 16px; }
+  .text-dim { color: var(--text-dim); }
+  .text-sm { font-size: 12px; }
+  .font-mono { font-family: var(--font-mono); }
+  .flex-center { display: flex; align-items: center; gap: 6px; }
+
+  /* Encapsulated detail layout */
+  .encap-detail {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 10px;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    line-height: 1.7;
+  }
+  .encap-detail dt { color: var(--text-dim); text-align: right; }
+  .encap-detail dd { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <nav class="toc" id="toc">
+    <div class="toc-title">Sections</div>
+    <a href="#s1">1. File Structure</a>
+    <a href="#s2">2. Pixel Encoding</a>
+    <a href="#s3">3. Memory Layout</a>
+    <a href="#s4">4. Image Tags</a>
+    <a href="#s5">5. Codec Pipeline</a>
+    <a href="#s6">6. Volume + Slices</a>
+  </nav>
+
+  <div class="main">
+
+    <h1 class="anim" style="--i:0">DICOS Image Layout</h1>
+    <p class="subtitle anim" style="--i:1">NEMA IIC 1 — binary structure &amp; pixel data organization &mdash; dicos.rs</p>
+
+    <!-- ================================================================ -->
+    <!-- SECTION 1: Binary File Structure                                  -->
+    <!-- ================================================================ -->
+    <div id="s1" class="sec-head anim" style="--i:2">
+      <span class="sec-num" style="background:var(--navy-dim);color:var(--navy)">1</span>
+      Binary File Structure
+    </div>
+
+    <div class="ve-card ve-card--hero anim" style="--i:3">
+      <div class="card-label" style="color:var(--navy)">
+        <span class="dot" style="background:var(--navy)"></span>
+        DICOM Part 10 Byte Layout
+      </div>
+
+      <div class="byte-map">
+        <div class="byte-seg seg-preamble">
+          <span class="seg-label">Preamble</span>
+          <span class="seg-size">128 bytes</span>
+          <span class="seg-offset">0x0000</span>
+        </div>
+        <div class="byte-seg seg-magic">
+          <span class="seg-label">DICM</span>
+          <span class="seg-size">4 bytes</span>
+          <span class="seg-offset">0x0080</span>
+        </div>
+        <div class="byte-seg seg-meta">
+          <span class="seg-label">File Meta Info</span>
+          <span class="seg-size">Group 0002</span>
+          <span class="seg-offset">0x0084</span>
+        </div>
+        <div class="byte-seg seg-dataset">
+          <span class="seg-label">Dataset Elements</span>
+          <span class="seg-size">Groups 0008–7FDF</span>
+          <span class="seg-offset">variable</span>
+        </div>
+        <div class="byte-seg seg-pixel">
+          <span class="seg-label">Pixel Data</span>
+          <span class="seg-size">(7FE0,0010)</span>
+          <span class="seg-offset">variable</span>
+        </div>
+      </div>
+
+      <div class="byte-detail">
+        <div class="byte-detail-item">
+          <div class="bdl"><span class="bds" style="background:var(--byte-preamble)"></span> Preamble</div>
+          <div class="bdd">128 zero bytes, unused by DICOS. Applications may embed info here.</div>
+        </div>
+        <div class="byte-detail-item">
+          <div class="bdl"><span class="bds" style="background:var(--byte-magic)"></span> Magic</div>
+          <div class="bdd">ASCII "DICM" — validates the file as DICOM/DICOS Part 10.</div>
+        </div>
+        <div class="byte-detail-item">
+          <div class="bdl"><span class="bds" style="background:var(--byte-meta)"></span> File Meta</div>
+          <div class="bdd">Always Explicit VR Little Endian. Contains Transfer Syntax UID, SOP Class.</div>
+        </div>
+        <div class="byte-detail-item">
+          <div class="bdl"><span class="bds" style="background:var(--byte-dataset)"></span> Dataset</div>
+          <div class="bdd">Encoded per Transfer Syntax. Image dimensions, modality, windowing, DICOS tags.</div>
+        </div>
+        <div class="byte-detail-item">
+          <div class="bdl"><span class="bds" style="background:var(--byte-pixel)"></span> Pixel Data</div>
+          <div class="bdd">Raw u16 values (native) or compressed frame fragments (encapsulated).</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callout anim" style="--i:4">
+      <strong>Rust mapping:</strong> The parser in <code>reader.rs</code> reads the preamble + magic, then decodes File Meta (always Explicit VR LE). The <code>TransferSyntax</code> from tag <code>(0002,0010)</code> determines how the remaining dataset is decoded. All elements are stored in a <code>BTreeMap&lt;Tag, Element&gt;</code> inside the <code>Dataset</code> struct.
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- SECTION 2: Pixel Data Encoding                                    -->
+    <!-- ================================================================ -->
+    <div id="s2" class="sec-head anim" style="--i:5">
+      <span class="sec-num" style="background:var(--teal-dim);color:var(--teal)">2</span>
+      Pixel Data Encoding
+    </div>
+
+    <div class="dual anim" style="--i:6">
+      <!-- Native panel -->
+      <div class="ve-card" style="border-color:var(--teal-dim)">
+        <div class="panel-title" style="color:var(--teal)">
+          <span class="dot" style="background:var(--teal);width:7px;height:7px;border-radius:50%;display:inline-block"></span>
+          Native (Uncompressed)
+        </div>
+        <p class="text-sm text-dim mb-sm">Transfer syntaxes: Implicit/Explicit VR Little Endian</p>
+
+        <div class="code-block mb-md"><span class="cm">// PixelData for native encoding</span>
+<span class="kw">struct</span> <span class="ty">PixelData</span> {
+  is_encapsulated: <span class="ty">false</span>,
+  frames: <span class="ty">Vec</span>&lt;<span class="ty">Frame</span>&gt;,
+}
+
+<span class="cm">// Each frame: flat u16 pixel values</span>
+<span class="kw">struct</span> <span class="ty">Frame</span> {
+  data: <span class="ty">Vec</span>&lt;<span class="nu">u16</span>&gt;,  <span class="cm">// width × height pixels</span>
+}</div>
+
+        <div class="text-sm" style="line-height:1.7">
+          Pixels stored as raw <span class="badge badge--teal">u16 LE</span> values, one <code style="font-family:var(--font-mono);font-size:11px;background:var(--teal-dim);color:var(--teal);padding:1px 5px;border-radius:3px">Frame</code> per image slice. For a 512×512 image, each frame holds 262,144 u16 values (512 KB).
+        </div>
+      </div>
+
+      <!-- Encapsulated panel -->
+      <div class="ve-card" style="border-color:var(--rust-dim)">
+        <div class="panel-title" style="color:var(--rust)">
+          <span class="dot" style="background:var(--rust);width:7px;height:7px;border-radius:50%;display:inline-block"></span>
+          Encapsulated (Compressed)
+        </div>
+        <p class="text-sm text-dim mb-sm">Transfer syntaxes: JPEG-LS, JPEG 2000, JPEG Lossless, RLE</p>
+
+        <div class="frame-strip mb-md">
+          <div class="frame-item frame-item--bot">
+            <span class="fi-tag">BOT</span>
+            <span class="fi-val">offset[0]</span>
+            <span class="fi-val">offset[1]</span>
+            <span class="fi-val">…</span>
+          </div>
+          <div class="frame-item frame-item--data">
+            <span class="fi-tag">Item</span>
+            <span class="fi-val">Frame 0</span>
+            <span class="fi-val">compressed</span>
+          </div>
+          <div class="frame-item frame-item--data">
+            <span class="fi-tag">Item</span>
+            <span class="fi-val">Frame 1</span>
+            <span class="fi-val">compressed</span>
+          </div>
+          <div class="frame-item frame-item--data">
+            <span class="fi-tag">Item</span>
+            <span class="fi-val">Frame N</span>
+            <span class="fi-val">compressed</span>
+          </div>
+          <div class="frame-item frame-item--delim">
+            <span class="fi-tag">Delim</span>
+            <span class="fi-val">FFFE,E0DD</span>
+          </div>
+        </div>
+
+        <div class="encap-detail">
+          <dt>BOT</dt><dd>Basic Offset Table — byte offsets to each frame item</dd>
+          <dt>Items</dt><dd>Each wraps one frame's compressed bitstream in <span class="badge badge--rust">Vec&lt;u8&gt;</span></dd>
+          <dt>Delim</dt><dd>Sequence Delimitation Item terminates the pixel data</dd>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- SECTION 3: Memory Layout                                          -->
+    <!-- ================================================================ -->
+    <div id="s3" class="sec-head anim" style="--i:7">
+      <span class="sec-num" style="background:var(--gold-dim);color:var(--gold)">3</span>
+      Memory Layout
+    </div>
+
+    <div class="dual anim" style="--i:8">
+      <!-- 2D pixel grid -->
+      <div class="ve-card" style="border-color:var(--gold-dim)">
+        <div class="card-label" style="color:var(--gold)">
+          <span class="dot" style="background:var(--gold)"></span>
+          2D — Row-Major Order
+        </div>
+        <p class="text-sm text-dim mb-md">index = y × width + x</p>
+
+        <div class="pixel-grid-wrap">
+          <!-- Header row -->
+          <div class="pixel-row">
+            <div class="pixel-cell pixel-cell--row-header"></div>
+            <div class="pixel-cell pixel-cell--header">x=0</div>
+            <div class="pixel-cell pixel-cell--header">x=1</div>
+            <div class="pixel-cell pixel-cell--header">x=2</div>
+            <div class="pixel-cell pixel-cell--header">x=3</div>
+          </div>
+          <!-- Row 0 -->
+          <div class="pixel-row">
+            <div class="pixel-cell pixel-cell--row-header">y=0</div>
+            <div class="pixel-cell pixel-cell--highlight">0</div>
+            <div class="pixel-cell">1</div>
+            <div class="pixel-cell">2</div>
+            <div class="pixel-cell">3</div>
+          </div>
+          <!-- Row 1 -->
+          <div class="pixel-row">
+            <div class="pixel-cell pixel-cell--row-header">y=1</div>
+            <div class="pixel-cell">4</div>
+            <div class="pixel-cell">5</div>
+            <div class="pixel-cell">6</div>
+            <div class="pixel-cell">7</div>
+          </div>
+          <!-- Row 2 -->
+          <div class="pixel-row">
+            <div class="pixel-cell pixel-cell--row-header">y=2</div>
+            <div class="pixel-cell">8</div>
+            <div class="pixel-cell">9</div>
+            <div class="pixel-cell">10</div>
+            <div class="pixel-cell">11</div>
+          </div>
+          <!-- Row 3 -->
+          <div class="pixel-row">
+            <div class="pixel-cell pixel-cell--row-header">y=3</div>
+            <div class="pixel-cell">12</div>
+            <div class="pixel-cell">13</div>
+            <div class="pixel-cell">14</div>
+            <div class="pixel-cell pixel-cell--highlight">15</div>
+          </div>
+        </div>
+
+        <div class="code-block" style="margin-top:12px;font-size:10px"><span class="cm">// GrayImage&lt;u16&gt; pixel access</span>
+<span class="kw">fn</span> pixel(&self, x: <span class="nu">u32</span>, y: <span class="nu">u32</span>) -> <span class="nu">u16</span> {
+    self.data[(y * self.width + x) <span class="kw">as</span> <span class="ty">usize</span>]
+}</div>
+      </div>
+
+      <!-- 3D volume -->
+      <div class="ve-card" style="border-color:var(--navy-dim)">
+        <div class="card-label" style="color:var(--navy)">
+          <span class="dot" style="background:var(--navy)"></span>
+          3D — Volume Indexing
+        </div>
+        <p class="text-sm text-dim mb-md">index = z × height × width + y × width + x</p>
+
+        <div class="volume-stack" style="margin-bottom:24px">
+          <div class="volume-slice" style="background:var(--navy-dim); border-color:var(--navy)">
+            <span class="slice-z" style="color:var(--navy)">0</span>
+            <span class="slice-label">z=0</span>
+          </div>
+          <div class="volume-slice" style="background:var(--teal-dim); border-color:var(--teal)">
+            <span class="slice-z" style="color:var(--teal)">1</span>
+            <span class="slice-label">z=1</span>
+          </div>
+          <div class="volume-slice" style="background:var(--gold-dim); border-color:var(--gold)">
+            <span class="slice-z" style="color:var(--gold)">2</span>
+            <span class="slice-label">z=2</span>
+          </div>
+          <div class="volume-slice" style="background:var(--rust-dim); border-color:var(--rust)">
+            <span class="slice-z" style="color:var(--rust)">3</span>
+            <span class="slice-label">z=3</span>
+          </div>
+          <div class="volume-slice" style="background:var(--slate-dim); border-color:var(--slate)">
+            <span class="slice-z" style="color:var(--text-dim)">…</span>
+            <span class="slice-label">z=N</span>
+          </div>
+        </div>
+
+        <div class="code-block" style="font-size:10px"><span class="cm">// Volume voxel access</span>
+<span class="kw">let</span> idx = z * dim_y * dim_x
+         + y * dim_x
+         + x;
+<span class="kw">let</span> voxel = volume.data[idx];
+
+<span class="cm">// Each z-slice = one Frame</span>
+<span class="cm">// Total: dim_x × dim_y × dim_z voxels</span>
+<span class="cm">// Example: 512×512×256 = 67M voxels</span>
+<span class="cm">//        = 128 MB (u16)</span></div>
+      </div>
+    </div>
+
+    <div class="callout anim" style="--i:9">
+      <strong>DICOS pixel format:</strong> Always <span class="badge badge--teal">MONOCHROME2</span> photometric interpretation with <span class="badge badge--navy">16 bits allocated</span>, 1 sample per pixel. Unsigned by default (<code>PixelRepresentation = 0</code>). CT values are mapped via <code>RescaleSlope</code> × raw + <code>RescaleIntercept</code> to Hounsfield Units.
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- SECTION 4: Image Pixel Module Tags                                -->
+    <!-- ================================================================ -->
+    <div id="s4" class="sec-head anim" style="--i:10">
+      <span class="sec-num" style="background:var(--slate-dim);color:var(--slate)">4</span>
+      Image Pixel Module Tags
+    </div>
+
+    <div class="ve-card anim" style="--i:11;padding:0;overflow:hidden">
+      <div class="tag-table-wrap">
+        <table class="tag-table">
+          <thead>
+            <tr>
+              <th style="width:110px">Tag</th>
+              <th style="width:30px">VR</th>
+              <th>Name</th>
+              <th>Typical Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="tag-group"><td colspan="4">Image Dimensions</td></tr>
+            <tr>
+              <td><code>(0028,0010)</code></td>
+              <td>US</td>
+              <td>Rows</td>
+              <td>Image height in pixels — e.g. <span class="badge badge--navy">512</span></td>
+            </tr>
+            <tr>
+              <td><code>(0028,0011)</code></td>
+              <td>US</td>
+              <td>Columns</td>
+              <td>Image width in pixels — e.g. <span class="badge badge--navy">512</span></td>
+            </tr>
+            <tr>
+              <td><code>(0028,0008)</code></td>
+              <td>IS</td>
+              <td>NumberOfFrames</td>
+              <td>Slice count for 3D volumes — e.g. <span class="badge badge--navy">256</span></td>
+            </tr>
+            <tr class="tag-group"><td colspan="4">Pixel Format</td></tr>
+            <tr>
+              <td><code>(0028,0002)</code></td>
+              <td>US</td>
+              <td>SamplesPerPixel</td>
+              <td><span class="badge badge--teal">1</span> (always grayscale)</td>
+            </tr>
+            <tr>
+              <td><code>(0028,0004)</code></td>
+              <td>CS</td>
+              <td>PhotometricInterpretation</td>
+              <td><span class="badge badge--teal">MONOCHROME2</span></td>
+            </tr>
+            <tr>
+              <td><code>(0028,0100)</code></td>
+              <td>US</td>
+              <td>BitsAllocated</td>
+              <td><span class="badge badge--gold">16</span></td>
+            </tr>
+            <tr>
+              <td><code>(0028,0101)</code></td>
+              <td>US</td>
+              <td>BitsStored</td>
+              <td>Actual bits used (≤ 16)</td>
+            </tr>
+            <tr>
+              <td><code>(0028,0102)</code></td>
+              <td>US</td>
+              <td>HighBit</td>
+              <td>BitsStored − 1</td>
+            </tr>
+            <tr>
+              <td><code>(0028,0103)</code></td>
+              <td>US</td>
+              <td>PixelRepresentation</td>
+              <td><span class="badge badge--gold">0</span> = unsigned</td>
+            </tr>
+            <tr class="tag-group"><td colspan="4">Windowing &amp; Rescale</td></tr>
+            <tr>
+              <td><code>(0028,1050)</code></td>
+              <td>DS</td>
+              <td>WindowCenter</td>
+              <td>CT window center value</td>
+            </tr>
+            <tr>
+              <td><code>(0028,1051)</code></td>
+              <td>DS</td>
+              <td>WindowWidth</td>
+              <td>CT window width value</td>
+            </tr>
+            <tr>
+              <td><code>(0028,1052)</code></td>
+              <td>DS</td>
+              <td>RescaleIntercept</td>
+              <td>HU offset (often −1024)</td>
+            </tr>
+            <tr>
+              <td><code>(0028,1053)</code></td>
+              <td>DS</td>
+              <td>RescaleSlope</td>
+              <td>Scale factor (often 1.0)</td>
+            </tr>
+            <tr class="tag-group"><td colspan="4">Spatial</td></tr>
+            <tr>
+              <td><code>(0028,0030)</code></td>
+              <td>DS</td>
+              <td>PixelSpacing</td>
+              <td>[row, col] in mm — e.g. <span class="badge badge--rust">0.5\0.5</span></td>
+            </tr>
+            <tr>
+              <td><code>(0018,0050)</code></td>
+              <td>DS</td>
+              <td>SliceThickness</td>
+              <td>Z-axis thickness in mm</td>
+            </tr>
+            <tr>
+              <td><code>(0018,0088)</code></td>
+              <td>DS</td>
+              <td>SpacingBetweenSlices</td>
+              <td>Gap between slices in mm</td>
+            </tr>
+            <tr class="tag-group"><td colspan="4">Pixel Data</td></tr>
+            <tr>
+              <td><code>(7FE0,0010)</code></td>
+              <td>OW</td>
+              <td>PixelData</td>
+              <td>Raw or encapsulated pixel bitstream</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- SECTION 5: Codec Pipeline                                         -->
+    <!-- ================================================================ -->
+    <div id="s5" class="sec-head anim" style="--i:12">
+      <span class="sec-num" style="background:var(--rust-dim);color:var(--rust)">5</span>
+      Codec Pipeline
+    </div>
+
+    <div class="ve-card anim" style="--i:13">
+      <div class="card-label" style="color:var(--rust)">
+        <span class="dot" style="background:var(--rust)"></span>
+        Transfer Syntax → Decoded Frame
+      </div>
+
+      <div class="pipeline" style="margin-bottom:16px">
+        <div class="pipeline-step" style="border-color:var(--navy-dim)">
+          <div class="step-name" style="color:var(--navy)">Transfer Syntax</div>
+          <div class="step-detail">UID from (0002,0010)<br>identifies encoding</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--teal-dim)">
+          <div class="step-name" style="color:var(--teal)">Codec Registry</div>
+          <div class="step-detail">codec_for_<br>transfer_syntax()</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--gold-dim)">
+          <div class="step-name" style="color:var(--gold)">Codec Impl</div>
+          <div class="step-detail">codec.decode()<br>per-frame</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--rust-dim)">
+          <div class="step-name" style="color:var(--rust)">GrayImage&lt;u16&gt;</div>
+          <div class="step-detail">width × height<br>decoded pixels</div>
+        </div>
+      </div>
+
+      <div class="tag-table-wrap" style="margin-top:12px">
+        <table class="tag-table">
+          <thead>
+            <tr>
+              <th>Codec</th>
+              <th>Crate</th>
+              <th>Algorithm</th>
+              <th>Lossless</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>JPEG-LS</td>
+              <td><code>jpegls</code></td>
+              <td>LOCO-I (ISO 14495-1)</td>
+              <td><span class="badge badge--teal">yes / near</span></td>
+            </tr>
+            <tr>
+              <td>JPEG 2000</td>
+              <td><code>jpeg2k</code></td>
+              <td>DWT + EBCOT (ITU-T T.800)</td>
+              <td><span class="badge badge--teal">yes / lossy</span></td>
+            </tr>
+            <tr>
+              <td>JPEG Lossless</td>
+              <td><code>jpegli</code></td>
+              <td>DPCM (ITU-T T.81 Annex H)</td>
+              <td><span class="badge badge--teal">yes</span></td>
+            </tr>
+            <tr>
+              <td>RLE</td>
+              <td><code>jpegrle</code></td>
+              <td>PackBits (DICOM Part 5 Annex G)</td>
+              <td><span class="badge badge--teal">yes</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="code-block" style="margin-top:14px;font-size:10px"><span class="cm">// Codec trait — all codecs implement this</span>
+<span class="kw">pub trait</span> <span class="ty">Codec</span>: <span class="ty">Send</span> + <span class="ty">Sync</span> {
+    <span class="kw">fn</span> encode(&self, img: &<span class="ty">GrayImage</span>&lt;<span class="nu">u16</span>&gt;, w: &<span class="kw">mut</span> <span class="kw">dyn</span> <span class="ty">Write</span>) -> <span class="ty">Result</span>&lt;(), <span class="ty">CodecError</span>&gt;;
+    <span class="kw">fn</span> decode(&self, data: &[<span class="nu">u8</span>], width: <span class="nu">u32</span>, height: <span class="nu">u32</span>) -> <span class="ty">Result</span>&lt;<span class="ty">GrayImage</span>&lt;<span class="nu">u16</span>&gt;, <span class="ty">CodecError</span>&gt;;
+}</div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- SECTION 6: Volume Reconstruction & Slices                         -->
+    <!-- ================================================================ -->
+    <div id="s6" class="sec-head anim" style="--i:14">
+      <span class="sec-num" style="background:var(--crimson-dim);color:var(--crimson)">6</span>
+      Volume Reconstruction &amp; Slice Extraction
+    </div>
+
+    <div class="ve-card anim" style="--i:15">
+      <div class="card-label" style="color:var(--crimson)">
+        <span class="dot" style="background:var(--crimson)"></span>
+        Frames → Volume → Rendered Slice
+      </div>
+
+      <div class="pipeline" style="margin-bottom:18px">
+        <div class="pipeline-step" style="border-color:var(--navy-dim)">
+          <div class="step-name" style="color:var(--navy)">DICOS File</div>
+          <div class="step-detail">N frames in<br>PixelData</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--teal-dim)">
+          <div class="step-name" style="color:var(--teal)">Decode</div>
+          <div class="step-detail">each frame<br>→ Vec&lt;u16&gt;</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--gold-dim)">
+          <div class="step-name" style="color:var(--gold)">Concatenate</div>
+          <div class="step-detail">all frames<br>→ flat buffer</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--rust-dim)">
+          <div class="step-name" style="color:var(--rust)">Volume</div>
+          <div class="step-detail">dim_x × dim_y<br>× dim_z</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" style="border-color:var(--crimson-dim)">
+          <div class="step-name" style="color:var(--crimson)">Slice View</div>
+          <div class="step-detail">axial / coronal<br>/ sagittal</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="orient-grid anim" style="--i:16">
+      <div class="orient-card" style="border-color:var(--navy-dim)">
+        <div class="orient-name" style="color:var(--navy)">Axial</div>
+        <div class="orient-plane">XY plane — looking down Z</div>
+        <div style="margin-bottom:10px">
+          <svg width="80" height="80" viewBox="0 0 80 80" style="display:block;margin:0 auto">
+            <rect x="10" y="10" width="60" height="60" rx="4" fill="var(--navy-dim)" stroke="var(--navy)" stroke-width="1.5"/>
+            <text x="40" y="28" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--text-dim)">x →</text>
+            <text x="18" y="45" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--text-dim)" transform="rotate(-90 18 45)">y →</text>
+            <circle cx="40" cy="45" r="14" fill="none" stroke="var(--navy)" stroke-width="1" stroke-dasharray="3 2"/>
+          </svg>
+        </div>
+        <div class="orient-formula">z × H × W + y × W + x</div>
+      </div>
+      <div class="orient-card" style="border-color:var(--teal-dim)">
+        <div class="orient-name" style="color:var(--teal)">Coronal</div>
+        <div class="orient-plane">XZ plane — looking through Y</div>
+        <div style="margin-bottom:10px">
+          <svg width="80" height="80" viewBox="0 0 80 80" style="display:block;margin:0 auto">
+            <rect x="10" y="10" width="60" height="60" rx="4" fill="var(--teal-dim)" stroke="var(--teal)" stroke-width="1.5"/>
+            <text x="40" y="28" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--text-dim)">x →</text>
+            <text x="18" y="45" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--text-dim)" transform="rotate(-90 18 45)">z →</text>
+            <rect x="26" y="35" width="28" height="20" rx="3" fill="none" stroke="var(--teal)" stroke-width="1" stroke-dasharray="3 2"/>
+          </svg>
+        </div>
+        <div class="orient-formula">y × H × W + z × W + x</div>
+      </div>
+      <div class="orient-card" style="border-color:var(--gold-dim)">
+        <div class="orient-name" style="color:var(--gold)">Sagittal</div>
+        <div class="orient-plane">YZ plane — looking through X</div>
+        <div style="margin-bottom:10px">
+          <svg width="80" height="80" viewBox="0 0 80 80" style="display:block;margin:0 auto">
+            <rect x="10" y="10" width="60" height="60" rx="4" fill="var(--gold-dim)" stroke="var(--gold)" stroke-width="1.5"/>
+            <text x="40" y="28" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--text-dim)">y →</text>
+            <text x="18" y="45" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--text-dim)" transform="rotate(-90 18 45)">z →</text>
+            <ellipse cx="40" cy="45" rx="18" ry="12" fill="none" stroke="var(--gold)" stroke-width="1" stroke-dasharray="3 2"/>
+          </svg>
+        </div>
+        <div class="orient-formula">x × H × W + z × W + y</div>
+      </div>
+    </div>
+
+    <div class="ve-card ve-card--recessed anim" style="--i:17;margin-top:16px">
+      <div class="card-label" style="color:var(--slate)">
+        <span class="dot" style="background:var(--slate)"></span>
+        Volume Struct
+      </div>
+      <div class="code-block" style="font-size:10px"><span class="kw">pub struct</span> <span class="ty">Volume</span> {
+    <span class="kw">pub</span> data: <span class="ty">Vec</span>&lt;<span class="nu">u16</span>&gt;,           <span class="cm">// all voxels, flat buffer</span>
+    <span class="kw">pub</span> dim_x: <span class="ty">usize</span>,              <span class="cm">// width  (Columns)</span>
+    <span class="kw">pub</span> dim_y: <span class="ty">usize</span>,              <span class="cm">// height (Rows)</span>
+    <span class="kw">pub</span> dim_z: <span class="ty">usize</span>,              <span class="cm">// depth  (NumberOfFrames)</span>
+    <span class="kw">pub</span> window_center: <span class="ty">f64</span>,       <span class="cm">// CT windowing</span>
+    <span class="kw">pub</span> window_width: <span class="ty">f64</span>,
+    <span class="kw">pub</span> rescale_intercept: <span class="ty">f64</span>,
+    <span class="kw">pub</span> voxel_spacing: [<span class="ty">f64</span>; <span class="nu">3</span>], <span class="cm">// [X, Y, Z] mm</span>
+    <span class="kw">pub</span> threats: <span class="ty">Vec</span>&lt;<span class="ty">ThreatBox</span>&gt;,  <span class="cm">// DICOS ATD bounding boxes</span>
+}</div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /wrap -->
+
+<!-- Scroll spy -->
+<script>
+(function() {
+  const toc = document.getElementById('toc');
+  const links = toc.querySelectorAll('a');
+  const sections = [];
+  links.forEach(link => {
+    const id = link.getAttribute('href').slice(1);
+    const el = document.getElementById(id);
+    if (el) sections.push({ id, el, link });
+  });
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const match = sections.find(s => s.el === entry.target);
+        if (match) {
+          match.link.classList.add('active');
+          if (window.innerWidth <= 1000) {
+            match.link.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+          }
+        }
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+  sections.forEach(s => observer.observe(s.el));
+  links.forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      const id = link.getAttribute('href').slice(1);
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        history.replaceState(null, '', '#' + id);
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

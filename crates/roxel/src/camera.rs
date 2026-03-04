@@ -65,11 +65,7 @@ impl Camera {
     /// Rotate the camera by delta angles (in radians).
     pub fn rotate(&mut self, delta_azimuth: f32, delta_elevation: f32) {
         self.azimuth += delta_azimuth;
-        // Clamp elevation to avoid gimbal lock at poles.
-        self.elevation = (self.elevation + delta_elevation).clamp(
-            -std::f32::consts::FRAC_PI_2 + 0.01,
-            std::f32::consts::FRAC_PI_2 - 0.01,
-        );
+        self.elevation += delta_elevation;
     }
 
     /// Zoom by a multiplicative factor (>1 zooms in, <1 zooms out).
@@ -142,12 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn rotation_clamps_elevation() {
+    fn rotation_continuous_elevation() {
         let mut cam = Camera::default();
-        cam.rotate(0.0, 100.0);
-        assert!(cam.elevation < std::f32::consts::FRAC_PI_2);
-        cam.rotate(0.0, -200.0);
-        assert!(cam.elevation > -std::f32::consts::FRAC_PI_2);
+        let start = cam.elevation;
+        cam.rotate(0.0, std::f32::consts::PI);
+        assert!((cam.elevation - (start + std::f32::consts::PI)).abs() < 1e-6);
     }
 
     #[test]

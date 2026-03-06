@@ -10,7 +10,6 @@ use crate::error::CodecError;
 use crate::bitstream::BitWriter;
 use crate::context::ContextModel;
 use crate::predictor::{clamp, predict_med};
-use crate::run_mode;
 
 // ---------------------------------------------------------------------------
 // JPEG-LS markers
@@ -214,14 +213,9 @@ fn encode_scan<W: Write>(
             let d2 = rb - rc;
             let d3 = rc - ra;
 
-            // Run mode disabled: matches Go codec behavior for compatibility
-            // with existing DICOS files.
-            if false && d1 == 0 && d2 == 0 && d3 == 0 {
-                run_mode::encode_run(bw, ctx, &curr_line, &mut x, w, ra, rb)?;
-                continue;
-            }
-
-            // Regular mode
+            // Run mode is intentionally disabled for compatibility with
+            // existing DICOS files produced by the Go codec.
+            // Regular mode:
             let (q, sign) = ctx.get_context_index(d1, d2, d3);
 
             let mut px = predict_med(ra, rb, rc);
@@ -273,7 +267,7 @@ fn effective_precision(max_pixel: u16) -> u32 {
         return 8;
     }
     let bits_needed = 16 - max_pixel.leading_zeros(); // ceil(log2(max+1))
-    bits_needed.max(8).min(16)
+    bits_needed.clamp(8, 16)
 }
 
 // ---------------------------------------------------------------------------

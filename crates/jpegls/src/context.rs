@@ -62,7 +62,7 @@ impl ContextModel {
         // Compute quantization thresholds (ISO A.3).
         let factor = (max_val.min(4095) + 128) / 256;
 
-        let t1 = clamp(factor * (3 - 2) + 2 + 3 * near, near + 1, max_val);
+        let t1 = clamp(factor + 2 + 3 * near, near + 1, max_val);
         let t2 = clamp(factor * (7 - 3) + 3 + 5 * near, t1, max_val);
         let t3 = clamp(factor * (21 - 4) + 4 + 7 * near, t2, max_val);
 

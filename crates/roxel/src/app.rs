@@ -18,7 +18,7 @@
 //! ```
 
 use crate::camera::Camera;
-use crate::renderer::{Quality, VolumeRenderer};
+use crate::renderer::{Quality, RenderParams, VolumeRenderer};
 use crate::slice_view::{Orientation, SliceView};
 use crate::transfer::{self, ColorBand, TransferFunction, TransferPreset};
 use crate::volume::{self, ThreatBox, Volume};
@@ -335,11 +335,12 @@ impl App {
             &self.queue,
             &mut encoder,
             surface_view,
-            &self.ui.camera,
-            width,
-            height,
-            active_3d_threats,
-            self.ui.show_threats,
+            RenderParams {
+                camera: &self.ui.camera,
+                viewport: [width, height],
+                threats: active_3d_threats,
+                show_threats: self.ui.show_threats,
+            },
         );
 
         self.egui_renderer.update_buffers(
@@ -787,8 +788,8 @@ fn draw_band_range_slider(ui: &mut egui::Ui, bands: &mut [ColorBand]) -> bool {
         }
     }
 
-    for i in 0..handle_count {
-        let hx = to_x(bands[i].threshold as f32);
+    for (i, band) in bands.iter().enumerate().take(handle_count) {
+        let hx = to_x(band.threshold as f32);
         let center = egui::pos2(hx, track_rect.center().y);
         let active = ui.memory(|m| m.data.get_temp::<usize>(id)) == Some(i) && response.dragged();
         let stroke_color = if active {
@@ -802,7 +803,7 @@ fn draw_band_range_slider(ui: &mut egui::Ui, bands: &mut [ColorBand]) -> bool {
         painter.text(
             egui::pos2(hx, track_rect.top() - 4.0),
             egui::Align2::CENTER_BOTTOM,
-            format!("{}", bands[i].threshold),
+            format!("{}", band.threshold),
             egui::FontId::monospace(10.0),
             ui.visuals().text_color(),
         );

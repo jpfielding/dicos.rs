@@ -17,7 +17,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use crate::error::DicosError;
 use crate::tag::{self, Tag};
 use crate::transfer;
-use crate::types::{Dataset, Element, Frame, PixelData, Value};
+use crate::types::{Dataset, Element, PixelData, Value};
 use crate::vr::Vr;
 
 /// The 4-byte DICOM magic number.
@@ -283,11 +283,8 @@ impl<R: Read> DicosReader<R> {
 
     /// Reads encapsulated pixel data (Basic Offset Table + compressed frames).
     fn read_encapsulated_pixel_data(&mut self) -> Result<PixelData, DicosError> {
-        let mut pd = PixelData {
-            is_encapsulated: true,
-            frames: Vec::new(),
-            offsets: Vec::new(),
-        };
+        let mut offsets = Vec::new();
+        let mut frames = Vec::new();
 
         // Read Basic Offset Table item
         let bot_tag = self.read_tag()?;
@@ -300,9 +297,9 @@ impl<R: Read> DicosReader<R> {
         let bot_len = self.inner.read_u32::<LittleEndian>()?;
         if bot_len > 0 {
             let num_offsets = bot_len / 4;
-            pd.offsets.reserve(num_offsets as usize);
+            offsets.reserve(num_offsets as usize);
             for _ in 0..num_offsets {
-                pd.offsets.push(self.inner.read_u32::<LittleEndian>()?);
+                offsets.push(self.inner.read_u32::<LittleEndian>()?);
             }
         }
 
@@ -326,13 +323,10 @@ impl<R: Read> DicosReader<R> {
             let mut frame_data = vec![0u8; item_len as usize];
             self.inner.read_exact(&mut frame_data)?;
 
-            pd.frames.push(Frame {
-                data: Vec::new(),
-                compressed_data: frame_data,
-            });
+            frames.push(frame_data);
         }
 
-        Ok(pd)
+        Ok(PixelData::encapsulated(frames, offsets))
     }
 
     /// Skips an undefined-length element by reading until Sequence Delimitation Item.
@@ -480,7 +474,7 @@ fn parse_value(vr: Vr, data: &[u8]) -> Result<Value, DicosError> {
         | Vr::UR
         | Vr::UT => {
             let s = String::from_utf8_lossy(data);
-            let trimmed = s.trim_end_matches(|c: char| c == '\0' || c == ' ');
+            let trimmed = s.trim_end_matches(['\0', ' ']);
             if trimmed.contains('\\') {
                 let values = trimmed.split('\\').map(ToOwned::to_owned).collect();
                 Ok(Value::Strings(values))

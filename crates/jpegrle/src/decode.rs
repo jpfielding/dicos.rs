@@ -33,9 +33,9 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
     }
 
     let mut offsets = [0u32; 15];
-    for i in 0..15 {
+    for (i, offset) in offsets.iter_mut().enumerate() {
         let start = 4 + i * 4;
-        offsets[i] = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
+        *offset = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
     }
 
     let num_pixels = (width as usize) * (height as usize);

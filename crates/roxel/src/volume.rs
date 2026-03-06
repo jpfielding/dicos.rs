@@ -6,7 +6,7 @@
 use dicos::error::DicosError;
 use dicos::reader;
 use dicos::tag;
-use dicos::types::{Dataset, Value};
+use dicos::types::{Dataset, PixelData, Value};
 
 /// Threat ROI bounding box extracted from DICOS metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -703,20 +703,21 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
     let mut all_pixels = Vec::with_capacity(cols * rows * num_frames);
 
     match &pixel_data.value {
-        Value::PixelData(pd) => {
-            for frame in &pd.frames {
-                if !frame.data.is_empty() {
-                    all_pixels.extend_from_slice(&frame.data);
-                } else if !frame.compressed_data.is_empty() {
-                    let ts = ds.transfer_syntax();
-                    let decoded = dicos::codec_registry::decode_frame(
-                        &frame.compressed_data,
-                        cols as u32,
-                        rows as u32,
-                        ts.uid(),
-                    )?;
-                    all_pixels.extend_from_slice(&decoded);
-                }
+        Value::PixelData(PixelData::Native { frames }) => {
+            for frame in frames {
+                all_pixels.extend_from_slice(frame);
+            }
+        }
+        Value::PixelData(PixelData::Encapsulated { frames, .. }) => {
+            let ts = ds.transfer_syntax();
+            for frame in frames {
+                let decoded = dicos::codec_registry::decode_frame(
+                    frame,
+                    cols as u32,
+                    rows as u32,
+                    ts.uid(),
+                )?;
+                all_pixels.extend_from_slice(&decoded);
             }
         }
         Value::Bytes(raw) => {

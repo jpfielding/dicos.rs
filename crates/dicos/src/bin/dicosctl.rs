@@ -161,8 +161,8 @@ fn element_to_json(elem: &dicos::types::Element) -> JsonValue {
         }
         Value::PixelData(pd) => json!({
             "vr": "OW",
-            "Encapsulated": pd.is_encapsulated,
-            "Frames": pd.frames.len(),
+            "Encapsulated": pd.is_compressed(),
+            "Frames": pd.num_frames(),
         }),
     }
 }

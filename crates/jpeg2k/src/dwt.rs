@@ -18,7 +18,7 @@ pub fn forward_1d(signal: &mut [i32]) {
         return;
     }
 
-    let half = (n + 1) / 2;
+    let half = n.div_ceil(2);
     let num_high = n - half;
 
     // Split into even (low) and odd (high) samples.
@@ -69,7 +69,7 @@ pub fn inverse_1d(signal: &mut [i32]) {
         return;
     }
 
-    let half = (n + 1) / 2;
+    let half = n.div_ceil(2);
     let num_high = n - half;
 
     let mut low = vec![0i32; half];
@@ -189,8 +189,8 @@ pub fn forward_multi_level(
             break;
         }
         forward_ll_region(data, width, ll_w, ll_h);
-        ll_w = (ll_w + 1) / 2;
-        ll_h = (ll_h + 1) / 2;
+        ll_w = ll_w.div_ceil(2);
+        ll_h = ll_h.div_ceil(2);
     }
     (ll_w, ll_h)
 }
@@ -203,7 +203,7 @@ pub fn inverse_multi_level(data: &mut [i32], width: usize, height: usize, levels
     let mut dims = vec![(0usize, 0usize); levels + 1];
     dims[0] = (width, height);
     for i in 1..=levels {
-        dims[i] = ((dims[i - 1].0 + 1) / 2, (dims[i - 1].1 + 1) / 2);
+        dims[i] = (dims[i - 1].0.div_ceil(2), dims[i - 1].1.div_ceil(2));
     }
 
     // Reconstruct from smallest to largest.

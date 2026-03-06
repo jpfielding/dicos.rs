@@ -141,12 +141,12 @@ pub struct SizMarker {
 impl SizMarker {
     /// Number of tiles horizontally.
     pub fn num_x_tiles(&self) -> u32 {
-        (self.x_siz - self.x_tosiz + self.x_tsiz - 1) / self.x_tsiz
+        (self.x_siz - self.x_tosiz).div_ceil(self.x_tsiz)
     }
 
     /// Number of tiles vertically.
     pub fn num_y_tiles(&self) -> u32 {
-        (self.y_siz - self.y_tosiz + self.y_tsiz - 1) / self.y_tsiz
+        (self.y_siz - self.y_tosiz).div_ceil(self.y_tsiz)
     }
 
     /// Total number of tiles.

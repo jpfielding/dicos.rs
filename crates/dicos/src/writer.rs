@@ -205,15 +205,13 @@ fn encode_value(value: &Value, vr: Vr) -> Result<(Vec<u8>, bool), DicosError> {
             Ok((b, true)) // Sequences use undefined length
         }
 
-        Value::PixelData(pd) => {
-            if pd.is_encapsulated {
-                let b = encode_encapsulated_pixel_data(pd)?;
+        Value::PixelData(pd) => match pd {
+            PixelData::Native { frames } => Ok((encode_native_pixel_data(frames), false)),
+            PixelData::Encapsulated { frames, offsets } => {
+                let b = encode_encapsulated_pixel_data(frames, offsets)?;
                 Ok((b, true)) // Encapsulated uses undefined length
-            } else {
-                let b = encode_native_pixel_data(pd);
-                Ok((b, false))
             }
-        }
+        },
     }
 }
 
@@ -248,11 +246,11 @@ fn encode_sequence(datasets: &[Dataset]) -> Result<Vec<u8>, DicosError> {
 }
 
 /// Encodes native (uncompressed) pixel data.
-fn encode_native_pixel_data(pd: &PixelData) -> Vec<u8> {
-    let total_pixels: usize = pd.frames.iter().map(|f| f.data.len()).sum();
+fn encode_native_pixel_data(frames: &[Vec<u16>]) -> Vec<u8> {
+    let total_pixels: usize = frames.iter().map(Vec::len).sum();
     let mut buf = Vec::with_capacity(total_pixels * 2);
-    for frame in &pd.frames {
-        for pixel in &frame.data {
+    for frame in frames {
+        for pixel in frame {
             buf.extend_from_slice(&pixel.to_le_bytes());
         }
     }
@@ -260,24 +258,27 @@ fn encode_native_pixel_data(pd: &PixelData) -> Vec<u8> {
 }
 
 /// Encodes encapsulated (compressed) pixel data with BOT and frame items.
-fn encode_encapsulated_pixel_data(pd: &PixelData) -> Result<Vec<u8>, DicosError> {
+fn encode_encapsulated_pixel_data(
+    frames: &[Vec<u8>],
+    offsets: &[u32],
+) -> Result<Vec<u8>, DicosError> {
     let mut buf = Vec::new();
 
     // Basic Offset Table item
     buf.write_u16::<LittleEndian>(0xFFFE)?; // Item tag
     buf.write_u16::<LittleEndian>(0xE000)?;
-    let bot_len = (pd.offsets.len() * 4) as u32;
+    let bot_len = (offsets.len() * 4) as u32;
     buf.write_u32::<LittleEndian>(bot_len)?;
-    for offset in &pd.offsets {
+    for offset in offsets {
         buf.write_u32::<LittleEndian>(*offset)?;
     }
 
     // Frame items
-    for frame in &pd.frames {
+    for frame in frames {
         buf.write_u16::<LittleEndian>(0xFFFE)?;
         buf.write_u16::<LittleEndian>(0xE000)?;
-        buf.write_u32::<LittleEndian>(frame.compressed_data.len() as u32)?;
-        buf.write_all(&frame.compressed_data)?;
+        buf.write_u32::<LittleEndian>(frame.len() as u32)?;
+        buf.write_all(frame)?;
     }
 
     // Sequence Delimitation Item
@@ -318,7 +319,6 @@ mod tests {
     use crate::reader;
     use crate::tag;
     use crate::transfer;
-    use crate::types::Frame;
 
     /// Helper: build a dataset, write it, read it back, and verify roundtrip.
     fn roundtrip(ds: &Dataset) -> Dataset {
@@ -457,14 +457,7 @@ mod tests {
         ds.put_u16(tag::COLUMNS, Vr::US, 4);
 
         let compressed_frame = vec![0xFF, 0xD8, 0x00, 0x01, 0x02, 0x03];
-        let pd = PixelData {
-            is_encapsulated: true,
-            frames: vec![Frame {
-                data: Vec::new(),
-                compressed_data: compressed_frame.clone(),
-            }],
-            offsets: vec![0],
-        };
+        let pd = PixelData::encapsulated(vec![compressed_frame.clone()], vec![0]);
         ds.insert(Element::new(tag::PIXEL_DATA, Vr::OW, Value::PixelData(pd)));
 
         let rt = roundtrip(&ds);
@@ -472,10 +465,10 @@ mod tests {
         let pd_elem = rt.get(tag::PIXEL_DATA).expect("should have pixel data");
         match &pd_elem.value {
             Value::PixelData(pd) => {
-                assert!(pd.is_encapsulated);
+                assert!(pd.is_compressed());
                 assert_eq!(pd.num_frames(), 1);
-                assert_eq!(pd.frames[0].compressed_data, compressed_frame);
-                assert_eq!(pd.offsets, vec![0]);
+                assert_eq!(pd.encapsulated_frame(0), Some(compressed_frame.as_slice()));
+                assert_eq!(pd.offsets(), &[0]);
             }
             other => panic!("expected PixelData, got {other:?}"),
         }
@@ -530,20 +523,10 @@ mod tests {
             transfer::EXPLICIT_VR_LITTLE_ENDIAN,
         );
 
-        let pd = PixelData {
-            is_encapsulated: true,
-            frames: vec![
-                Frame {
-                    data: Vec::new(),
-                    compressed_data: vec![0x01, 0x02, 0x03, 0x04],
-                },
-                Frame {
-                    data: Vec::new(),
-                    compressed_data: vec![0x05, 0x06, 0x07, 0x08],
-                },
-            ],
-            offsets: vec![0, 12],
-        };
+        let pd = PixelData::encapsulated(
+            vec![vec![0x01, 0x02, 0x03, 0x04], vec![0x05, 0x06, 0x07, 0x08]],
+            vec![0, 12],
+        );
         ds.insert(Element::new(tag::PIXEL_DATA, Vr::OW, Value::PixelData(pd)));
 
         let rt = roundtrip(&ds);
@@ -551,8 +534,8 @@ mod tests {
         match &pd_elem.value {
             Value::PixelData(pd) => {
                 assert_eq!(pd.num_frames(), 2);
-                assert_eq!(pd.frames[0].compressed_data, vec![0x01, 0x02, 0x03, 0x04]);
-                assert_eq!(pd.frames[1].compressed_data, vec![0x05, 0x06, 0x07, 0x08]);
+                assert_eq!(pd.encapsulated_frame(0), Some(&[0x01, 0x02, 0x03, 0x04][..]));
+                assert_eq!(pd.encapsulated_frame(1), Some(&[0x05, 0x06, 0x07, 0x08][..]));
             }
             other => panic!("expected PixelData, got {other:?}"),
         }

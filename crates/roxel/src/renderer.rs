@@ -42,6 +42,14 @@ pub enum Quality {
     High,
 }
 
+/// Per-frame render inputs that vary independently of the renderer state.
+pub struct RenderParams<'a> {
+    pub camera: &'a Camera,
+    pub viewport: [u32; 2],
+    pub threats: &'a [ThreatBox],
+    pub show_threats: bool,
+}
+
 /// GPU volume renderer state.
 pub struct VolumeRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -576,16 +584,14 @@ impl VolumeRenderer {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target_view: &wgpu::TextureView,
-        camera: &Camera,
-        width: u32,
-        height: u32,
-        threats: &[ThreatBox],
-        show_threats: bool,
+        params: RenderParams<'_>,
     ) {
         let bind_group = match &self.bind_group {
             Some(bg) => bg,
             None => return, // No volume loaded yet.
         };
+        let camera = params.camera;
+        let [width, height] = params.viewport;
 
         let max_dim = self.dim_x.max(self.dim_y).max(self.dim_z) as f32;
         let base_voxel_size = if max_dim > 0.0 { 1.0 / max_dim } else { 0.01 };
@@ -633,8 +639,8 @@ impl VolumeRenderer {
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        let line_vertices = if show_threats {
-            self.build_threat_line_vertices(threats, camera, aspect, scale_z)
+        let line_vertices = if params.show_threats {
+            self.build_threat_line_vertices(params.threats, camera, aspect, scale_z)
         } else {
             Vec::new()
         };

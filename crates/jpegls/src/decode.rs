@@ -8,7 +8,6 @@ use crate::error::CodecError;
 use crate::bitstream::BitReader;
 use crate::context::ContextModel;
 use crate::predictor::{clamp, predict_med};
-use crate::run_mode;
 
 // ---------------------------------------------------------------------------
 // JPEG-LS markers
@@ -283,15 +282,8 @@ fn decode_scan(
             let d2 = rb - rc;
             let d3 = rc - ra;
 
-            // Run mode disabled: existing DICOS files were encoded by the Go
-            // codec which has run mode disabled.  Enabling it here would
-            // desynchronize the bitstream and produce garbled output.
-            if false && d1 == 0 && d2 == 0 && d3 == 0 {
-                run_mode::decode_run(br, ctx, &mut curr_line, &mut x, w, ra, rb)?;
-                continue;
-            }
-
-            // Regular mode.
+            // Run mode is intentionally disabled for compatibility with
+            // existing DICOS files produced by the Go codec. Regular mode:
             let (q, sign) = ctx.get_context_index(d1, d2, d3);
 
             let mut px = predict_med(ra, rb, rc);

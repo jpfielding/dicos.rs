@@ -1,4 +1,4 @@
-//! Core DICOS data types: Dataset, Element, Value, PixelData, and Frame.
+//! Core DICOS data types: Dataset, Element, Value, and PixelData.
 //!
 //! These types represent the in-memory structure of a DICOS file after parsing,
 //! and serve as the input for writing DICOS files.
@@ -305,39 +305,44 @@ impl fmt::Display for Dataset {
 /// Pixel data with support for both native (uncompressed) and encapsulated
 /// (compressed) formats.
 ///
-/// In native format, each [`Frame`] contains decoded pixel values in `data`.
-/// In encapsulated format, each [`Frame`] contains a compressed bitstream in
-/// `compressed_data`.
+/// In native format, each frame stores decoded pixel values.
+/// In encapsulated format, each frame stores a compressed bitstream item.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PixelData {
-    /// Whether the pixel data is encapsulated (compressed).
-    pub is_encapsulated: bool,
-    /// The image frames.
-    pub frames: Vec<Frame>,
-    /// Basic Offset Table entries (encapsulated format only).
-    pub offsets: Vec<u32>,
+pub enum PixelData {
+    /// Native uncompressed pixel data.
+    Native {
+        /// The image frames as decoded pixels.
+        frames: Vec<Vec<u16>>,
+    },
+    /// Encapsulated compressed pixel data.
+    Encapsulated {
+        /// The compressed frame items.
+        frames: Vec<Vec<u8>>,
+        /// Basic Offset Table entries.
+        offsets: Vec<u32>,
+    },
 }
 
 impl PixelData {
     /// Creates new native (uncompressed) pixel data from a single frame.
     pub fn native_single(data: Vec<u16>) -> Self {
-        Self {
-            is_encapsulated: false,
-            frames: vec![Frame {
-                data,
-                compressed_data: Vec::new(),
-            }],
-            offsets: Vec::new(),
-        }
+        Self::Native { frames: vec![data] }
+    }
+
+    /// Creates native pixel data from multiple frames.
+    pub fn native(frames: Vec<Vec<u16>>) -> Self {
+        Self::Native { frames }
+    }
+
+    /// Creates encapsulated pixel data from compressed frames and BOT offsets.
+    pub fn encapsulated(frames: Vec<Vec<u8>>, offsets: Vec<u32>) -> Self {
+        Self::Encapsulated { frames, offsets }
     }
 
     /// Returns all native frames concatenated into a single slice.
     ///
     /// Returns `None` for encapsulated data.
     pub fn flat_data(&self) -> Option<Vec<u16>> {
-        if self.is_encapsulated {
-            return None;
-        }
         let mut result = Vec::new();
         self.flat_data_into(&mut result)?;
         Some(result)
@@ -347,79 +352,91 @@ impl PixelData {
     ///
     /// Returns `None` for encapsulated data.
     pub fn flat_data_into(&self, out: &mut Vec<u16>) -> Option<()> {
-        if self.is_encapsulated {
-            return None;
-        }
-        let total: usize = self.frames.iter().map(|f| f.data.len()).sum();
+        let frames = self.native_frames()?;
+        let total: usize = frames.iter().map(Vec::len).sum();
         out.clear();
         out.reserve(total);
-        for frame in &self.frames {
-            out.extend_from_slice(&frame.data);
+        for frame in frames {
+            out.extend_from_slice(frame);
         }
         Some(())
     }
 
-    /// Returns the frame at the given index, or `None` if out of bounds.
-    pub fn frame(&self, index: usize) -> Option<&Frame> {
-        self.frames.get(index)
+    /// Returns the native frame at the given index, or `None` if not native or out of bounds.
+    pub fn native_frame(&self, index: usize) -> Option<&[u16]> {
+        self.native_frames()?.get(index).map(Vec::as_slice)
     }
 
-    /// Returns all frames.
-    pub fn frames(&self) -> &[Frame] {
-        &self.frames
+    /// Returns the encapsulated frame at the given index, or `None` if not encapsulated or out of bounds.
+    pub fn encapsulated_frame(&self, index: usize) -> Option<&[u8]> {
+        self.encapsulated_frames()?.get(index).map(Vec::as_slice)
+    }
+
+    /// Returns the native frames when the pixel data is uncompressed.
+    pub fn native_frames(&self) -> Option<&[Vec<u16>]> {
+        match self {
+            PixelData::Native { frames } => Some(frames),
+            PixelData::Encapsulated { .. } => None,
+        }
+    }
+
+    /// Returns the encapsulated frames when the pixel data is compressed.
+    pub fn encapsulated_frames(&self) -> Option<&[Vec<u8>]> {
+        match self {
+            PixelData::Encapsulated { frames, .. } => Some(frames),
+            PixelData::Native { .. } => None,
+        }
+    }
+
+    /// Returns the encapsulated Basic Offset Table entries, or an empty slice for native data.
+    pub fn offsets(&self) -> &[u32] {
+        match self {
+            PixelData::Encapsulated { offsets, .. } => offsets,
+            PixelData::Native { .. } => &[],
+        }
     }
 
     /// Iterates all native pixels across all frames.
     pub fn iter_native_pixels(&self) -> impl Iterator<Item = u16> + '_ {
-        (!self.is_encapsulated)
-            .then_some(
-                self.frames
-                    .iter()
-                    .flat_map(|frame| frame.data.iter().copied()),
-            )
+        self.native_frames()
             .into_iter()
             .flatten()
+            .flat_map(|frame| frame.iter().copied())
     }
 
     /// Returns the number of frames.
     pub fn num_frames(&self) -> usize {
-        self.frames.len()
+        match self {
+            PixelData::Native { frames } => frames.len(),
+            PixelData::Encapsulated { frames, .. } => frames.len(),
+        }
     }
 
     /// Returns `true` if the pixel data is compressed.
     pub fn is_compressed(&self) -> bool {
-        self.is_encapsulated
+        matches!(self, PixelData::Encapsulated { .. })
     }
 
     /// Returns `true` if at least one frame is present.
     pub fn has_frames(&self) -> bool {
-        !self.frames.is_empty()
+        self.num_frames() > 0
     }
 
     /// Returns the number of pixels in the first frame (native only), or 0.
     pub fn frame_size(&self) -> usize {
-        if self.is_encapsulated || self.frames.is_empty() {
-            return 0;
+        match self {
+            PixelData::Native { frames } => frames.first().map_or(0, Vec::len),
+            PixelData::Encapsulated { .. } => 0,
         }
-        self.frames[0].data.len()
     }
 
     /// Returns the total number of pixels across all frames (native only), or 0.
     pub fn total_pixels(&self) -> usize {
-        if self.is_encapsulated {
-            return 0;
+        match self {
+            PixelData::Native { frames } => frames.iter().map(Vec::len).sum(),
+            PixelData::Encapsulated { .. } => 0,
         }
-        self.frames.iter().map(|f| f.data.len()).sum()
     }
-}
-
-/// A single frame (image slice) of pixel data.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Frame {
-    /// Native (uncompressed) pixel values, stored as u16.
-    pub data: Vec<u16>,
-    /// Compressed pixel bitstream (encapsulated format).
-    pub compressed_data: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -503,9 +520,9 @@ mod tests {
         assert_eq!(Value::U32(100_000).as_u32(), Some(100_000));
         assert_eq!(Value::I32(-5).as_i32(), Some(-5));
         assert_eq!(Value::I16(-3).as_i32(), Some(-3));
-        assert_eq!(Value::F64(3.14).as_f64(), Some(3.14));
+        assert_eq!(Value::F64(2.5).as_f64(), Some(2.5));
         assert_eq!(Value::Str("123".into()).as_u16(), Some(123));
-        assert_eq!(Value::Str("3.14".into()).as_f64(), Some(3.14));
+        assert_eq!(Value::Str("2.5".into()).as_f64(), Some(2.5));
         assert_eq!(Value::Str("hello".into()).as_str(), Some("hello"));
     }
 
@@ -539,25 +556,12 @@ mod tests {
 
     #[test]
     fn pixel_data_native_helpers() {
-        let pd = PixelData {
-            is_encapsulated: false,
-            frames: vec![
-                Frame {
-                    data: vec![1, 2],
-                    compressed_data: Vec::new(),
-                },
-                Frame {
-                    data: vec![3, 4],
-                    compressed_data: Vec::new(),
-                },
-            ],
-            offsets: Vec::new(),
-        };
+        let pd = PixelData::native(vec![vec![1, 2], vec![3, 4]]);
 
         let mut out = Vec::new();
         assert_eq!(pd.flat_data_into(&mut out), Some(()));
         assert_eq!(out, vec![1, 2, 3, 4]);
-        assert_eq!(pd.frames().len(), 2);
+        assert_eq!(pd.native_frames().unwrap().len(), 2);
         assert_eq!(
             pd.iter_native_pixels().collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
@@ -566,14 +570,7 @@ mod tests {
 
     #[test]
     fn pixel_data_encapsulated() {
-        let pd = PixelData {
-            is_encapsulated: true,
-            frames: vec![Frame {
-                data: Vec::new(),
-                compressed_data: vec![0xFF, 0xD8, 0x01, 0x02],
-            }],
-            offsets: vec![0],
-        };
+        let pd = PixelData::encapsulated(vec![vec![0xFF, 0xD8, 0x01, 0x02]], vec![0]);
         assert!(pd.is_compressed());
         assert!(pd.has_frames());
         assert_eq!(pd.frame_size(), 0);
@@ -583,26 +580,13 @@ mod tests {
 
     #[test]
     fn pixel_data_multi_frame() {
-        let pd = PixelData {
-            is_encapsulated: false,
-            frames: vec![
-                Frame {
-                    data: vec![1, 2, 3, 4],
-                    compressed_data: Vec::new(),
-                },
-                Frame {
-                    data: vec![5, 6, 7, 8],
-                    compressed_data: Vec::new(),
-                },
-            ],
-            offsets: Vec::new(),
-        };
+        let pd = PixelData::native(vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
         assert_eq!(pd.num_frames(), 2);
         assert_eq!(pd.total_pixels(), 8);
         assert_eq!(pd.flat_data(), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
-        assert_eq!(pd.frame(0).unwrap().data, vec![1, 2, 3, 4]);
-        assert_eq!(pd.frame(1).unwrap().data, vec![5, 6, 7, 8]);
-        assert!(pd.frame(2).is_none());
+        assert_eq!(pd.native_frame(0), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(pd.native_frame(1), Some(&[5, 6, 7, 8][..]));
+        assert!(pd.native_frame(2).is_none());
     }
 
     #[test]

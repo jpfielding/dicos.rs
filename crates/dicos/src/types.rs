@@ -101,6 +101,38 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Returns the slice of u16 values if this is `U16s`.
+    pub fn as_u16s(&self) -> Option<&[u16]> {
+        match self {
+            Value::U16s(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Returns the slice of f32 values if this is `F32s`.
+    pub fn as_f32s(&self) -> Option<&[f32]> {
+        match self {
+            Value::F32s(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Returns the slice of f64 values if this is `F64s`.
+    pub fn as_f64s(&self) -> Option<&[f64]> {
+        match self {
+            Value::F64s(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw bytes if this is `Bytes`.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// A single DICOM/DICOS data element.

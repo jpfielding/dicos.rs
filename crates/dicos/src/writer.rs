@@ -250,8 +250,20 @@ fn encode_native_pixel_data(frames: &[Vec<u16>]) -> Vec<u8> {
     let total_pixels: usize = frames.iter().map(Vec::len).sum();
     let mut buf = Vec::with_capacity(total_pixels * 2);
     for frame in frames {
-        for pixel in frame {
-            buf.extend_from_slice(&pixel.to_le_bytes());
+        // On little-endian targets the in-memory u16 layout matches DICOM LE,
+        // so we can copy the raw bytes directly.
+        #[cfg(target_endian = "little")]
+        {
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 2)
+            };
+            buf.extend_from_slice(bytes);
+        }
+        #[cfg(target_endian = "big")]
+        {
+            for pixel in frame {
+                buf.extend_from_slice(&pixel.to_le_bytes());
+            }
         }
     }
     buf

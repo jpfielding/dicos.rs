@@ -26,6 +26,26 @@ const DICM_MAGIC: &[u8; 4] = b"DICM";
 /// Sentinel for undefined length.
 const UNDEFINED_LENGTH: u32 = 0xFFFF_FFFF;
 
+/// Maximum single-element allocation (256 MB).
+const MAX_ELEMENT_LENGTH: usize = 256 * 1024 * 1024;
+
+/// Allocate a buffer of `len` bytes, rejecting unreasonable sizes.
+fn checked_alloc(len: u32) -> Result<Vec<u8>, DicosError> {
+    let n = len as usize;
+    if n > MAX_ELEMENT_LENGTH {
+        return Err(DicosError::InvalidFile(format!(
+            "element length {n} exceeds maximum ({MAX_ELEMENT_LENGTH})"
+        )));
+    }
+    Ok(vec![0u8; n])
+}
+
+/// Skip `len` bytes without allocating.
+fn skip_bytes<R: Read>(reader: &mut R, len: u32) -> Result<(), DicosError> {
+    io::copy(&mut reader.take(len as u64), &mut io::sink())?;
+    Ok(())
+}
+
 /// Parses a DICOS/DICOM file from a reader.
 ///
 /// This is the main entry point for reading DICOS files.
@@ -122,9 +142,8 @@ impl<R: Read> DicosReader<R> {
         // Sequence delimiters always have implicit structure: 4-byte length, no VR
         if tag.group == 0xFFFE {
             let len = self.inner.read_u32::<LittleEndian>()?;
-            // Item, Item Delimitation, Sequence Delimitation -- treat as raw bytes
             let value = if len > 0 && len != UNDEFINED_LENGTH {
-                let mut buf = vec![0u8; len as usize];
+                let mut buf = checked_alloc(len)?;
                 self.inner.read_exact(&mut buf)?;
                 Value::Bytes(buf)
             } else {
@@ -181,10 +200,10 @@ impl<R: Read> DicosReader<R> {
             return self.read_undefined_length_value(tag, vr);
         }
 
-        let mut data = vec![0u8; vl as usize];
+        let mut data = checked_alloc(vl)?;
         self.inner.read_exact(&mut data)?;
 
-        parse_value(vr, &data)
+        parse_value(vr, &data, self.explicit_vr)
     }
 
     /// Handles elements with undefined length: encapsulated pixel data or sequences.
@@ -256,7 +275,7 @@ impl<R: Read> DicosReader<R> {
 
     /// Reads a sequence item with a known fixed length.
     fn read_item_fixed_length(&mut self, len: u32) -> Result<Dataset, DicosError> {
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = checked_alloc(len)?;
         self.inner.read_exact(&mut buf)?;
 
         // Parse the item bytes as a mini-dataset
@@ -320,7 +339,7 @@ impl<R: Read> DicosReader<R> {
             }
 
             let item_len = self.inner.read_u32::<LittleEndian>()?;
-            let mut frame_data = vec![0u8; item_len as usize];
+            let mut frame_data = checked_alloc(item_len)?;
             self.inner.read_exact(&mut frame_data)?;
 
             frames.push(frame_data);
@@ -347,8 +366,7 @@ impl<R: Read> DicosReader<R> {
 
                 // Item start
                 if len != UNDEFINED_LENGTH && len > 0 {
-                    let mut skip_buf = vec![0u8; len as usize];
-                    self.inner.read_exact(&mut skip_buf)?;
+                    skip_bytes(&mut self.inner, len)?;
                 } else if len == UNDEFINED_LENGTH {
                     // Nested undefined length
                     self.skip_undefined_length()?;
@@ -371,16 +389,14 @@ impl<R: Read> DicosReader<R> {
                 };
 
                 if vl != UNDEFINED_LENGTH && vl > 0 {
-                    let mut skip = vec![0u8; vl as usize];
-                    self.inner.read_exact(&mut skip)?;
+                    skip_bytes(&mut self.inner, vl)?;
                 } else if vl == UNDEFINED_LENGTH {
                     self.skip_undefined_length()?;
                 }
             } else {
                 let vl = self.inner.read_u32::<LittleEndian>()?;
                 if vl != UNDEFINED_LENGTH && vl > 0 {
-                    let mut skip = vec![0u8; vl as usize];
-                    self.inner.read_exact(&mut skip)?;
+                    skip_bytes(&mut self.inner, vl)?;
                 } else if vl == UNDEFINED_LENGTH {
                     self.skip_undefined_length()?;
                 }
@@ -453,7 +469,7 @@ fn implicit_vr_for_tag(tag: Tag) -> Vr {
 }
 
 /// Parses raw bytes into a typed `Value` based on VR.
-fn parse_value(vr: Vr, data: &[u8]) -> Result<Value, DicosError> {
+fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool) -> Result<Value, DicosError> {
     match vr {
         // String types
         Vr::AE
@@ -572,8 +588,7 @@ fn parse_value(vr: Vr, data: &[u8]) -> Result<Value, DicosError> {
             if data.is_empty() {
                 return Ok(Value::Sequence(Vec::new()));
             }
-            // Attempt to parse items from the byte buffer
-            let items = parse_sequence_items(data)?;
+            let items = parse_sequence_items(data, explicit_vr)?;
             Ok(Value::Sequence(items))
         }
 
@@ -583,12 +598,13 @@ fn parse_value(vr: Vr, data: &[u8]) -> Result<Value, DicosError> {
 }
 
 /// Parses sequence items from a byte buffer (fixed-length SQ).
-fn parse_sequence_items(data: &[u8]) -> Result<Vec<Dataset>, DicosError> {
+///
+/// Reuses `DicosReader` for element parsing to avoid duplicating VR/header logic.
+fn parse_sequence_items(data: &[u8], explicit_vr: bool) -> Result<Vec<Dataset>, DicosError> {
     let mut cursor = io::Cursor::new(data);
     let mut items = Vec::new();
 
     loop {
-        // Read item tag
         let group = match cursor.read_u16::<LittleEndian>() {
             Ok(g) => g,
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -603,83 +619,53 @@ fn parse_sequence_items(data: &[u8]) -> Result<Vec<Dataset>, DicosError> {
         }
 
         if item_tag != tag::ITEM {
-            break; // Unexpected tag, stop parsing
+            return Err(DicosError::InvalidFile(format!(
+                "expected Item tag in fixed-length SQ, got {item_tag}"
+            )));
         }
 
         let item_len = cursor.read_u32::<LittleEndian>()?;
 
         if item_len == UNDEFINED_LENGTH {
-            // Cannot parse undefined-length items from a fixed buffer easily;
-            // skip this edge case
-            break;
+            return Err(DicosError::InvalidFile(
+                "undefined-length item inside fixed-length SQ".into(),
+            ));
         }
 
         let pos = cursor.position() as usize;
         let end = pos + item_len as usize;
         if end > data.len() {
-            break;
+            return Err(DicosError::InvalidFile(format!(
+                "SQ item length {item_len} exceeds buffer ({})",
+                data.len() - pos
+            )));
         }
 
         let item_bytes = &data[pos..end];
         cursor.set_position(end as u64);
 
-        // Parse item elements -- use explicit VR as default
-        let mut item_cursor = io::Cursor::new(item_bytes);
+        let mut sub_reader = DicosReader {
+            inner: io::Cursor::new(item_bytes),
+            explicit_vr,
+            transfer_syntax_uid: None,
+            in_meta: false,
+        };
+
         let mut ds = Dataset::new();
-
         loop {
-            let g = match item_cursor.read_u16::<LittleEndian>() {
-                Ok(g) => g,
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(_) => break,
-            };
-            let el = match item_cursor.read_u16::<LittleEndian>() {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-            let t = Tag::new(g, el);
-
-            if t.group == 0xFFFE {
-                // Delimiter within item
-                let _ = item_cursor.read_u32::<LittleEndian>();
-                break;
-            }
-
-            // Read VR (explicit)
-            let mut vr_buf = [0u8; 2];
-            if item_cursor.read_exact(&mut vr_buf).is_err() {
-                break;
-            }
-            let vr = Vr::from_bytes(&vr_buf).unwrap_or(Vr::UN);
-
-            let vl = if vr.is_long_vr() {
-                let mut reserved = [0u8; 2];
-                if item_cursor.read_exact(&mut reserved).is_err() {
-                    break;
-                }
-                match item_cursor.read_u32::<LittleEndian>() {
-                    Ok(v) => v,
-                    Err(_) => break,
-                }
-            } else {
-                match item_cursor.read_u16::<LittleEndian>() {
-                    Ok(v) => u32::from(v),
-                    Err(_) => break,
-                }
+            let tag = match sub_reader.read_tag() {
+                Ok(t) => t,
+                Err(DicosError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
             };
 
-            if vl == UNDEFINED_LENGTH || vl as u64 > item_cursor.get_ref().len() as u64 {
+            if tag.group == 0xFFFE {
+                let _ = sub_reader.inner.read_u32::<LittleEndian>();
                 break;
             }
 
-            let mut val_buf = vec![0u8; vl as usize];
-            if item_cursor.read_exact(&mut val_buf).is_err() {
-                break;
-            }
-
-            if let Ok(value) = parse_value(vr, &val_buf) {
-                ds.insert(Element::new(t, vr, value));
-            }
+            let elem = sub_reader.read_element_with_tag(tag)?;
+            ds.insert(elem);
         }
 
         items.push(ds);

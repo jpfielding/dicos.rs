@@ -17,28 +17,12 @@ use crate::codec::Codec;
     feature = "jpegli",
     feature = "jpeg2k"
 ))]
-use crate::error::CodecError;
-#[cfg(any(
-    feature = "rle",
-    feature = "jpegls",
-    feature = "jpegli",
-    feature = "jpeg2k"
-))]
-use crate::img::GrayImage;
-#[cfg(any(
-    feature = "rle",
-    feature = "jpegls",
-    feature = "jpegli",
-    feature = "jpeg2k"
-))]
-use crate::transfer;
-#[cfg(any(
-    feature = "rle",
-    feature = "jpegls",
-    feature = "jpegli",
-    feature = "jpeg2k"
-))]
-use std::io::Write;
+use {
+    crate::error::CodecError,
+    crate::img::GrayImage,
+    crate::transfer,
+    std::io::Write,
+};
 
 // ---------------------------------------------------------------------------
 // Codec adapter structs -- bridge raw codec crate APIs to the Codec trait
@@ -256,11 +240,14 @@ pub fn sniff_codec(data: &[u8]) -> Option<&'static dyn Codec> {
         return Some(&JPEG2K_CODEC);
     }
 
+    // JPEG-LS / JPEG Lossless: SOF markers appear in the header, so limit
+    // the scan to the first 4 KB to avoid scanning multi-MB frames.
+    let probe_end = data.len().min(4096);
+
     // JPEG-LS: starts with FF D8, then SOF55 marker (FF F7)
     #[cfg(feature = "jpegls")]
     if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
-        // Scan for JPEG-LS SOF marker (FF F7)
-        for i in 2..data.len().saturating_sub(1) {
+        for i in 2..probe_end.saturating_sub(1) {
             if data[i] == 0xFF && data[i + 1] == 0xF7 {
                 return Some(&JPEGLS_CODEC);
             }
@@ -270,7 +257,7 @@ pub fn sniff_codec(data: &[u8]) -> Option<&'static dyn Codec> {
     // JPEG Lossless: starts with FF D8, then SOF3 marker (FF C3)
     #[cfg(feature = "jpegli")]
     if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
-        for i in 2..data.len().saturating_sub(1) {
+        for i in 2..probe_end.saturating_sub(1) {
             if data[i] == 0xFF && data[i + 1] == 0xC3 {
                 return Some(&JPEGLI_CODEC);
             }

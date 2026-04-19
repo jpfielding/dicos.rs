@@ -48,31 +48,40 @@ pub struct Volume {
 
 impl Volume {
     /// Compute the density-weighted center of mass in normalized [0,1] coordinates.
+    ///
+    /// Single linear pass: computes min/max for threshold, then accumulates
+    /// weighted coordinates using flat-index arithmetic to avoid nested loops.
     pub fn center_of_mass(&self) -> [f32; 3] {
         if self.data.is_empty() {
             return [0.5, 0.5, 0.5];
         }
 
-        let min_val = *self.data.iter().min().unwrap_or(&0) as f64;
-        let max_val = *self.data.iter().max().unwrap_or(&0) as f64;
-        let threshold = min_val + (max_val - min_val) * 0.1;
+        let mut min_val = u16::MAX;
+        let mut max_val = u16::MIN;
+        for &v in &self.data {
+            min_val = min_val.min(v);
+            max_val = max_val.max(v);
+        }
+        let threshold = min_val as f64 + (max_val as f64 - min_val as f64) * 0.1;
 
+        let dx = self.dim_x;
+        let dxy = self.dim_x * self.dim_y;
         let mut sum_x = 0.0f64;
         let mut sum_y = 0.0f64;
         let mut sum_z = 0.0f64;
         let mut total_weight = 0.0f64;
 
-        for z in 0..self.dim_z {
-            for y in 0..self.dim_y {
-                for x in 0..self.dim_x {
-                    let val = self.data[z * self.dim_y * self.dim_x + y * self.dim_x + x] as f64;
-                    if val > threshold {
-                        sum_x += x as f64 * val;
-                        sum_y += y as f64 * val;
-                        sum_z += z as f64 * val;
-                        total_weight += val;
-                    }
-                }
+        for (i, &v) in self.data.iter().enumerate() {
+            let val = v as f64;
+            if val > threshold {
+                let z = i / dxy;
+                let rem = i % dxy;
+                let y = rem / dx;
+                let x = rem % dx;
+                sum_x += x as f64 * val;
+                sum_y += y as f64 * val;
+                sum_z += z as f64 * val;
+                total_weight += val;
             }
         }
 
@@ -114,81 +123,66 @@ impl Volume {
     /// Pack volume data for GPU upload as `RGBA16Unorm`.
     ///
     /// Each voxel becomes 4 `u16` values: `[density, grad_x+0.5, grad_y+0.5, grad_z+0.5]`.
-    /// Gradients are computed using central differences and offset by 0.5 to
-    /// fit in unsigned texture range.
+    /// Gradients use central differences, offset by 0.5 for unsigned texture range.
+    ///
+    /// Uses precomputed strides and minimizes bounds checks by handling
+    /// interior voxels (no clamping needed) separately from edges.
     pub fn pack_for_gpu(&self) -> Vec<u16> {
-        let total = self.dim_x * self.dim_y * self.dim_z;
+        let dx = self.dim_x;
+        let dy = self.dim_y;
+        let dz = self.dim_z;
+        let total = dx * dy * dz;
         let mut packed = vec![0u16; total * 4];
 
-        // Gradients are normalized by full u16 range so packed values map to
-        // [0, 1] in the UNorm texture.
         let inv_range = 1.0 / 65535.0f32;
+        let stride_y = dx;
+        let stride_z = dx * dy;
+        let data = &self.data;
 
-        for z in 0..self.dim_z {
-            for y in 0..self.dim_y {
-                for x in 0..self.dim_x {
-                    let idx = z * self.dim_y * self.dim_x + y * self.dim_x + x;
-                    let gx = self.gradient_x(x, y, z) * inv_range;
-                    let gy = self.gradient_y(x, y, z) * inv_range;
-                    let gz = self.gradient_z(x, y, z) * inv_range;
-
+        for z in 0..dz {
+            let z_base = z * stride_z;
+            let z_is_edge = z == 0 || z == dz - 1;
+            for y in 0..dy {
+                let yz_base = z_base + y * stride_y;
+                let y_is_edge = y == 0 || y == dy - 1;
+                for x in 0..dx {
+                    let idx = yz_base + x;
                     let pi = idx * 4;
-                    // Density maps directly since source is already u16.
-                    packed[pi] = self.data[idx];
-                    packed[pi + 1] = to_unorm16(gx + 0.5);
-                    packed[pi + 2] = to_unorm16(gy + 0.5);
-                    packed[pi + 3] = to_unorm16(gz + 0.5);
+                    let center = data[idx] as f32;
+
+                    let gx = if x == 0 || x == dx - 1 {
+                        let left = if x > 0 { data[idx - 1] as f32 } else { center };
+                        let right = if x < dx - 1 { data[idx + 1] as f32 } else { center };
+                        (right - left) * 0.5
+                    } else {
+                        (data[idx + 1] as f32 - data[idx - 1] as f32) * 0.5
+                    };
+
+                    let gy = if y_is_edge {
+                        let below = if y > 0 { data[idx - stride_y] as f32 } else { center };
+                        let above = if y < dy - 1 { data[idx + stride_y] as f32 } else { center };
+                        (above - below) * 0.5
+                    } else {
+                        (data[idx + stride_y] as f32 - data[idx - stride_y] as f32) * 0.5
+                    };
+
+                    let gz = if z_is_edge {
+                        let back = if z > 0 { data[idx - stride_z] as f32 } else { center };
+                        let front = if z < dz - 1 { data[idx + stride_z] as f32 } else { center };
+                        (front - back) * 0.5
+                    } else {
+                        (data[idx + stride_z] as f32 - data[idx - stride_z] as f32) * 0.5
+                    };
+
+                    packed[pi] = data[idx];
+                    packed[pi + 1] = to_unorm16(gx * inv_range + 0.5);
+                    packed[pi + 2] = to_unorm16(gy * inv_range + 0.5);
+                    packed[pi + 3] = to_unorm16(gz * inv_range + 0.5);
                 }
             }
         }
 
         packed
-    }
-
-    fn sample(&self, x: usize, y: usize, z: usize) -> f32 {
-        self.data[z * self.dim_y * self.dim_x + y * self.dim_x + x] as f32
-    }
-
-    fn gradient_x(&self, x: usize, y: usize, z: usize) -> f32 {
-        let left = if x > 0 {
-            self.sample(x - 1, y, z)
-        } else {
-            self.sample(x, y, z)
-        };
-        let right = if x < self.dim_x - 1 {
-            self.sample(x + 1, y, z)
-        } else {
-            self.sample(x, y, z)
-        };
-        (right - left) * 0.5
-    }
-
-    fn gradient_y(&self, x: usize, y: usize, z: usize) -> f32 {
-        let below = if y > 0 {
-            self.sample(x, y - 1, z)
-        } else {
-            self.sample(x, y, z)
-        };
-        let above = if y < self.dim_y - 1 {
-            self.sample(x, y + 1, z)
-        } else {
-            self.sample(x, y, z)
-        };
-        (above - below) * 0.5
-    }
-
-    fn gradient_z(&self, x: usize, y: usize, z: usize) -> f32 {
-        let back = if z > 0 {
-            self.sample(x, y, z - 1)
-        } else {
-            self.sample(x, y, z)
-        };
-        let front = if z < self.dim_z - 1 {
-            self.sample(x, y, z + 1)
-        } else {
-            self.sample(x, y, z)
-        };
-        (front - back) * 0.5
     }
 }
 
@@ -238,6 +232,47 @@ fn parse_text(value: &Value) -> Option<String> {
     }
 }
 
+/// Try to parse raw bytes as a textual numeric list (backslash/comma/space separated).
+fn parse_numeric_text(raw: &[u8]) -> Option<Vec<f64>> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let parsed: Vec<f64> = s
+        .trim()
+        .trim_matches('\0')
+        .split(['\\', ',', ';', ' '])
+        .filter_map(|part| {
+            let p = part.trim();
+            if p.is_empty() {
+                None
+            } else {
+                p.parse::<f64>().ok()
+            }
+        })
+        .collect();
+    if parsed.is_empty() { None } else { Some(parsed) }
+}
+
+/// Try to parse raw bytes as little-endian f32 triples/values.
+fn parse_le_f32s(raw: &[u8]) -> Option<Vec<f64>> {
+    if raw.len() % 4 != 0 {
+        return None;
+    }
+    let values: Vec<f64> = raw
+        .chunks_exact(4)
+        .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect();
+    if values.iter().all(|v| v.is_finite()) { Some(values) } else { None }
+}
+
+/// Parse raw bytes as little-endian u16 values.
+fn parse_le_u16s(raw: &[u8]) -> Vec<f64> {
+    if raw.len() % 2 != 0 {
+        return Vec::new();
+    }
+    raw.chunks_exact(2)
+        .map(|c| f64::from(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
 fn parse_numbers(value: &Value) -> Vec<f64> {
     match value {
         Value::Str(s) => s
@@ -262,49 +297,14 @@ fn parse_numbers(value: &Value) -> Vec<f64> {
             if raw.is_empty() {
                 return Vec::new();
             }
-
-            // DICOS files may encode ROI coordinates in UN either as textual
-            // DS values or as binary float triples.
-            if let Ok(s) = std::str::from_utf8(raw) {
-                let parsed: Vec<f64> = s
-                    .trim()
-                    .trim_matches('\0')
-                    .split(['\\', ',', ';', ' '])
-                    .filter_map(|part| {
-                        let p = part.trim();
-                        if p.is_empty() {
-                            None
-                        } else {
-                            p.parse::<f64>().ok()
-                        }
-                    })
-                    .collect();
-                if !parsed.is_empty() {
-                    return parsed;
-                }
+            // Precedence: text > LE f32 > LE u16
+            if let Some(v) = parse_numeric_text(raw) {
+                return v;
             }
-
-            if raw.len() % 4 == 0 {
-                let values: Vec<f64> = raw
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        f64::from(f)
-                    })
-                    .collect();
-                if values.iter().all(|v| v.is_finite()) {
-                    return values;
-                }
+            if let Some(v) = parse_le_f32s(raw) {
+                return v;
             }
-
-            if raw.len() % 2 == 0 {
-                return raw
-                    .chunks_exact(2)
-                    .map(|chunk| f64::from(u16::from_le_bytes([chunk[0], chunk[1]])))
-                    .collect();
-            }
-
-            Vec::new()
+            parse_le_u16s(raw)
         }
         _ => Vec::new(),
     }
@@ -664,6 +664,15 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         return Err(DicosError::InvalidFile("Rows or Columns is zero".into()));
     }
 
+    let expected_pixels = cols
+        .checked_mul(rows)
+        .and_then(|v| v.checked_mul(num_frames))
+        .ok_or_else(|| {
+            DicosError::InvalidFile(format!(
+                "pixel count overflow: {cols} x {rows} x {num_frames}"
+            ))
+        })?;
+
     // Get window center/width. If metadata provides multiple presets, we'll
     // later fall back to a data-derived window to keep viewer defaults stable.
     let wc_values = ds.get_strs(tag::WINDOW_CENTER);
@@ -700,7 +709,7 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         .get(tag::PIXEL_DATA)
         .ok_or_else(|| DicosError::InvalidFile("Missing PixelData (7FE0,0010)".into()))?;
 
-    let mut all_pixels = Vec::with_capacity(cols * rows * num_frames);
+    let mut all_pixels = Vec::with_capacity(expected_pixels);
 
     match &pixel_data.value {
         Value::PixelData(PixelData::Native { frames }) => {
@@ -721,6 +730,11 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
             }
         }
         Value::Bytes(raw) => {
+            if raw.len() % 2 != 0 {
+                return Err(DicosError::InvalidFile(
+                    "native pixel data has odd byte length".into(),
+                ));
+            }
             for chunk in raw.chunks_exact(2) {
                 all_pixels.push(u16::from_le_bytes([chunk[0], chunk[1]]));
             }
@@ -730,6 +744,13 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
                 "PixelData has unexpected type".into(),
             ));
         }
+    }
+
+    if all_pixels.len() != expected_pixels {
+        return Err(DicosError::InvalidFile(format!(
+            "pixel count mismatch: expected {} ({}x{}x{}), got {}",
+            expected_pixels, cols, rows, num_frames, all_pixels.len()
+        )));
     }
 
     let (dim_x, dim_y, dim_z) = if num_frames > 1 {

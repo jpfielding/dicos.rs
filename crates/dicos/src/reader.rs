@@ -26,15 +26,15 @@ const DICM_MAGIC: &[u8; 4] = b"DICM";
 /// Sentinel for undefined length.
 const UNDEFINED_LENGTH: u32 = 0xFFFF_FFFF;
 
-/// Maximum single-element allocation (256 MB).
-const MAX_ELEMENT_LENGTH: usize = 256 * 1024 * 1024;
+/// Default per-element allocation limit (1 GB).
+const DEFAULT_MAX_ELEMENT_LENGTH: usize = 1024 * 1024 * 1024;
 
-/// Allocate a buffer of `len` bytes, rejecting unreasonable sizes.
-fn checked_alloc(len: u32) -> Result<Vec<u8>, DicosError> {
+/// Allocate a buffer of `len` bytes, rejecting sizes above `limit`.
+fn checked_alloc(len: u32, limit: usize) -> Result<Vec<u8>, DicosError> {
     let n = len as usize;
-    if n > MAX_ELEMENT_LENGTH {
+    if n > limit {
         return Err(DicosError::InvalidFile(format!(
-            "element length {n} exceeds maximum ({MAX_ELEMENT_LENGTH})"
+            "element length {n} exceeds limit ({limit})"
         )));
     }
     Ok(vec![0u8; n])
@@ -48,9 +48,22 @@ fn skip_bytes<R: Read>(reader: &mut R, len: u32) -> Result<(), DicosError> {
 
 /// Parses a DICOS/DICOM file from a reader.
 ///
-/// This is the main entry point for reading DICOS files.
+/// Uses a default per-element allocation limit of 1 GB. For custom limits,
+/// use [`parse_with_limit`].
 pub fn parse<R: Read>(reader: R) -> Result<Dataset, DicosError> {
-    let mut r = DicosReader::new(reader);
+    parse_with_limit(reader, DEFAULT_MAX_ELEMENT_LENGTH)
+}
+
+/// Parses a DICOS/DICOM file with a custom per-element allocation limit.
+///
+/// Any single element whose on-disk length exceeds `max_element_bytes` is
+/// rejected. This guards against malicious files without restricting
+/// legitimate large volumes.
+pub fn parse_with_limit<R: Read>(
+    reader: R,
+    max_element_bytes: usize,
+) -> Result<Dataset, DicosError> {
+    let mut r = DicosReader::new(reader, max_element_bytes);
     r.read_dataset()
 }
 
@@ -61,15 +74,18 @@ struct DicosReader<R> {
     transfer_syntax_uid: Option<String>,
     /// Tracks whether we are still inside group 0002 (File Meta Information).
     in_meta: bool,
+    /// Per-element allocation ceiling in bytes.
+    max_element_bytes: usize,
 }
 
 impl<R: Read> DicosReader<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, max_element_bytes: usize) -> Self {
         Self {
             inner,
             explicit_vr: true, // Group 0002 is always explicit
             transfer_syntax_uid: None,
             in_meta: true,
+            max_element_bytes,
         }
     }
 
@@ -143,7 +159,7 @@ impl<R: Read> DicosReader<R> {
         if tag.group == 0xFFFE {
             let len = self.inner.read_u32::<LittleEndian>()?;
             let value = if len > 0 && len != UNDEFINED_LENGTH {
-                let mut buf = checked_alloc(len)?;
+                let mut buf = checked_alloc(len, self.max_element_bytes)?;
                 self.inner.read_exact(&mut buf)?;
                 Value::Bytes(buf)
             } else {
@@ -200,10 +216,10 @@ impl<R: Read> DicosReader<R> {
             return self.read_undefined_length_value(tag, vr);
         }
 
-        let mut data = checked_alloc(vl)?;
+        let mut data = checked_alloc(vl, self.max_element_bytes)?;
         self.inner.read_exact(&mut data)?;
 
-        parse_value(vr, &data, self.explicit_vr)
+        parse_value(vr, &data, self.explicit_vr, self.max_element_bytes)
     }
 
     /// Handles elements with undefined length: encapsulated pixel data or sequences.
@@ -275,7 +291,7 @@ impl<R: Read> DicosReader<R> {
 
     /// Reads a sequence item with a known fixed length.
     fn read_item_fixed_length(&mut self, len: u32) -> Result<Dataset, DicosError> {
-        let mut buf = checked_alloc(len)?;
+        let mut buf = checked_alloc(len, self.max_element_bytes)?;
         self.inner.read_exact(&mut buf)?;
 
         // Parse the item bytes as a mini-dataset
@@ -284,6 +300,7 @@ impl<R: Read> DicosReader<R> {
             explicit_vr: self.explicit_vr,
             transfer_syntax_uid: self.transfer_syntax_uid.clone(),
             in_meta: false,
+            max_element_bytes: self.max_element_bytes,
         };
 
         let mut ds = Dataset::new();
@@ -339,7 +356,7 @@ impl<R: Read> DicosReader<R> {
             }
 
             let item_len = self.inner.read_u32::<LittleEndian>()?;
-            let mut frame_data = checked_alloc(item_len)?;
+            let mut frame_data = checked_alloc(item_len, self.max_element_bytes)?;
             self.inner.read_exact(&mut frame_data)?;
 
             frames.push(frame_data);
@@ -469,7 +486,7 @@ fn implicit_vr_for_tag(tag: Tag) -> Vr {
 }
 
 /// Parses raw bytes into a typed `Value` based on VR.
-fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool) -> Result<Value, DicosError> {
+fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool, max_element_bytes: usize) -> Result<Value, DicosError> {
     match vr {
         // String types
         Vr::AE
@@ -588,7 +605,7 @@ fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool) -> Result<Value, DicosErr
             if data.is_empty() {
                 return Ok(Value::Sequence(Vec::new()));
             }
-            let items = parse_sequence_items(data, explicit_vr)?;
+            let items = parse_sequence_items(data, explicit_vr, max_element_bytes)?;
             Ok(Value::Sequence(items))
         }
 
@@ -600,7 +617,7 @@ fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool) -> Result<Value, DicosErr
 /// Parses sequence items from a byte buffer (fixed-length SQ).
 ///
 /// Reuses `DicosReader` for element parsing to avoid duplicating VR/header logic.
-fn parse_sequence_items(data: &[u8], explicit_vr: bool) -> Result<Vec<Dataset>, DicosError> {
+fn parse_sequence_items(data: &[u8], explicit_vr: bool, max_element_bytes: usize) -> Result<Vec<Dataset>, DicosError> {
     let mut cursor = io::Cursor::new(data);
     let mut items = Vec::new();
 
@@ -649,6 +666,7 @@ fn parse_sequence_items(data: &[u8], explicit_vr: bool) -> Result<Vec<Dataset>, 
             explicit_vr,
             transfer_syntax_uid: None,
             in_meta: false,
+            max_element_bytes,
         };
 
         let mut ds = Dataset::new();

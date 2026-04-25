@@ -114,7 +114,14 @@ fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> 
         let length = if is_undefined_length {
             0xFFFF_FFFFu32
         } else {
-            val_bytes.len() as u32
+            u32::try_from(val_bytes.len()).map_err(|_| {
+                DicosError::Validation(format!(
+                    "value too large for element {} ({} bytes, max {})",
+                    elem.tag,
+                    val_bytes.len(),
+                    u32::MAX
+                ))
+            })?
         };
         w.write_u32::<LittleEndian>(length)?;
     } else {
@@ -124,7 +131,14 @@ fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> 
                 elem.vr
             )));
         }
-        w.write_u16::<LittleEndian>(val_bytes.len() as u16)?;
+        let length = u16::try_from(val_bytes.len()).map_err(|_| {
+            DicosError::Validation(format!(
+                "value too large for short-VR element {} ({} bytes, max 65535)",
+                elem.tag,
+                val_bytes.len()
+            ))
+        })?;
+        w.write_u16::<LittleEndian>(length)?;
     }
 
     // Value bytes
@@ -231,7 +245,13 @@ fn encode_sequence(datasets: &[Dataset]) -> Result<Vec<u8>, DicosError> {
         }
 
         // Item length
-        buf.write_u32::<LittleEndian>(item_buf.len() as u32)?;
+        buf.write_u32::<LittleEndian>(u32::try_from(item_buf.len()).map_err(|_| {
+            DicosError::Validation(format!(
+                "sequence item too large ({} bytes, max {})",
+                item_buf.len(),
+                u32::MAX
+            ))
+        })?)?;
 
         // Item data
         buf.write_all(&item_buf)?;
@@ -279,7 +299,9 @@ fn encode_encapsulated_pixel_data(
     // Basic Offset Table item
     buf.write_u16::<LittleEndian>(0xFFFE)?; // Item tag
     buf.write_u16::<LittleEndian>(0xE000)?;
-    let bot_len = (offsets.len() * 4) as u32;
+    let bot_len = u32::try_from(offsets.len() * 4).map_err(|_| {
+        DicosError::Validation("Basic Offset Table too large".into())
+    })?;
     buf.write_u32::<LittleEndian>(bot_len)?;
     for offset in offsets {
         buf.write_u32::<LittleEndian>(*offset)?;
@@ -289,7 +311,13 @@ fn encode_encapsulated_pixel_data(
     for frame in frames {
         buf.write_u16::<LittleEndian>(0xFFFE)?;
         buf.write_u16::<LittleEndian>(0xE000)?;
-        buf.write_u32::<LittleEndian>(frame.len() as u32)?;
+        buf.write_u32::<LittleEndian>(u32::try_from(frame.len()).map_err(|_| {
+            DicosError::Validation(format!(
+                "compressed frame too large ({} bytes, max {})",
+                frame.len(),
+                u32::MAX
+            ))
+        })?)?;
         buf.write_all(frame)?;
     }
 

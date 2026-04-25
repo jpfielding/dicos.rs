@@ -1077,4 +1077,133 @@ mod tests {
             other => panic!("expected Bytes, got {other:?}"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Fixed-length SQ parsing tests (issue #3)
+    // -----------------------------------------------------------------------
+
+    /// Encodes a single element in explicit-VR wire format: tag | VR | len | value.
+    fn encode_explicit_elem(elem: &Element) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&elem.tag.group.to_le_bytes());
+        buf.extend_from_slice(&elem.tag.element.to_le_bytes());
+        buf.extend_from_slice(&elem.vr.as_bytes());
+        let val = encode_value_bytes(&elem.value);
+        if elem.vr.is_long_vr() {
+            buf.extend_from_slice(&[0, 0]); // reserved
+            buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        } else {
+            buf.extend_from_slice(&(val.len() as u16).to_le_bytes());
+        }
+        buf.extend_from_slice(&val);
+        buf
+    }
+
+    /// Wraps `content` in a fixed-length SQ item: FFFE,E000 | 4-byte len | content.
+    fn build_sq_item(content: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        buf.extend_from_slice(&0xE000u16.to_le_bytes());
+        buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        buf.extend_from_slice(content);
+        buf
+    }
+
+    /// Wraps `items_bytes` in a fixed-length SQ element (long VR encoding).
+    fn build_fixed_sq(sq_tag: Tag, items_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&sq_tag.group.to_le_bytes());
+        buf.extend_from_slice(&sq_tag.element.to_le_bytes());
+        buf.extend_from_slice(b"SQ");
+        buf.extend_from_slice(&[0u8, 0u8]); // reserved (long VR)
+        buf.extend_from_slice(&(items_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(items_bytes);
+        buf
+    }
+
+    /// A well-formed fixed-length SQ with one item containing a valid element
+    /// must parse correctly and return the expected value.
+    #[test]
+    fn parse_fixed_length_sq_valid_item() {
+        // Build one item containing (0028,0010) Rows = 128.
+        let inner = encode_explicit_elem(&Element::new(tag::ROWS, Vr::US, Value::U16(128)));
+        let item_bytes = build_sq_item(&inner);
+        let sq_bytes = build_fixed_sq(tag::REFERENCED_IMAGE_SEQUENCE, &item_bytes);
+
+        let mut file = build_minimal_explicit_vr_le(&[]);
+        file.extend_from_slice(&sq_bytes);
+
+        let ds = parse(io::Cursor::new(file)).expect("valid fixed-length SQ should parse");
+        let sq_elem = ds
+            .get(tag::REFERENCED_IMAGE_SEQUENCE)
+            .expect("SQ element must be present");
+
+        match &sq_elem.value {
+            Value::Sequence(items) => {
+                assert_eq!(items.len(), 1, "expected exactly one item");
+                assert_eq!(items[0].rows(), 128, "inner element should decode rows=128");
+            }
+            other => panic!("expected Value::Sequence, got {other:?}"),
+        }
+    }
+
+    /// A fixed-length SQ whose item length field claims more bytes than are
+    /// present in the buffer must return an error rather than silently returning
+    /// partial data.
+    ///
+    /// This is the primary regression guard for issue #3: before the fix the
+    /// inner loop would `break` on the I/O error and return an empty Dataset
+    /// without surfacing the problem to the caller.
+    #[test]
+    fn parse_fixed_length_sq_item_length_exceeds_buffer_returns_error() {
+        // Item claims 64 bytes of content but only 4 bytes follow.
+        let mut items_bytes = Vec::new();
+        items_bytes.extend_from_slice(&0xFFFEu16.to_le_bytes()); // item group
+        items_bytes.extend_from_slice(&0xE000u16.to_le_bytes()); // item element
+        items_bytes.extend_from_slice(&64u32.to_le_bytes()); // claimed length: 64
+        items_bytes.extend_from_slice(&[0x00, 0x08, 0x60, 0x00]); // only 4 actual bytes
+
+        // The SQ length matches what we actually wrote (tag 8 bytes + 4 payload bytes).
+        let sq_bytes = build_fixed_sq(tag::REFERENCED_IMAGE_SEQUENCE, &items_bytes);
+
+        let mut file = build_minimal_explicit_vr_le(&[]);
+        file.extend_from_slice(&sq_bytes);
+
+        let result = parse(io::Cursor::new(file));
+        assert!(
+            result.is_err(),
+            "item length exceeding buffer must return an error, got Ok"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        // The error must mention the length mismatch — not just "I/O error"
+        // from a swallowed EOF.
+        assert!(
+            msg.contains("SQ item length") || msg.contains("exceeds"),
+            "error should describe the length mismatch; got: {msg}"
+        );
+    }
+
+    /// A fixed-length SQ item whose body is a valid but empty byte slice
+    /// (zero-length item) must parse as an empty Dataset, not an error.
+    #[test]
+    fn parse_fixed_length_sq_empty_item_is_valid() {
+        let item_bytes = build_sq_item(&[]);
+        let sq_bytes = build_fixed_sq(tag::REFERENCED_IMAGE_SEQUENCE, &item_bytes);
+
+        let mut file = build_minimal_explicit_vr_le(&[]);
+        file.extend_from_slice(&sq_bytes);
+
+        let ds = parse(io::Cursor::new(file)).expect("empty SQ item should parse");
+        let sq_elem = ds
+            .get(tag::REFERENCED_IMAGE_SEQUENCE)
+            .expect("SQ element must be present");
+
+        match &sq_elem.value {
+            Value::Sequence(items) => {
+                assert_eq!(items.len(), 1, "one item expected");
+                assert!(items[0].is_empty(), "item dataset should be empty");
+            }
+            other => panic!("expected Value::Sequence, got {other:?}"),
+        }
+    }
 }

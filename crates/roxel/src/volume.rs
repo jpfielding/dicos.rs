@@ -563,10 +563,42 @@ pub fn load_dicos_volume(path: &std::path::Path) -> Result<Volume, DicosError> {
     volume_from_dataset(&dataset)
 }
 
+/// Extract a sort key from a dataset for spatial slice ordering.
+///
+/// Priority:
+/// 1. `ImagePositionPatient` Z coordinate (tag 0020,0032) — most accurate.
+/// 2. `SliceLocation` (tag 0020,1041).
+/// 3. `InstanceNumber` (tag 0020,0013).
+/// 4. `filename_fallback` — position in alphabetically sorted file list.
+fn slice_sort_key(ds: &Dataset, filename_fallback: f64) -> f64 {
+    // Try ImagePositionPatient Z component (backslash-separated DS: "x\y\z").
+    if let Some(s) = ds.get_string(tag::IMAGE_POSITION_PATIENT) {
+        let parts: Vec<&str> = s.trim().split('\\').collect();
+        if parts.len() >= 3 {
+            if let Ok(z) = parts[2].trim().parse::<f64>() {
+                return z;
+            }
+        }
+    }
+    // Try SliceLocation.
+    if let Some(s) = ds.get_string(tag::SLICE_LOCATION) {
+        if let Ok(v) = s.trim().parse::<f64>() {
+            return v;
+        }
+    }
+    // Try InstanceNumber.
+    if let Some(n) = ds.get_u16(tag::INSTANCE_NUMBER) {
+        return f64::from(n);
+    }
+    filename_fallback
+}
+
 /// Load a directory of DICOS files as a single volume.
 ///
-/// Each file contributes one or more slices. Files are sorted by name to
-/// ensure consistent slice ordering.
+/// Each file contributes one or more slices. Slices are ordered by DICOM
+/// spatial metadata: `ImagePositionPatient` Z coordinate (preferred), then
+/// `SliceLocation`, then `InstanceNumber`, falling back to filename order
+/// when none of those tags are present.
 fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map_err(DicosError::Io)?
@@ -583,6 +615,7 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
         })
         .collect();
 
+    // Sort alphabetically first so filename_fallback indices are stable.
     files.sort();
 
     if files.is_empty() {
@@ -594,22 +627,61 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
 
     log::info!("Loading {} DICOS files from {}", files.len(), dir.display());
 
-    // Load the first file to get dimensions and metadata.
-    let first = load_dicos_volume(&files[0])?;
+    // Parse each file once, extract sort key, keep dataset for volume extraction.
+    let mut entries: Vec<(f64, std::path::PathBuf, Dataset)> = Vec::with_capacity(files.len());
+    for (idx, path) in files.into_iter().enumerate() {
+        let file = match std::fs::File::open(&path).map_err(DicosError::Io) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Skipping {}: {e}", path.display());
+                continue;
+            }
+        };
+        let reader = std::io::BufReader::new(file);
+        match dicos::reader::parse(reader) {
+            Ok(ds) => {
+                let key = slice_sort_key(&ds, idx as f64);
+                entries.push((key, path, ds));
+            }
+            Err(e) => {
+                log::warn!("Skipping {}: {e}", path.display());
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(DicosError::InvalidFile(
+            "No valid DICOS files could be parsed".into(),
+        ));
+    }
+
+    // Sort by spatial key; use path as tiebreaker for determinism.
+    entries.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+
+    // Extract the first volume to get dimensions and shared metadata.
+    let (_, first_path, first_ds) = entries.remove(0);
+    let first = match volume_from_dataset(&first_ds) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     let cols = first.dim_x;
     let rows = first.dim_y;
 
     let mut all_pixels = first.data;
     let mut total_slices = first.dim_z;
 
-    // Load remaining files, appending their pixel data.
-    for file in &files[1..] {
-        match load_dicos_volume(file) {
+    // Extract remaining volumes, appending their pixel data.
+    for (_, path, ds) in entries {
+        match volume_from_dataset(&ds) {
             Ok(vol) => {
                 if vol.dim_x != cols || vol.dim_y != rows {
                     log::warn!(
                         "Skipping {}: dimensions {}x{} don't match expected {}x{}",
-                        file.display(),
+                        path.display(),
                         vol.dim_x,
                         vol.dim_y,
                         cols,
@@ -621,17 +693,18 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
                 all_pixels.extend_from_slice(&vol.data);
             }
             Err(e) => {
-                log::warn!("Skipping {}: {e}", file.display());
+                log::warn!("Skipping {}: {e}", path.display());
             }
         }
     }
 
     log::info!(
-        "Assembled volume: {}x{}x{} from {} files",
+        "Assembled volume: {}x{}x{} from {} files (first: {})",
         cols,
         rows,
         total_slices,
-        files.len()
+        total_slices,
+        first_path.display()
     );
 
     let mut vol = Volume {
@@ -941,6 +1014,82 @@ mod tests {
         assert_eq!(vol.threats[0].min, [1, 1, 0]);
         assert_eq!(vol.threats[0].max, [3, 2, 0]);
         assert!(vol.threats[0].enabled);
+    }
+
+    /// Build a minimal single-pixel dataset with ImagePositionPatient set to the
+    /// given Z coordinate.
+    fn ds_with_z(z: f32) -> Dataset {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 1);
+        ds.put_string(tag::MODALITY, Vr::CS, "CT");
+        ds.put_string(
+            tag::IMAGE_POSITION_PATIENT,
+            Vr::DS,
+            &format!("0.0\\0.0\\{z}"),
+        );
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OW,
+            Value::Bytes(vec![0u8, 0u8]),
+        ));
+        ds
+    }
+
+    #[test]
+    fn slice_sort_key_image_position_patient() {
+        let ds = ds_with_z(-50.0);
+        let key = slice_sort_key(&ds, 99.0);
+        assert!(
+            (key - (-50.0)).abs() < 1e-6,
+            "Expected -50.0, got {key}"
+        );
+    }
+
+    #[test]
+    fn slice_sort_key_falls_back_to_slice_location() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 1);
+        ds.put_string(tag::MODALITY, Vr::CS, "CT");
+        ds.put_string(tag::SLICE_LOCATION, Vr::DS, "12.5");
+        let key = slice_sort_key(&ds, 99.0);
+        assert!((key - 12.5).abs() < 1e-6, "Expected 12.5, got {key}");
+    }
+
+    #[test]
+    fn slice_sort_key_falls_back_to_instance_number() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 1);
+        ds.put_string(tag::MODALITY, Vr::CS, "CT");
+        ds.put_u16(tag::INSTANCE_NUMBER, Vr::IS, 7);
+        let key = slice_sort_key(&ds, 99.0);
+        assert!((key - 7.0).abs() < 1e-6, "Expected 7.0, got {key}");
+    }
+
+    #[test]
+    fn slice_sort_key_uses_filename_fallback() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 1);
+        ds.put_string(tag::MODALITY, Vr::CS, "CT");
+        // No spatial tags at all.
+        let key = slice_sort_key(&ds, 3.0);
+        assert!((key - 3.0).abs() < 1e-6, "Expected 3.0, got {key}");
+    }
+
+    #[test]
+    fn volume_from_datasets_sorted_by_z() {
+        // Build two 1x1 single-slice datasets with Z = 10 and Z = -10.
+        // When sorted by ImagePositionPatient Z, Z=-10 should be first (lower Z).
+        let ds_neg = ds_with_z(-10.0);
+        let ds_pos = ds_with_z(10.0);
+
+        let key_neg = slice_sort_key(&ds_neg, 0.0);
+        let key_pos = slice_sort_key(&ds_pos, 1.0);
+
+        assert!(key_neg < key_pos, "Z=-10 should sort before Z=10");
     }
 
     #[test]

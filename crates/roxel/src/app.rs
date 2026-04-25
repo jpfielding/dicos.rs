@@ -466,7 +466,7 @@ impl App {
 
         self.ui.volumes.clear();
         for file in &files {
-            match volume::load_dicos_volume(file) {
+            match volume::load_dicos_path(file) {
                 Ok(vol) => {
                     let name = file
                         .file_stem()

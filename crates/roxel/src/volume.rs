@@ -759,6 +759,18 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         (cols, rows, 1)
     };
 
+    let expected_pixels = dim_x * dim_y * dim_z;
+    if all_pixels.len() != expected_pixels {
+        return Err(DicosError::InvalidFile(format!(
+            "pixel data has {} pixels but {}×{}×{} = {} expected",
+            all_pixels.len(),
+            dim_x,
+            dim_y,
+            dim_z,
+            expected_pixels,
+        )));
+    }
+
     // Parse pixel spacing from either multi-valued DS or backslash-separated DS.
     let mut voxel_spacing = [1.0f64; 3];
     if let Some(parts) = ds.get_strs(tag::PIXEL_SPACING) {

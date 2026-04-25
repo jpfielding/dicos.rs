@@ -137,6 +137,14 @@ fn parse_size(s: &str) -> Result<[usize; 3], String> {
             "--size values must be >= 32 in each axis for this generator",
         ));
     }
+    if out[0] > u16::MAX as usize || out[1] > u16::MAX as usize {
+        return Err(format!(
+            "--size x and y must be at most {} (DICOM ROWS/COLUMNS u16 limit); got x={}, y={}",
+            u16::MAX,
+            out[0],
+            out[1],
+        ));
+    }
     Ok(out)
 }
 

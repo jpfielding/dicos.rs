@@ -26,6 +26,7 @@ pub struct ThreatBox {
 }
 
 /// A loaded 3D volume ready for rendering.
+#[derive(Debug)]
 pub struct Volume {
     /// Raw voxel data (uint16, 0-65535).
     pub data: Vec<u16>,
@@ -152,23 +153,43 @@ impl Volume {
 
                     let gx = if x == 0 || x == dx - 1 {
                         let left = if x > 0 { data[idx - 1] as f32 } else { center };
-                        let right = if x < dx - 1 { data[idx + 1] as f32 } else { center };
+                        let right = if x < dx - 1 {
+                            data[idx + 1] as f32
+                        } else {
+                            center
+                        };
                         (right - left) * 0.5
                     } else {
                         (data[idx + 1] as f32 - data[idx - 1] as f32) * 0.5
                     };
 
                     let gy = if y_is_edge {
-                        let below = if y > 0 { data[idx - stride_y] as f32 } else { center };
-                        let above = if y < dy - 1 { data[idx + stride_y] as f32 } else { center };
+                        let below = if y > 0 {
+                            data[idx - stride_y] as f32
+                        } else {
+                            center
+                        };
+                        let above = if y < dy - 1 {
+                            data[idx + stride_y] as f32
+                        } else {
+                            center
+                        };
                         (above - below) * 0.5
                     } else {
                         (data[idx + stride_y] as f32 - data[idx - stride_y] as f32) * 0.5
                     };
 
                     let gz = if z_is_edge {
-                        let back = if z > 0 { data[idx - stride_z] as f32 } else { center };
-                        let front = if z < dz - 1 { data[idx + stride_z] as f32 } else { center };
+                        let back = if z > 0 {
+                            data[idx - stride_z] as f32
+                        } else {
+                            center
+                        };
+                        let front = if z < dz - 1 {
+                            data[idx + stride_z] as f32
+                        } else {
+                            center
+                        };
                         (front - back) * 0.5
                     } else {
                         (data[idx + stride_z] as f32 - data[idx - stride_z] as f32) * 0.5
@@ -248,7 +269,11 @@ fn parse_numeric_text(raw: &[u8]) -> Option<Vec<f64>> {
             }
         })
         .collect();
-    if parsed.is_empty() { None } else { Some(parsed) }
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
 }
 
 /// Try to parse raw bytes as little-endian f32 triples/values.
@@ -260,7 +285,11 @@ fn parse_le_f32s(raw: &[u8]) -> Option<Vec<f64>> {
         .chunks_exact(4)
         .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
         .collect();
-    if values.iter().all(|v| v.is_finite()) { Some(values) } else { None }
+    if values.iter().all(|v| v.is_finite()) {
+        Some(values)
+    } else {
+        None
+    }
 }
 
 /// Parse raw bytes as little-endian u16 values.
@@ -793,12 +822,8 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         Value::PixelData(PixelData::Encapsulated { frames, .. }) => {
             let ts = ds.transfer_syntax();
             for frame in frames {
-                let decoded = dicos::codec_registry::decode_frame(
-                    frame,
-                    cols as u32,
-                    rows as u32,
-                    ts.uid(),
-                )?;
+                let decoded =
+                    dicos::codec_registry::decode_frame(frame, cols as u32, rows as u32, ts.uid())?;
                 all_pixels.extend_from_slice(&decoded);
             }
         }
@@ -822,7 +847,11 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
     if all_pixels.len() != expected_pixels {
         return Err(DicosError::InvalidFile(format!(
             "pixel count mismatch: expected {} ({}x{}x{}), got {}",
-            expected_pixels, cols, rows, num_frames, all_pixels.len()
+            expected_pixels,
+            cols,
+            rows,
+            num_frames,
+            all_pixels.len()
         )));
     }
 
@@ -1146,5 +1175,215 @@ mod tests {
         assert_eq!(vol.threats[0].name, "7 (ltr_0)");
         assert_eq!(vol.threats[0].min, [2, 3, 4]);
         assert_eq!(vol.threats[0].max, [8, 9, 10]);
+    }
+
+    // -----------------------------------------------------------------------
+    // volume_from_dataset edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn volume_from_dataset_zero_rows_errors() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 0);
+        ds.put_u16(tag::COLUMNS, Vr::US, 4);
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(result, Err(dicos::error::DicosError::InvalidFile(_))),
+            "expected InvalidFile, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn volume_from_dataset_zero_columns_errors() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 4);
+        ds.put_u16(tag::COLUMNS, Vr::US, 0);
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(result, Err(dicos::error::DicosError::InvalidFile(_))),
+            "expected InvalidFile, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn volume_from_dataset_missing_pixel_data_errors() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 4);
+        ds.put_u16(tag::COLUMNS, Vr::US, 4);
+        // No PIXEL_DATA inserted.
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(result, Err(dicos::error::DicosError::InvalidFile(_))),
+            "expected InvalidFile for missing pixel data, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: build a minimal valid in-memory dataset (4x4x1, all zeros).
+    // -----------------------------------------------------------------------
+
+    fn minimal_dataset(rows: u16, cols: u16) -> Dataset {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, rows);
+        ds.put_u16(tag::COLUMNS, Vr::US, cols);
+        ds.put_string(tag::MODALITY, Vr::CS, "CT");
+        let n = (rows as usize) * (cols as usize);
+        let mut bytes = vec![0u8; n * 2];
+        // make the data non-trivial so compute_window_from_data doesn't short-circuit
+        for i in 0..n {
+            let v = (i as u16).wrapping_add(1);
+            let pair = v.to_le_bytes();
+            bytes[i * 2] = pair[0];
+            bytes[i * 2 + 1] = pair[1];
+        }
+        ds.insert(Element::new(tag::PIXEL_DATA, Vr::OW, Value::Bytes(bytes)));
+        ds
+    }
+
+    // -----------------------------------------------------------------------
+    // load_threat_sidecars_from_dir tests
+    // -----------------------------------------------------------------------
+
+    /// Write a minimal DICOS file to `path` using dicos::writer.
+    fn write_minimal_dicos(path: &std::path::Path, rows: u16, cols: u16) {
+        let ds = minimal_dataset(rows, cols);
+        let mut file = std::fs::File::create(path).expect("create test file");
+        dicos::writer::write(&mut file, &ds).expect("write test dicos file");
+    }
+
+    #[test]
+    fn load_threat_sidecars_from_empty_dir() {
+        let tmpdir = std::env::temp_dir().join("dicos_test_sidecars_empty");
+        std::fs::create_dir_all(&tmpdir).ok();
+        // Ensure directory is empty.
+        for entry in std::fs::read_dir(&tmpdir).unwrap().flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+
+        let result = load_threat_sidecars_from_dir(&tmpdir, [4, 4, 1]);
+        assert!(
+            result.is_empty(),
+            "expected no sidecars from empty dir, got {result:?}"
+        );
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    #[test]
+    fn load_threat_sidecars_ignores_non_dicos_files() {
+        let tmpdir = std::env::temp_dir().join("dicos_test_sidecars_nondicos");
+        std::fs::create_dir_all(&tmpdir).ok();
+        // Place a file that is not .dcs/.dcm.
+        std::fs::write(tmpdir.join("threat_report.txt"), b"not dicos").ok();
+
+        let result = load_threat_sidecars_from_dir(&tmpdir, [4, 4, 1]);
+        assert!(
+            result.is_empty(),
+            "expected no sidecars from non-DICOS files, got {result:?}"
+        );
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    #[test]
+    fn load_threat_sidecars_ignores_files_without_threat_in_stem() {
+        let tmpdir = std::env::temp_dir().join("dicos_test_sidecars_nostem");
+        std::fs::create_dir_all(&tmpdir).ok();
+        // File has .dcs extension but stem doesn't contain "threat".
+        let path = tmpdir.join("scan.dcs");
+        write_minimal_dicos(&path, 4, 4);
+
+        let result = load_threat_sidecars_from_dir(&tmpdir, [4, 4, 1]);
+        assert!(
+            result.is_empty(),
+            "expected no sidecars for non-threat stem, got {result:?}"
+        );
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    #[test]
+    fn load_threat_sidecars_returns_empty_for_threat_file_with_no_rois() {
+        let tmpdir = std::env::temp_dir().join("dicos_test_sidecars_nothreatdata");
+        std::fs::create_dir_all(&tmpdir).ok();
+        // File name contains "threat" but dataset has no threat sequences.
+        let path = tmpdir.join("threat_report.dcs");
+        write_minimal_dicos(&path, 4, 4);
+
+        let result = load_threat_sidecars_from_dir(&tmpdir, [4, 4, 1]);
+        // The file is found and parsed, but yields zero ThreatBox entries.
+        assert!(
+            result.is_empty(),
+            "expected no threat boxes from a file with no ROI sequences, got {result:?}"
+        );
+
+        std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_unique_threats tests (via pub(crate) in app.rs)
+    // -----------------------------------------------------------------------
+
+    fn make_threat(name: &str, min: [usize; 3], max: [usize; 3]) -> ThreatBox {
+        ThreatBox {
+            name: name.to_string(),
+            confidence: None,
+            min,
+            max,
+            color: [255, 0, 0],
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn merge_unique_threats_empty_src_changes_nothing() {
+        let mut dst = vec![make_threat("A", [0, 0, 0], [1, 1, 1])];
+        let added = crate::app::merge_unique_threats(&mut dst, vec![]);
+        assert_eq!(added, 0);
+        assert_eq!(dst.len(), 1);
+    }
+
+    #[test]
+    fn merge_unique_threats_adds_unique_entries() {
+        let mut dst = vec![make_threat("A", [0, 0, 0], [1, 1, 1])];
+        let src = vec![
+            make_threat("B", [2, 2, 2], [3, 3, 3]),
+            make_threat("C", [4, 4, 4], [5, 5, 5]),
+        ];
+        let added = crate::app::merge_unique_threats(&mut dst, src);
+        assert_eq!(added, 2);
+        assert_eq!(dst.len(), 3);
+        assert_eq!(dst[1].name, "B");
+        assert_eq!(dst[2].name, "C");
+    }
+
+    #[test]
+    fn merge_unique_threats_does_not_duplicate_identical_boxes() {
+        let t = make_threat("A", [0, 0, 0], [1, 1, 1]);
+        let mut dst = vec![t.clone()];
+        let src = vec![t];
+        let added = crate::app::merge_unique_threats(&mut dst, src);
+        assert_eq!(added, 0, "duplicate should not be added");
+        assert_eq!(dst.len(), 1);
+    }
+
+    #[test]
+    fn merge_unique_threats_same_bbox_different_name_is_not_duplicate() {
+        let mut dst = vec![make_threat("A", [0, 0, 0], [1, 1, 1])];
+        let src = vec![make_threat("B", [0, 0, 0], [1, 1, 1])];
+        let added = crate::app::merge_unique_threats(&mut dst, src);
+        assert_eq!(added, 1, "different name means not a duplicate");
+        assert_eq!(dst.len(), 2);
+    }
+
+    #[test]
+    fn merge_unique_threats_reassigns_colors() {
+        // After merging, all threats should have colors set by threat_color_for_index.
+        let mut dst = vec![make_threat("A", [0, 0, 0], [1, 1, 1])];
+        let src = vec![make_threat("B", [2, 2, 2], [3, 3, 3])];
+        crate::app::merge_unique_threats(&mut dst, src);
+        // Color at index 0 should equal threat_color_for_index(0).
+        assert_eq!(dst[0].color, threat_color_for_index(0));
+        assert_eq!(dst[1].color, threat_color_for_index(1));
     }
 }

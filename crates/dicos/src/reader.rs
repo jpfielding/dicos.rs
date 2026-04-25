@@ -960,6 +960,59 @@ mod tests {
         );
     }
 
+    /// Builds a DICOS file with no TransferSyntaxUID in group 0002.
+    ///
+    /// The meta section contains only (0002,0000) GroupLength with value 0.
+    /// The dataset element is encoded as Implicit VR LE (4-byte length, no VR
+    /// field) because that is what the reader will default to per the DICOM
+    /// standard.
+    fn build_dicos_without_transfer_syntax() -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Preamble
+        buf.extend_from_slice(&[0u8; 128]);
+        // DICM magic
+        buf.extend_from_slice(b"DICM");
+
+        // (0002,0000) UL 4 <0> — group length; no other meta elements follow,
+        // so the value is 0 (nothing after this element in group 0002).
+        buf.extend_from_slice(&0x0002u16.to_le_bytes()); // group
+        buf.extend_from_slice(&0x0000u16.to_le_bytes()); // element
+        buf.extend_from_slice(b"UL"); // VR (group 0002 is always explicit)
+        buf.extend_from_slice(&4u16.to_le_bytes()); // length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // value: 0 bytes of meta follow
+
+        // One non-group-0002 element so the reader crosses the meta boundary.
+        // Encoded as Implicit VR LE: tag (4 bytes) + length (4 bytes) + value.
+        // (0028,0010) Rows = 64
+        buf.extend_from_slice(&0x0028u16.to_le_bytes()); // group
+        buf.extend_from_slice(&0x0010u16.to_le_bytes()); // element
+        buf.extend_from_slice(&2u32.to_le_bytes()); // length (implicit VR: 4-byte len)
+        buf.extend_from_slice(&64u16.to_le_bytes()); // value
+
+        buf
+    }
+
+    #[test]
+    fn parse_without_transfer_syntax_defaults_to_implicit_vr_le() {
+        // A file missing TransferSyntaxUID in group 0002 must be treated as
+        // Implicit VR Little Endian per DICOM PS3.5 §10.1.  After parsing, both
+        // the reader state AND Dataset::transfer_syntax() must agree on that
+        // value — this was the inconsistency tracked in issue #8.
+        let buf = build_dicos_without_transfer_syntax();
+        let ds = parse(io::Cursor::new(buf)).expect("parse should succeed");
+
+        // The inferred TS must be materialized in the dataset.
+        assert_eq!(
+            ds.transfer_syntax().uid(),
+            transfer::IMPLICIT_VR_LITTLE_ENDIAN,
+            "Dataset::transfer_syntax() should return Implicit VR LE when no TS tag was present"
+        );
+
+        // The dataset element should have been parsed correctly under implicit VR LE.
+        assert_eq!(ds.rows(), 64);
+    }
+
     // -- Integration tests against real DICOS files --
 
     fn testdata_path(name: &str) -> std::path::PathBuf {

@@ -473,16 +473,11 @@ mod tests {
 
         assert_eq!(rt.rows(), 2);
         assert_eq!(rt.columns(), 2);
-        let pd_elem = rt.get(tag::PIXEL_DATA).expect("should have pixel data");
-        match &pd_elem.value {
-            Value::Bytes(b) => {
-                assert_eq!(b.len(), 8);
-                // Verify first pixel
-                let p0 = u16::from_le_bytes([b[0], b[1]]);
-                assert_eq!(p0, 100);
-            }
-            other => panic!("expected Bytes, got {other:?}"),
-        }
+        // After roundtrip the reader normalizes raw OW bytes to PixelData::Native
+        let pd = rt.pixel_data().expect("pixel_data() should return Some");
+        let frames = pd.native_frames().expect("should be native pixel data");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], vec![100u16, 200, 300, 400]);
     }
 
     #[test]

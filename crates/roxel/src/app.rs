@@ -614,7 +614,7 @@ impl App {
     }
 }
 
-fn merge_unique_threats(dst: &mut Vec<ThreatBox>, src: Vec<ThreatBox>) -> usize {
+pub(crate) fn merge_unique_threats(dst: &mut Vec<ThreatBox>, src: Vec<ThreatBox>) -> usize {
     let mut added = 0;
     for threat in src {
         let duplicate = dst.iter().any(|existing| {

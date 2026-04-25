@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use dicos::reader;
 use dicos::tag;
-use dicos::types::Value;
+use dicos::types::{PixelData, Value};
 
 fn sample_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -59,17 +59,17 @@ fn bag_ct_sample_has_non_uniform_pixel_data() {
     let cols = ds.columns() as usize;
     let frames = ds.number_of_frames() as usize;
 
-    let pixel = ds.get(tag::PIXEL_DATA).expect("pixel data present");
-    let raw = match &pixel.value {
-        Value::Bytes(b) => b,
-        other => panic!("expected native pixel bytes, got {other:?}"),
+    // After normalization, pixel data is PixelData::Native, not raw bytes.
+    let pd = ds.pixel_data().expect("pixel_data() should return Some");
+    let native_frames = match pd {
+        PixelData::Native { frames: ref f } => f,
+        other => panic!("expected native pixel data, got {other:?}"),
     };
 
-    assert_eq!(raw.len(), rows * cols * frames * 2);
-    let voxels: Vec<u16> = raw
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let total_pixels: usize = native_frames.iter().map(|f| f.len()).sum();
+    assert_eq!(total_pixels, rows * cols * frames);
+
+    let voxels: Vec<u16> = native_frames.iter().flat_map(|f| f.iter().copied()).collect();
 
     let min = voxels.iter().copied().min().expect("non-empty pixels");
     let max = voxels.iter().copied().max().expect("non-empty pixels");

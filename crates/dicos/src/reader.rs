@@ -154,6 +154,7 @@ impl<R: Read> DicosReader<R> {
             ds.insert(elem);
         }
 
+        normalize_native_pixel_data(&mut ds);
         Ok(ds)
     }
 
@@ -712,6 +713,58 @@ fn parse_sequence_items(
     Ok(items)
 }
 
+/// Normalizes raw OW/OB pixel data bytes to PixelData::Native after parsing.
+///
+/// The reader stores fixed-length (7FE0,0010) as Value::Bytes. This converts
+/// them to PixelData::Native so Dataset::pixel_data() works for all datasets.
+fn normalize_native_pixel_data(ds: &mut Dataset) {
+    let rows = ds.rows() as usize;
+    let cols = ds.columns() as usize;
+    let num_frames = ds.number_of_frames() as usize;
+
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    let frame_pixels = rows * cols;
+
+    // Check if pixel data is raw bytes (uncompressed, fixed-length)
+    let should_normalize = matches!(
+        ds.get(tag::PIXEL_DATA).map(|e| &e.value),
+        Some(Value::Bytes(_))
+    );
+
+    if !should_normalize {
+        return;
+    }
+
+    let raw_bytes = match ds.remove(tag::PIXEL_DATA) {
+        Some(elem) => match elem.value {
+            Value::Bytes(b) => b,
+            _ => return,
+        },
+        None => return,
+    };
+
+    // Decode as little-endian u16 pixels
+    let all_pixels: Vec<u16> = raw_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    let frames: Vec<Vec<u16>> = if num_frames > 1 && all_pixels.len() == frame_pixels * num_frames {
+        all_pixels.chunks(frame_pixels).map(|c| c.to_vec()).collect()
+    } else {
+        vec![all_pixels]
+    };
+
+    ds.insert(Element::new(
+        tag::PIXEL_DATA,
+        Vr::OW,
+        Value::PixelData(PixelData::Native { frames }),
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,12 +1123,11 @@ mod tests {
         assert_eq!(ds.rows(), 2);
         assert_eq!(ds.columns(), 2);
 
-        // Pixel data comes back as raw bytes (OW)
-        let pd_elem = ds.get(tag::PIXEL_DATA).expect("should have pixel data");
-        match &pd_elem.value {
-            Value::Bytes(b) => assert_eq!(b.len(), 8), // 4 pixels x 2 bytes
-            other => panic!("expected Bytes, got {other:?}"),
-        }
+        // Raw OW bytes are normalized to PixelData::Native after parsing
+        let pd = ds.pixel_data().expect("pixel_data() should return Some");
+        let frames = pd.native_frames().expect("should be native pixel data");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], vec![100u16, 200, 300, 400]);
     }
 
     // -----------------------------------------------------------------------

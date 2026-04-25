@@ -123,11 +123,22 @@ impl<R: Read> DicosReader<R> {
             if tag.group != 0x0002 && self.in_meta {
                 self.in_meta = false;
                 if self.transfer_syntax_uid.is_none() {
-                    // No TransferSyntaxUID was found; default to Implicit VR LE
-                    self.transfer_syntax_uid =
-                        Some(transfer::IMPLICIT_VR_LITTLE_ENDIAN.to_string());
+                    // No TransferSyntaxUID was found; default to Implicit VR LE per DICOM standard.
+                    // Materialize the inferred TS into the dataset so Dataset::transfer_syntax()
+                    // returns the same value the reader actually used.
+                    let default_uid = transfer::IMPLICIT_VR_LITTLE_ENDIAN.to_string();
+                    self.transfer_syntax_uid = Some(default_uid.clone());
+                    ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, default_uid);
                 }
                 self.update_transfer_syntax();
+
+                // Reject big-endian transfer syntaxes — we only decode little-endian.
+                if let Some(uid) = &self.transfer_syntax_uid {
+                    let ts = transfer::TransferSyntax::new(uid.as_str());
+                    if !ts.is_little_endian() {
+                        return Err(DicosError::UnsupportedTransferSyntax(uid.clone()));
+                    }
+                }
             }
 
             let elem = self.read_element_with_tag(tag)?;
@@ -486,7 +497,12 @@ fn implicit_vr_for_tag(tag: Tag) -> Vr {
 }
 
 /// Parses raw bytes into a typed `Value` based on VR.
-fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool, max_element_bytes: usize) -> Result<Value, DicosError> {
+fn parse_value(
+    vr: Vr,
+    data: &[u8],
+    explicit_vr: bool,
+    max_element_bytes: usize,
+) -> Result<Value, DicosError> {
     match vr {
         // String types
         Vr::AE
@@ -617,7 +633,11 @@ fn parse_value(vr: Vr, data: &[u8], explicit_vr: bool, max_element_bytes: usize)
 /// Parses sequence items from a byte buffer (fixed-length SQ).
 ///
 /// Reuses `DicosReader` for element parsing to avoid duplicating VR/header logic.
-fn parse_sequence_items(data: &[u8], explicit_vr: bool, max_element_bytes: usize) -> Result<Vec<Dataset>, DicosError> {
+fn parse_sequence_items(
+    data: &[u8],
+    explicit_vr: bool,
+    max_element_bytes: usize,
+) -> Result<Vec<Dataset>, DicosError> {
     let mut cursor = io::Cursor::new(data);
     let mut items = Vec::new();
 
@@ -870,6 +890,74 @@ mod tests {
             other => panic!("expected Value::Strings, got {other:?}"),
         }
         assert_eq!(ds.get_string(tag::IMAGE_TYPE), Some("ORIGINAL"));
+    }
+
+    /// Builds a minimal valid DICOS file in memory with an arbitrary transfer syntax UID.
+    ///
+    /// Identical structure to `build_minimal_explicit_vr_le` but lets the caller choose
+    /// the TS UID so we can test how the reader reacts to, e.g., big-endian files.
+    fn build_minimal_dicos_with_ts(ts_uid: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Preamble (128 zeros)
+        buf.extend_from_slice(&[0u8; 128]);
+        // DICM magic
+        buf.extend_from_slice(b"DICM");
+
+        let meta_start = buf.len();
+
+        // TransferSyntaxUID (0002,0010) UI
+        let ts_bytes = ts_uid.as_bytes();
+        let ts_padded_len = if ts_bytes.len() % 2 == 0 {
+            ts_bytes.len()
+        } else {
+            ts_bytes.len() + 1
+        };
+        buf.extend_from_slice(&0x0002u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"UI");
+        buf.extend_from_slice(&(ts_padded_len as u16).to_le_bytes());
+        buf.extend_from_slice(ts_bytes);
+        if ts_bytes.len() % 2 != 0 {
+            buf.push(b' ');
+        }
+
+        let meta_len = buf.len() - meta_start;
+
+        // Prepend the group-length element before the TS UID element.
+        let mut final_buf = Vec::new();
+        final_buf.extend_from_slice(&buf[..meta_start]);
+
+        // (0002,0000) UL 4 <meta_len>
+        final_buf.extend_from_slice(&0x0002u16.to_le_bytes());
+        final_buf.extend_from_slice(&0x0000u16.to_le_bytes());
+        final_buf.extend_from_slice(b"UL");
+        final_buf.extend_from_slice(&4u16.to_le_bytes());
+        final_buf.extend_from_slice(&(meta_len as u32).to_le_bytes());
+
+        // Re-append the TS UID element
+        final_buf.extend_from_slice(&buf[meta_start..]);
+
+        // Append a trivial non-group-0002 element so the reader crosses the
+        // meta boundary and evaluates the declared transfer syntax.
+        // (0008,0060) Modality CS "CT" — two bytes, explicit VR LE encoding.
+        final_buf.extend_from_slice(&0x0008u16.to_le_bytes()); // group
+        final_buf.extend_from_slice(&0x0060u16.to_le_bytes()); // element
+        final_buf.extend_from_slice(b"CS"); // VR
+        final_buf.extend_from_slice(&2u16.to_le_bytes()); // length
+        final_buf.extend_from_slice(b"CT"); // value
+
+        final_buf
+    }
+
+    #[test]
+    fn parse_rejects_big_endian_transfer_syntax() {
+        let buf = build_minimal_dicos_with_ts(transfer::EXPLICIT_VR_BIG_ENDIAN);
+        let result = parse(io::Cursor::new(buf));
+        assert!(
+            matches!(result, Err(DicosError::UnsupportedTransferSyntax(_))),
+            "Expected UnsupportedTransferSyntax, got: {result:?}"
+        );
     }
 
     // -- Integration tests against real DICOS files --

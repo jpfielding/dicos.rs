@@ -32,14 +32,26 @@ RUN set -eux && \
 ENV HOME "/home/${USERNAME}"
 ENV SDK_HOME ${HOME}/sdk
 ENV PATH ${HOME}/bin:${PATH}
+RUN mkdir -p ${SDK_HOME}
 
-# claude
-ENV NODE_EXTRA_CA_CERTS="/etc/pki/ca-trust/source/anchors/cas.pem"
-ENV PATH="$HOME/.local/bin:$PATH"
+# rust — keep RUST_VERSION in sync with /rust-toolchain.toml (single source of truth at runtime)
+ARG RUST_VERSION=1.95.0
+ENV PATH ${HOME}/.cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        bash -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal -c rustfmt,clippy
+
+# pretty bash
+COPY --chown=${USERNAME}:${USERNAME} .bash_pretty ${HOME}/.bash_rust
+RUN set -eux && \
+    echo "source ${HOME}/.bash_rust" >> ${HOME}/.bashrc
+
+# pretty bash
+COPY --chown=${USERNAME}:${USERNAME} .bash_pretty ${HOME}/.bash_pretty
+RUN set -eux && \
+    echo "source ${HOME}/.bash_pretty" >> ${HOME}/.bashrc
 
 # go
-ENV GO_VERSION "1.26.0"
-ENV GOPRIVATE ""
+ENV GO_VERSION "1.26.3"
 ENV GOPATH ${SDK_HOME}/go
 ENV PATH ${GOPATH}/bin:${HOME}/sdk/go:${PATH}
 RUN set -eux && \
@@ -49,13 +61,4 @@ RUN set -eux && \
     tar xzf go.tar.gz && mv go ${SDK_HOME} && rm /tmp/go.tar.gz && \
     cd ${SDK_HOME} && mv go go${GO_VERSION} && ln -s go${GO_VERSION} go
 
-# pretty bash
-COPY --chown=${USERNAME}:${USERNAME} .bash_pretty ${HOME}/.bash_pretty
-RUN set -eux && \
-    echo "source ${HOME}/.bash_pretty" >> ${HOME}/.bashrc
-
-# rust
-RUN set -eux -o pipeline && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh &&
-    echo "source ${HOME}/.cargo/env" >> ${HOME}/.bashrc
 

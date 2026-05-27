@@ -15,7 +15,8 @@
         "eamodio.gitlens",
         "ms-vscode.hexeditor",
         "Anthropic.claude-code",
-        "openai.chatgpt"
+        "openai.chatgpt",
+        "PolyMeilex.wgsl"
       ]
     }
   },

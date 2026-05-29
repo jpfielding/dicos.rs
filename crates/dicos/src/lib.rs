@@ -25,6 +25,8 @@
 //! - `jpeg2k`: Enable JPEG 2000 codec
 //! - `all-codecs`: Enable all codec crates
 
+#![forbid(unsafe_code)]
+
 pub mod codec;
 pub mod codec_registry;
 pub mod error;

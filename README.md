@@ -123,9 +123,13 @@ cargo build -p roxel --release
 
 ### dicosctl
 
+The `dicos` crate ships two binaries (`dicosctl` and the
+`dicos-gen-luggage-fishtank` fixture generator), so `cargo run` must be told
+which one to launch with `--bin dicosctl`.
+
 ```sh
 # Print a human-readable summary of a DICOS file
-cargo run -p dicos --features cli -- info scan.dcs
+cargo run --bin dicosctl -p dicos --features cli -- info scan.dcs
 
 # Example output:
 #   File: scan.dcs
@@ -139,14 +143,14 @@ cargo run -p dicos --features cli -- info scan.dcs
 #   Manufacturer: L3 Technologies
 #   Model: CX100
 
-# Dump all metadata as JSON
-cargo run -p dicos --features cli -- dump scan.dcs
+# Dump all metadata as JSON (pretty-printed by default)
+cargo run --bin dicosctl -p dicos --features cli -- dump scan.dcs
 
 # Pipe JSON output to jq for querying
-cargo run -p dicos --features cli -- dump scan.dcs | jq '.Modality'
+cargo run --bin dicosctl -p dicos --features cli -- dump scan.dcs | jq '.Modality'
 
-# Compact (non-pretty) JSON
-cargo run -p dicos --features cli -- dump --no-pretty scan.dcs
+# Compact (single-line) JSON
+cargo run --bin dicosctl -p dicos --features cli -- dump --compact scan.dcs
 ```
 
 ### roxel
@@ -182,15 +186,17 @@ including architecture, rendering pipeline, and GPU requirements.
 
 ## Test Results
 
+Run `cargo test --workspace` to reproduce. Current counts:
+
 ```
-dicos:   87 passed, 0 failed
-roxel:   31 passed, 0 failed
+dicos:  102 passed, 0 failed   (99 unit + 3 integration)
+roxel:   51 passed, 0 failed
 jpeg2k:  62 passed, 0 failed
-jpegli:  51 passed, 0 failed
+jpegli:  49 passed, 0 failed
 jpegls:  61 passed, 0 failed
 jpegrle: 29 passed, 0 failed
 ---------------------------------
-Total:  321 passed, 0 failed, 0 ignored
+Total:  354 passed, 0 failed, 0 ignored
 ```
 
 ## References

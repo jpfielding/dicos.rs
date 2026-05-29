@@ -29,6 +29,13 @@ const UNDEFINED_LENGTH: u32 = 0xFFFF_FFFF;
 /// Default per-element allocation limit (1 GB).
 const DEFAULT_MAX_ELEMENT_LENGTH: usize = 1024 * 1024 * 1024;
 
+/// Maximum sequence/item nesting depth.
+///
+/// Bounds recursion on attacker-controlled nesting so a crafted file with
+/// deeply nested sequences cannot overflow the stack. Legitimate DICOS/DICOM
+/// files nest only a handful of levels.
+const MAX_NESTING_DEPTH: usize = 64;
+
 /// Allocate a buffer of `len` bytes, rejecting sizes above `limit`.
 fn checked_alloc(len: u32, limit: usize) -> Result<Vec<u8>, DicosError> {
     let n = len as usize;
@@ -141,7 +148,7 @@ impl<R: Read> DicosReader<R> {
                 }
             }
 
-            let elem = self.read_element_with_tag(tag)?;
+            let elem = self.read_element_with_tag(tag, 0)?;
 
             // Capture TransferSyntaxUID when we see it (still in group 0002)
             if tag == tag::TRANSFER_SYNTAX_UID {
@@ -166,7 +173,10 @@ impl<R: Read> DicosReader<R> {
     }
 
     /// Reads an element after the tag has already been consumed.
-    fn read_element_with_tag(&mut self, tag: Tag) -> Result<Element, DicosError> {
+    ///
+    /// `depth` is the current sequence-nesting level; it is propagated to any
+    /// nested sequence parsing and bounded by [`MAX_NESTING_DEPTH`].
+    fn read_element_with_tag(&mut self, tag: Tag, depth: usize) -> Result<Element, DicosError> {
         // Sequence delimiters always have implicit structure: 4-byte length, no VR
         if tag.group == 0xFFFE {
             let len = self.inner.read_u32::<LittleEndian>()?;
@@ -191,7 +201,7 @@ impl<R: Read> DicosReader<R> {
         // with the correct VR mode because we call update_transfer_syntax before
         // read_element_with_tag for the first non-0002 tag.
 
-        let value = self.read_value(tag, vr, vl)?;
+        let value = self.read_value(tag, vr, vl, depth)?;
 
         Ok(Element::new(tag, vr, value))
     }
@@ -223,36 +233,47 @@ impl<R: Read> DicosReader<R> {
     }
 
     /// Reads the value bytes and parses them according to VR.
-    fn read_value(&mut self, tag: Tag, vr: Vr, vl: u32) -> Result<Value, DicosError> {
+    fn read_value(&mut self, tag: Tag, vr: Vr, vl: u32, depth: usize) -> Result<Value, DicosError> {
         if vl == UNDEFINED_LENGTH {
-            return self.read_undefined_length_value(tag, vr);
+            return self.read_undefined_length_value(tag, vr, depth);
         }
 
         let mut data = checked_alloc(vl, self.max_element_bytes)?;
         self.inner.read_exact(&mut data)?;
 
-        parse_value(vr, &data, self.explicit_vr, self.max_element_bytes)
+        parse_value(vr, &data, self.explicit_vr, self.max_element_bytes, depth)
     }
 
     /// Handles elements with undefined length: encapsulated pixel data or sequences.
-    fn read_undefined_length_value(&mut self, tag: Tag, vr: Vr) -> Result<Value, DicosError> {
+    fn read_undefined_length_value(
+        &mut self,
+        tag: Tag,
+        vr: Vr,
+        depth: usize,
+    ) -> Result<Value, DicosError> {
         if tag == tag::PIXEL_DATA {
             let pd = self.read_encapsulated_pixel_data()?;
             return Ok(Value::PixelData(pd));
         }
 
         if vr == Vr::SQ {
-            let items = self.read_sequence_items()?;
+            let items = self.read_sequence_items(depth)?;
             return Ok(Value::Sequence(items));
         }
 
         // Unknown undefined-length element: skip until sequence delimitation
-        self.skip_undefined_length()?;
+        self.skip_undefined_length(depth)?;
         Ok(Value::Bytes(Vec::new()))
     }
 
     /// Reads sequence items until the Sequence Delimitation Item tag.
-    fn read_sequence_items(&mut self) -> Result<Vec<Dataset>, DicosError> {
+    fn read_sequence_items(&mut self, depth: usize) -> Result<Vec<Dataset>, DicosError> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(DicosError::InvalidFile(format!(
+                "sequence nesting exceeds maximum depth ({MAX_NESTING_DEPTH})"
+            )));
+        }
+
         let mut items = Vec::new();
 
         loop {
@@ -270,9 +291,9 @@ impl<R: Read> DicosReader<R> {
             }
 
             let item_ds = if item_len == UNDEFINED_LENGTH {
-                self.read_item_undefined_length()?
+                self.read_item_undefined_length(depth)?
             } else {
-                self.read_item_fixed_length(item_len)?
+                self.read_item_fixed_length(item_len, depth)?
             };
 
             items.push(item_ds);
@@ -282,7 +303,7 @@ impl<R: Read> DicosReader<R> {
     }
 
     /// Reads a sequence item with undefined length (delimited by Item Delimitation Item).
-    fn read_item_undefined_length(&mut self) -> Result<Dataset, DicosError> {
+    fn read_item_undefined_length(&mut self, depth: usize) -> Result<Dataset, DicosError> {
         let mut ds = Dataset::new();
 
         loop {
@@ -294,7 +315,7 @@ impl<R: Read> DicosReader<R> {
                 break;
             }
 
-            let elem = self.read_element_with_tag(elem_tag)?;
+            let elem = self.read_element_with_tag(elem_tag, depth + 1)?;
             ds.insert(elem);
         }
 
@@ -302,7 +323,7 @@ impl<R: Read> DicosReader<R> {
     }
 
     /// Reads a sequence item with a known fixed length.
-    fn read_item_fixed_length(&mut self, len: u32) -> Result<Dataset, DicosError> {
+    fn read_item_fixed_length(&mut self, len: u32, depth: usize) -> Result<Dataset, DicosError> {
         let mut buf = checked_alloc(len, self.max_element_bytes)?;
         self.inner.read_exact(&mut buf)?;
 
@@ -322,7 +343,7 @@ impl<R: Read> DicosReader<R> {
                 Err(DicosError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             };
-            let elem = sub_reader.read_element_with_tag(tag)?;
+            let elem = sub_reader.read_element_with_tag(tag, depth + 1)?;
             ds.insert(elem);
         }
 
@@ -378,7 +399,13 @@ impl<R: Read> DicosReader<R> {
     }
 
     /// Skips an undefined-length element by reading until Sequence Delimitation Item.
-    fn skip_undefined_length(&mut self) -> Result<(), DicosError> {
+    fn skip_undefined_length(&mut self, depth: usize) -> Result<(), DicosError> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(DicosError::InvalidFile(format!(
+                "sequence nesting exceeds maximum depth ({MAX_NESTING_DEPTH})"
+            )));
+        }
+
         loop {
             let item_tag = self.read_tag()?;
 
@@ -398,7 +425,7 @@ impl<R: Read> DicosReader<R> {
                     skip_bytes(&mut self.inner, len)?;
                 } else if len == UNDEFINED_LENGTH {
                     // Nested undefined length
-                    self.skip_undefined_length()?;
+                    self.skip_undefined_length(depth + 1)?;
                 }
                 continue;
             }
@@ -420,14 +447,14 @@ impl<R: Read> DicosReader<R> {
                 if vl != UNDEFINED_LENGTH && vl > 0 {
                     skip_bytes(&mut self.inner, vl)?;
                 } else if vl == UNDEFINED_LENGTH {
-                    self.skip_undefined_length()?;
+                    self.skip_undefined_length(depth + 1)?;
                 }
             } else {
                 let vl = self.inner.read_u32::<LittleEndian>()?;
                 if vl != UNDEFINED_LENGTH && vl > 0 {
                     skip_bytes(&mut self.inner, vl)?;
                 } else if vl == UNDEFINED_LENGTH {
-                    self.skip_undefined_length()?;
+                    self.skip_undefined_length(depth + 1)?;
                 }
             }
         }
@@ -503,6 +530,7 @@ fn parse_value(
     data: &[u8],
     explicit_vr: bool,
     max_element_bytes: usize,
+    depth: usize,
 ) -> Result<Value, DicosError> {
     match vr {
         // String types
@@ -622,7 +650,7 @@ fn parse_value(
             if data.is_empty() {
                 return Ok(Value::Sequence(Vec::new()));
             }
-            let items = parse_sequence_items(data, explicit_vr, max_element_bytes)?;
+            let items = parse_sequence_items(data, explicit_vr, max_element_bytes, depth)?;
             Ok(Value::Sequence(items))
         }
 
@@ -638,7 +666,14 @@ fn parse_sequence_items(
     data: &[u8],
     explicit_vr: bool,
     max_element_bytes: usize,
+    depth: usize,
 ) -> Result<Vec<Dataset>, DicosError> {
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(DicosError::InvalidFile(format!(
+            "sequence nesting exceeds maximum depth ({MAX_NESTING_DEPTH})"
+        )));
+    }
+
     let mut cursor = io::Cursor::new(data);
     let mut items = Vec::new();
 
@@ -703,7 +738,7 @@ fn parse_sequence_items(
                 break;
             }
 
-            let elem = sub_reader.read_element_with_tag(tag)?;
+            let elem = sub_reader.read_element_with_tag(tag, depth + 1)?;
             ds.insert(elem);
         }
 
@@ -746,15 +781,31 @@ fn normalize_native_pixel_data(ds: &mut Dataset) {
         None => return,
     };
 
-    // Decode as little-endian u16 pixels
+    // Decode as little-endian u16 pixels. A trailing odd byte cannot belong to
+    // a 16-bit pixel, so flag it rather than dropping it silently.
+    if raw_bytes.len() % 2 != 0 {
+        log::warn!(
+            "native pixel data has an odd byte length ({}); trailing byte ignored",
+            raw_bytes.len()
+        );
+    }
     let all_pixels: Vec<u16> = raw_bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
 
+    let expected = frame_pixels.saturating_mul(num_frames.max(1));
     let frames: Vec<Vec<u16>> = if num_frames > 1 && all_pixels.len() == frame_pixels * num_frames {
         all_pixels.chunks(frame_pixels).map(|c| c.to_vec()).collect()
     } else {
+        if all_pixels.len() != expected {
+            log::warn!(
+                "native pixel data size ({} pixels) does not match rows*cols*frames ({}); \
+                 storing as a single frame",
+                all_pixels.len(),
+                expected
+            );
+        }
         vec![all_pixels]
     };
 
@@ -1257,5 +1308,70 @@ mod tests {
             }
             other => panic!("expected Value::Sequence, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Nesting-depth guard (stack-overflow DoS protection)
+    // -----------------------------------------------------------------------
+
+    /// Wraps `inner` in one level of undefined-length SQ containing a single
+    /// undefined-length item, in explicit-VR LE encoding.
+    fn wrap_undefined_length_sq(inner: &[u8]) -> Vec<u8> {
+        let mut item = Vec::new();
+        item.extend_from_slice(&0xFFFEu16.to_le_bytes()); // Item tag
+        item.extend_from_slice(&0xE000u16.to_le_bytes());
+        item.extend_from_slice(&UNDEFINED_LENGTH.to_le_bytes());
+        item.extend_from_slice(inner);
+        item.extend_from_slice(&0xFFFEu16.to_le_bytes()); // Item Delimitation
+        item.extend_from_slice(&0xE00Du16.to_le_bytes());
+        item.extend_from_slice(&0u32.to_le_bytes());
+
+        let tag = tag::REFERENCED_IMAGE_SEQUENCE;
+        let mut sq = Vec::new();
+        sq.extend_from_slice(&tag.group.to_le_bytes());
+        sq.extend_from_slice(&tag.element.to_le_bytes());
+        sq.extend_from_slice(b"SQ");
+        sq.extend_from_slice(&[0u8, 0u8]); // reserved (long VR)
+        sq.extend_from_slice(&UNDEFINED_LENGTH.to_le_bytes());
+        sq.extend_from_slice(&item);
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes()); // Sequence Delimitation
+        sq.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq
+    }
+
+    /// A pathologically deep tower of nested sequences must be rejected with a
+    /// depth error rather than recursing until the stack overflows.
+    #[test]
+    fn parse_rejects_excessive_sequence_nesting() {
+        let mut payload = Vec::new();
+        for _ in 0..(MAX_NESTING_DEPTH + 16) {
+            payload = wrap_undefined_length_sq(&payload);
+        }
+
+        let mut file = build_minimal_explicit_vr_le(&[]);
+        file.extend_from_slice(&payload);
+
+        let result = parse(io::Cursor::new(file));
+        assert!(
+            matches!(result, Err(DicosError::InvalidFile(ref m)) if m.contains("depth")),
+            "deeply nested sequences must error on depth, got: {result:?}"
+        );
+    }
+
+    /// Nesting up to (but not beyond) the limit must still parse successfully —
+    /// the guard must not reject legitimately structured files.
+    #[test]
+    fn parse_accepts_nesting_within_limit() {
+        let mut payload = Vec::new();
+        for _ in 0..(MAX_NESTING_DEPTH - 1) {
+            payload = wrap_undefined_length_sq(&payload);
+        }
+
+        let mut file = build_minimal_explicit_vr_le(&[]);
+        file.extend_from_slice(&payload);
+
+        let ds = parse(io::Cursor::new(file)).expect("nesting within limit should parse");
+        assert!(ds.get(tag::REFERENCED_IMAGE_SEQUENCE).is_some());
     }
 }

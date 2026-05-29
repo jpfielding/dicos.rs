@@ -28,9 +28,9 @@ enum Commands {
     Dump {
         /// Path to the DICOS (.dcs) file.
         file: String,
-        /// Pretty-print the JSON output.
-        #[arg(short, long, default_value_t = true)]
-        pretty: bool,
+        /// Emit compact (single-line) JSON instead of pretty-printed.
+        #[arg(short, long)]
+        compact: bool,
     },
     /// Print a human-readable summary of the file.
     Info {
@@ -44,7 +44,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Dump { ref file, pretty } => cmd_dump(file, pretty),
+        Commands::Dump { ref file, compact } => cmd_dump(file, !compact),
         Commands::Info { ref file } => cmd_info(file),
     };
 

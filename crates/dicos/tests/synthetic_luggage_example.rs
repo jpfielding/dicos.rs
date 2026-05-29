@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use dicos::reader;
 use dicos::tag;
-use dicos::types::{PixelData, Value};
+use dicos::types::PixelData;
 
 fn sample_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

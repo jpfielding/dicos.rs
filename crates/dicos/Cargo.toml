@@ -24,6 +24,7 @@ cli = ["dep:clap", "dep:env_logger", "dep:serde", "dep:serde_json", "all-codecs"
 thiserror.workspace = true
 byteorder.workspace = true
 log.workspace = true
+bytemuck.workspace = true
 
 # Optional codec dependencies (behind feature flags)
 jpegrle = { workspace = true, optional = true }

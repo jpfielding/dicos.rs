@@ -3,7 +3,6 @@
 
 # Rust files
 /target/
-**/Cargo.lock
 
 # OS-specific files
 .DS_Store

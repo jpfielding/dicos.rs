@@ -54,26 +54,26 @@ jobs:
       # publish` blocks until each crate is live in the index before returning,
       # so the later crates resolve their dependencies cleanly.
       - name: Publish pure-jpegrle
-        run: cargo publish -p pure-jpegrle
+        run: cargo publish -p pure-jpegrle --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish pure-jpegls
-        run: cargo publish -p pure-jpegls
+        run: cargo publish -p pure-jpegls --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish pure-jpegli
-        run: cargo publish -p pure-jpegli
+        run: cargo publish -p pure-jpegli --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish pure-jpeg2k
-        run: cargo publish -p pure-jpeg2k
+        run: cargo publish -p pure-jpeg2k --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish dicos
-        run: cargo publish -p dicos
+        run: cargo publish -p dicos --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

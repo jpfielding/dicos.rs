@@ -728,18 +728,18 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dicos"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "byteorder",
  "clap",
  "env_logger",
- "jpeg2k",
- "jpegli",
- "jpegls",
- "jpegrle",
  "log",
  "proptest",
+ "pure-jpeg2k",
+ "pure-jpegli",
+ "pure-jpegls",
+ "pure-jpegrle",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1579,38 +1579,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg2k"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "jpegli"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "jpegls"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "jpegrle"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2426,6 +2394,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "pure-jpeg2k"
+version = "1.0.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pure-jpegli"
+version = "1.0.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pure-jpegls"
+version = "1.0.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pure-jpegrle"
+version = "1.0.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2611,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "roxel"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "dicos",

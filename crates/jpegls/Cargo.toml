@@ -1,10 +1,19 @@
 [package]
-name = "jpegls"
-description = "JPEG-LS lossless codec (ISO/IEC 14495-1 / ITU-T T.87)"
+name = "pure-jpegls"
+description = "Pure-Rust JPEG-LS lossless codec (ISO/IEC 14495-1 / ITU-T T.87)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["jpeg-ls", "jpeg", "lossless", "codec", "compression"]
+categories = ["compression", "multimedia::images"]
+
+# Published as `pure-jpegls`, imported as `jpegls`.
+[lib]
+name = "jpegls"
 
 [dependencies]
 thiserror.workspace = true

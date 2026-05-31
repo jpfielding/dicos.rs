@@ -693,10 +693,7 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
 
     // Extract the first volume to get dimensions and shared metadata.
     let (_, first_path, first_ds) = entries.remove(0);
-    let first = match volume_from_dataset(&first_ds) {
-        Ok(v) => v,
-        Err(e) => return Err(e),
-    };
+    let first = volume_from_dataset(&first_ds)?;
     let cols = first.dim_x;
     let rows = first.dim_y;
 
@@ -1055,7 +1052,7 @@ mod tests {
         ds.put_string(
             tag::IMAGE_POSITION_PATIENT,
             Vr::DS,
-            &format!("0.0\\0.0\\{z}"),
+            format!("0.0\\0.0\\{z}"),
         );
         ds.insert(Element::new(
             tag::PIXEL_DATA,
@@ -1069,10 +1066,7 @@ mod tests {
     fn slice_sort_key_image_position_patient() {
         let ds = ds_with_z(-50.0);
         let key = slice_sort_key(&ds, 99.0);
-        assert!(
-            (key - (-50.0)).abs() < 1e-6,
-            "Expected -50.0, got {key}"
-        );
+        assert!((key - (-50.0)).abs() < 1e-6, "Expected -50.0, got {key}");
     }
 
     #[test]

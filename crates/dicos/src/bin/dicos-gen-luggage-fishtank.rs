@@ -194,8 +194,16 @@ fn synthesize_volume(size: [usize; 3], seed: u64, with_noise: bool) -> (Vec<u16>
 
     // Air gap near top of tank.
     let air_gap = BBox {
-        min: [fish_tank.min[0] + 2, fish_tank.min[1] + 2, fish_tank.max[2] - 4],
-        max: [fish_tank.max[0] - 2, fish_tank.max[1] - 2, fish_tank.max[2] - 2],
+        min: [
+            fish_tank.min[0] + 2,
+            fish_tank.min[1] + 2,
+            fish_tank.max[2] - 4,
+        ],
+        max: [
+            fish_tank.max[0] - 2,
+            fish_tank.max[1] - 2,
+            fish_tank.max[2] - 2,
+        ],
     };
     fill_box(&mut data, size, air_gap, 900);
 
@@ -342,8 +350,16 @@ fn build_dataset(
     let mut ds = Dataset::new();
 
     // File Meta Information.
-    ds.put_string(tag::MEDIA_STORAGE_SOP_CLASS_UID, Vr::UI, DICOS_CT_SOP_CLASS_UID);
-    ds.put_string(tag::MEDIA_STORAGE_SOP_INSTANCE_UID, Vr::UI, sop_instance_uid);
+    ds.put_string(
+        tag::MEDIA_STORAGE_SOP_CLASS_UID,
+        Vr::UI,
+        DICOS_CT_SOP_CLASS_UID,
+    );
+    ds.put_string(
+        tag::MEDIA_STORAGE_SOP_INSTANCE_UID,
+        Vr::UI,
+        sop_instance_uid,
+    );
     ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, EXPLICIT_VR_LE);
     ds.put_string(tag::IMPLEMENTATION_CLASS_UID, Vr::UI, IMPL_CLASS_UID);
     ds.put_string(tag::IMPLEMENTATION_VERSION_NAME, Vr::SH, "DICOSRS_2026A");
@@ -377,7 +393,11 @@ fn build_dataset(
     ds.put_string(tag::INSTANCE_CREATION_TIME, Vr::TM, now_time);
 
     ds.put_string(tag::STUDY_DESCRIPTION, Vr::LO, "Synthetic Luggage Scan");
-    ds.put_string(tag::SERIES_DESCRIPTION, Vr::LO, "Luggage with Fish Tank (Synthetic)");
+    ds.put_string(
+        tag::SERIES_DESCRIPTION,
+        Vr::LO,
+        "Luggage with Fish Tank (Synthetic)",
+    );
     ds.put_string(tag::PATIENT_NAME, Vr::PN, "UNKNOWN^OBJECT");
     ds.put_string(tag::PATIENT_ID, Vr::LO, "PUBLIC-DEMO-001");
     ds.put_string(tag::MANUFACTURER, Vr::LO, "GenericVendor");
@@ -448,7 +468,11 @@ fn build_dataset(
     for p in voxels {
         pixel_bytes.extend_from_slice(&p.to_le_bytes());
     }
-    ds.insert(Element::new(tag::PIXEL_DATA, Vr::OW, Value::Bytes(pixel_bytes)));
+    ds.insert(Element::new(
+        tag::PIXEL_DATA,
+        Vr::OW,
+        Value::Bytes(pixel_bytes),
+    ));
 
     ds
 }

@@ -1,10 +1,19 @@
 [package]
-name = "jpegrle"
-description = "DICOM RLE PackBits lossless codec (DICOM Part 5 Section 8.1.1)"
+name = "pure-jpegrle"
+description = "Pure-Rust DICOM RLE PackBits lossless codec (DICOM Part 5 Section 8.1.1)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["rle", "packbits", "dicom", "lossless", "codec"]
+categories = ["compression", "multimedia::images"]
+
+# Published as `pure-jpegrle`, imported as `jpegrle`.
+[lib]
+name = "jpegrle"
 
 [dependencies]
 thiserror.workspace = true

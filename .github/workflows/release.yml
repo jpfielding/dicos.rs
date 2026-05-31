@@ -1,0 +1,79 @@
+name: Release
+
+# Publishes the workspace crates to crates.io when a semver tag is pushed.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Authentication uses crates.io Trusted Publishing (OIDC) — no long-lived
+# CARGO_REGISTRY_TOKEN secret is stored in the repo. Each crate must have this
+# repository + workflow registered as a Trusted Publisher under its crate
+# settings on crates.io. See the one-time setup notes in PUBLISHING.md.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Required for the OIDC token exchange with crates.io.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Sanity check: the pushed tag must match the workspace version, so a
+      # mistyped tag never publishes the wrong number.
+      - name: Verify tag matches Cargo version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='dicos'))")"
+          if [ "$tag" != "$crate_version" ]; then
+            echo "::error::tag v$tag does not match Cargo version $crate_version"
+            exit 1
+          fi
+          echo "Releasing version $crate_version"
+
+      # Exchanges the GitHub OIDC token for a short-lived crates.io token and
+      # exports CARGO_REGISTRY_TOKEN for the subsequent publish steps.
+      - name: Authenticate to crates.io (Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Publish in dependency order. The codec crates have no internal deps and
+      # go first; `dicos` depends on all four, so it must be last. `cargo
+      # publish` blocks until each crate is live in the index before returning,
+      # so the later crates resolve their dependencies cleanly.
+      - name: Publish pure-jpegrle
+        run: cargo publish -p pure-jpegrle
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish pure-jpegls
+        run: cargo publish -p pure-jpegls
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish pure-jpegli
+        run: cargo publish -p pure-jpegli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish pure-jpeg2k
+        run: cargo publish -p pure-jpeg2k
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish dicos
+        run: cargo publish -p dicos
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

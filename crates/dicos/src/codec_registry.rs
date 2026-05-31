@@ -17,12 +17,7 @@ use crate::codec::Codec;
     feature = "jpegli",
     feature = "jpeg2k"
 ))]
-use {
-    crate::error::CodecError,
-    crate::img::GrayImage,
-    crate::transfer,
-    std::io::Write,
-};
+use {crate::error::CodecError, crate::img::GrayImage, crate::transfer, std::io::Write};
 
 // ---------------------------------------------------------------------------
 // Codec adapter structs -- bridge raw codec crate APIs to the Codec trait
@@ -241,7 +236,9 @@ pub fn sniff_codec(data: &[u8]) -> Option<&'static dyn Codec> {
     }
 
     // JPEG-LS / JPEG Lossless: SOF markers appear in the header, so limit
-    // the scan to the first 4 KB to avoid scanning multi-MB frames.
+    // the scan to the first 4 KB to avoid scanning multi-MB frames. Only used
+    // when the jpegls/jpegli codec features are enabled.
+    #[allow(unused_variables)]
     let probe_end = data.len().min(4096);
 
     // JPEG-LS: starts with FF D8, then SOF55 marker (FF F7)

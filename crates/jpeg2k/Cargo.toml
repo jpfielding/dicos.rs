@@ -1,10 +1,20 @@
 [package]
-name = "jpeg2k"
-description = "JPEG 2000 Part-1 lossless codec (ITU-T T.800)"
+name = "pure-jpeg2k"
+description = "Pure-Rust JPEG 2000 Part-1 lossless codec (ITU-T T.800)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["jpeg2000", "jpeg", "lossless", "codec", "compression"]
+categories = ["compression", "multimedia::images"]
+
+# Published as `pure-jpeg2k` (the plain `jpeg2k` name is a native OpenJPEG
+# wrapper on crates.io), but the crate is still imported as `jpeg2k`.
+[lib]
+name = "jpeg2k"
 
 [dependencies]
 thiserror.workspace = true

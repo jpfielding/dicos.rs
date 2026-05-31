@@ -296,9 +296,8 @@ fn encode_encapsulated_pixel_data(
     // Basic Offset Table item
     buf.write_u16::<LittleEndian>(0xFFFE)?; // Item tag
     buf.write_u16::<LittleEndian>(0xE000)?;
-    let bot_len = u32::try_from(offsets.len() * 4).map_err(|_| {
-        DicosError::Validation("Basic Offset Table too large".into())
-    })?;
+    let bot_len = u32::try_from(offsets.len() * 4)
+        .map_err(|_| DicosError::Validation("Basic Offset Table too large".into()))?;
     buf.write_u32::<LittleEndian>(bot_len)?;
     for offset in offsets {
         buf.write_u32::<LittleEndian>(*offset)?;
@@ -566,8 +565,14 @@ mod tests {
         match &pd_elem.value {
             Value::PixelData(pd) => {
                 assert_eq!(pd.num_frames(), 2);
-                assert_eq!(pd.encapsulated_frame(0), Some(&[0x01, 0x02, 0x03, 0x04][..]));
-                assert_eq!(pd.encapsulated_frame(1), Some(&[0x05, 0x06, 0x07, 0x08][..]));
+                assert_eq!(
+                    pd.encapsulated_frame(0),
+                    Some(&[0x01, 0x02, 0x03, 0x04][..])
+                );
+                assert_eq!(
+                    pd.encapsulated_frame(1),
+                    Some(&[0x05, 0x06, 0x07, 0x08][..])
+                );
             }
             other => panic!("expected PixelData, got {other:?}"),
         }

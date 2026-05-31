@@ -796,7 +796,10 @@ fn normalize_native_pixel_data(ds: &mut Dataset) {
 
     let expected = frame_pixels.saturating_mul(num_frames.max(1));
     let frames: Vec<Vec<u16>> = if num_frames > 1 && all_pixels.len() == frame_pixels * num_frames {
-        all_pixels.chunks(frame_pixels).map(|c| c.to_vec()).collect()
+        all_pixels
+            .chunks(frame_pixels)
+            .map(|c| c.to_vec())
+            .collect()
     } else {
         if all_pixels.len() != expected {
             log::warn!(

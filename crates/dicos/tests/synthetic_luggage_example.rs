@@ -30,7 +30,10 @@ fn bag_ct_sample_is_ct() {
         "1.2.840.10008.5.1.4.1.1.2"
     );
     assert_eq!(first_string(&ds, tag::MODALITY), "CT");
-    assert_eq!(first_string(&ds, tag::TRANSFER_SYNTAX_UID), "1.2.840.10008.1.2.1");
+    assert_eq!(
+        first_string(&ds, tag::TRANSFER_SYNTAX_UID),
+        "1.2.840.10008.1.2.1"
+    );
     assert!(ds.rows() > 0);
     assert!(ds.columns() > 0);
     assert!(ds.number_of_frames() >= 1);
@@ -69,7 +72,10 @@ fn bag_ct_sample_has_non_uniform_pixel_data() {
     let total_pixels: usize = native_frames.iter().map(|f| f.len()).sum();
     assert_eq!(total_pixels, rows * cols * frames);
 
-    let voxels: Vec<u16> = native_frames.iter().flat_map(|f| f.iter().copied()).collect();
+    let voxels: Vec<u16> = native_frames
+        .iter()
+        .flat_map(|f| f.iter().copied())
+        .collect();
 
     let min = voxels.iter().copied().min().expect("non-empty pixels");
     let max = voxels.iter().copied().max().expect("non-empty pixels");

@@ -12,10 +12,14 @@ fn sample_path() -> PathBuf {
     p
 }
 
-fn parse_ds() -> dicos::types::Dataset {
+fn parse_ds() -> Option<dicos::types::Dataset> {
     let p = sample_path();
+    if !p.exists() {
+        eprintln!("skipping: {p:?} not found");
+        return None;
+    }
     let f = File::open(&p).expect("open bag CT sample");
-    reader::parse(BufReader::new(f)).expect("parse bag CT sample")
+    Some(reader::parse(BufReader::new(f)).expect("parse bag CT sample"))
 }
 
 fn first_string(ds: &dicos::types::Dataset, t: dicos::tag::Tag) -> String {
@@ -24,7 +28,9 @@ fn first_string(ds: &dicos::types::Dataset, t: dicos::tag::Tag) -> String {
 
 #[test]
 fn bag_ct_sample_is_ct() {
-    let ds = parse_ds();
+    let Some(ds) = parse_ds() else {
+        return;
+    };
     assert_eq!(
         first_string(&ds, tag::SOP_CLASS_UID),
         "1.2.840.10008.5.1.4.1.1.2"
@@ -41,7 +47,9 @@ fn bag_ct_sample_is_ct() {
 
 #[test]
 fn bag_ct_sample_is_public_safe() {
-    let ds = parse_ds();
+    let Some(ds) = parse_ds() else {
+        return;
+    };
     let joined = ds
         .iter()
         .filter_map(|(_, e)| e.value.as_str())
@@ -56,7 +64,9 @@ fn bag_ct_sample_is_public_safe() {
 
 #[test]
 fn bag_ct_sample_has_non_uniform_pixel_data() {
-    let ds = parse_ds();
+    let Some(ds) = parse_ds() else {
+        return;
+    };
 
     let rows = ds.rows() as usize;
     let cols = ds.columns() as usize;

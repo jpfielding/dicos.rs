@@ -10,15 +10,15 @@ stored in the repository.
 | Package on crates.io | Imported as | Notes |
 |----------------------|-------------|-------|
 | `dicos`              | `dicos`     | core library + `dicosctl` binary |
-| `pure-jpegrle`       | `jpegrle`   | DICOM RLE PackBits codec |
-| `pure-jpegls`        | `jpegls`    | JPEG-LS codec |
-| `pure-jpegli`        | `jpegli`    | JPEG Lossless codec |
-| `pure-jpeg2k`        | `jpeg2k`    | JPEG 2000 codec |
+| `pure_jpegrle`       | `jpegrle`   | DICOM RLE PackBits codec |
+| `pure_jpegls`        | `jpegls`    | JPEG-LS codec |
+| `pure_jpegli`        | `jpegli`    | JPEG Lossless codec |
+| `pure_jpeg2k`        | `jpeg2k`    | JPEG 2000 codec |
 
-The codec crates use a `pure-` prefix because they are pure-Rust
+The codec crates use a `pure_` prefix because they are pure-Rust
 implementations (the plain `jpegli`/`jpeg2k` names on crates.io are native C
 wrappers). Each keeps its plain `lib` name, so `use jpegli::…` is unchanged for
-consumers; they just depend on `pure-jpegli` in `Cargo.toml`.
+consumers; they just depend on `pure_jpegli` in `Cargo.toml`.
 
 `roxel` (the GPU viewer) is marked `publish = false` and is not released.
 
@@ -32,10 +32,10 @@ token; every release after that is tokenless.
 
    ```sh
    cargo login            # paste a token from https://crates.io/settings/tokens
-   cargo publish -p pure-jpegrle
-   cargo publish -p pure-jpegls
-   cargo publish -p pure-jpegli
-   cargo publish -p pure-jpeg2k
+   cargo publish -p pure_jpegrle
+   cargo publish -p pure_jpegls
+   cargo publish -p pure_jpegli
+   cargo publish -p pure_jpeg2k
    cargo publish -p dicos
    ```
 
@@ -71,3 +71,9 @@ Before tagging, confirm everything packages cleanly:
 ```sh
 cargo package --workspace --locked
 ```
+
+Before the first release, `cargo publish --dry-run -p dicos` will fail until
+the codec packages are actually present in the crates.io index. Use the
+workspace package dry run above for first-release verification; after the
+codec packages are published once, the `dicos` publish dry run can resolve
+them normally.

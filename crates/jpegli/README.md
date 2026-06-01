@@ -17,6 +17,13 @@ DICOM UID: `1.2.840.10008.1.2.4.70` (JPEG Lossless, Non-Hierarchical, Process 14
 
 ## Usage
 
+Add the package under the plain import name:
+
+```toml
+[dependencies]
+jpegli = { package = "pure_jpegli", version = "1.0" }
+```
+
 ### Encoding
 
 ```rust

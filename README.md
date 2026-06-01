@@ -32,12 +32,12 @@ Pure Rust implementations of the lossless image compression formats used by
 DICOS and DICOM. Each codec is a standalone crate with **zero dependency on
 `dicos`**, so they can be used independently in any imaging pipeline.
 
-| Crate | Standard | Algorithm | Use Case |
-|-------|----------|-----------|----------|
-| **jpeg2k** | ITU-T T.800 | Wavelet (DWT + EBCOT) | Excellent compression ratio |
-| **jpegli** | ITU-T T.81 Annex H | DPCM (Process 14 SV1) | Traditional lossless JPEG |
-| **jpegls** | ISO/IEC 14495-1 / ITU-T T.87 | LOCO-I | Very efficient, near-entropy |
-| **jpegrle** | DICOM Part 5 Section 8.1.1 | PackBits RLE | Simple run-length encoding |
+| Package | Imported as | Standard | Algorithm |
+|---------|-------------|----------|-----------|
+| **pure_jpeg2k** | `jpeg2k` | ITU-T T.800 | Wavelet (DWT + EBCOT) |
+| **pure_jpegli** | `jpegli` | ITU-T T.81 Annex H | DPCM (Process 14 SV1) |
+| **pure_jpegls** | `jpegls` | ISO/IEC 14495-1 / ITU-T T.87 | LOCO-I |
+| **pure_jpegrle** | `jpegrle` | DICOM Part 5 Section 8.1.1 | PackBits RLE |
 
 ### dicosctl -- CLI Inspector
 

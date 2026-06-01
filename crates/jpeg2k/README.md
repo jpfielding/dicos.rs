@@ -19,6 +19,13 @@ DICOM UID: `1.2.840.10008.1.2.4.90` (JPEG 2000 Lossless)
 
 ## Usage
 
+Add the package under the plain import name:
+
+```toml
+[dependencies]
+jpeg2k = { package = "pure_jpeg2k", version = "1.0" }
+```
+
 ### Encoding
 
 ```rust

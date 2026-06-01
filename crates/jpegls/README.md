@@ -18,6 +18,13 @@ DICOM UID: `1.2.840.10008.1.2.4.80` (JPEG-LS Lossless)
 
 ## Usage
 
+Add the package under the plain import name:
+
+```toml
+[dependencies]
+jpegls = { package = "pure_jpegls", version = "1.0" }
+```
+
 ### Encoding
 
 ```rust

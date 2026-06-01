@@ -138,10 +138,10 @@ Add `dicos` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dicos = "0.1"
+dicos = "1.0"
 
 # Enable compression codecs as needed:
-# dicos = { version = "0.1", features = ["all-codecs"] }
+# dicos = { version = "1.0", features = ["all-codecs"] }
 ```
 
 ### Reading a DICOS File
@@ -264,10 +264,10 @@ codec.encode(&img, &mut buf)?;
 
 | Feature | Description |
 |---------|-------------|
-| `rle` | Enable RLE PackBits codec via `jpegrle` crate |
-| `jpegls` | Enable JPEG-LS codec via `jpegls` crate |
-| `jpegli` | Enable JPEG Lossless codec via `jpegli` crate |
-| `jpeg2k` | Enable JPEG 2000 codec via `jpeg2k` crate |
+| `rle` | Enable RLE PackBits codec via `pure_jpegrle` package, imported as `jpegrle` |
+| `jpegls` | Enable JPEG-LS codec via `pure_jpegls` package, imported as `jpegls` |
+| `jpegli` | Enable JPEG Lossless codec via `pure_jpegli` package, imported as `jpegli` |
+| `jpeg2k` | Enable JPEG 2000 codec via `pure_jpeg2k` package, imported as `jpeg2k` |
 | `all-codecs` | Enable all of the above |
 | `cli` | Build the `dicosctl` binary (includes all codecs + clap + serde_json) |
 
@@ -464,12 +464,12 @@ All DICOS-specific tags are defined in the `tag` module. The primary DICOS group
 
 All codec crates provide lossless 16-bit grayscale encode/decode through the `Codec` trait:
 
-| Codec | Standard | Crate | Feature | Transfer Syntax UID |
-|-------|----------|-------|---------|---------------------|
-| RLE PackBits | DICOM Part 5 Annex G | `jpegrle` | `rle` | `1.2.840.10008.1.2.5` |
-| JPEG-LS | ISO/IEC 14495-1 (LOCO-I) | `jpegls` | `jpegls` | `1.2.840.10008.1.2.4.80` |
-| JPEG Lossless | ITU-T T.81 Annex H (DPCM) | `jpegli` | `jpegli` | `1.2.840.10008.1.2.4.70` |
-| JPEG 2000 | ITU-T T.800 (Wavelet) | `jpeg2k` | `jpeg2k` | `1.2.840.10008.1.2.4.90` |
+| Codec | Standard | Package | Imported as | Feature | Transfer Syntax UID |
+|-------|----------|---------|-------------|---------|---------------------|
+| RLE PackBits | DICOM Part 5 Annex G | `pure_jpegrle` | `jpegrle` | `rle` | `1.2.840.10008.1.2.5` |
+| JPEG-LS | ISO/IEC 14495-1 (LOCO-I) | `pure_jpegls` | `jpegls` | `jpegls` | `1.2.840.10008.1.2.4.80` |
+| JPEG Lossless | ITU-T T.81 Annex H (DPCM) | `pure_jpegli` | `jpegli` | `jpegli` | `1.2.840.10008.1.2.4.70` |
+| JPEG 2000 | ITU-T T.800 (Wavelet) | `pure_jpeg2k` | `jpeg2k` | `jpeg2k` | `1.2.840.10008.1.2.4.90` |
 
 The codec registry provides three ways to resolve a codec:
 

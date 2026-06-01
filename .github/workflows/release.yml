@@ -53,23 +53,23 @@ jobs:
       # go first; `dicos` depends on all four, so it must be last. `cargo
       # publish` blocks until each crate is live in the index before returning,
       # so the later crates resolve their dependencies cleanly.
-      - name: Publish pure-jpegrle
-        run: cargo publish -p pure-jpegrle --locked
+      - name: Publish pure_jpegrle
+        run: cargo publish -p pure_jpegrle --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-      - name: Publish pure-jpegls
-        run: cargo publish -p pure-jpegls --locked
+      - name: Publish pure_jpegls
+        run: cargo publish -p pure_jpegls --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-      - name: Publish pure-jpegli
-        run: cargo publish -p pure-jpegli --locked
+      - name: Publish pure_jpegli
+        run: cargo publish -p pure_jpegli --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-      - name: Publish pure-jpeg2k
-        run: cargo publish -p pure-jpeg2k --locked
+      - name: Publish pure_jpeg2k
+        run: cargo publish -p pure_jpeg2k --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 

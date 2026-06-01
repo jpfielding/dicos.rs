@@ -736,10 +736,10 @@ dependencies = [
  "env_logger",
  "log",
  "proptest",
- "pure-jpeg2k",
- "pure-jpegli",
- "pure-jpegls",
- "pure-jpegrle",
+ "pure_jpeg2k",
+ "pure_jpegli",
+ "pure_jpegls",
+ "pure_jpegrle",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2394,7 +2394,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pure-jpeg2k"
+name = "pure_jpeg2k"
 version = "1.0.0"
 dependencies = [
  "proptest",
@@ -2402,7 +2402,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pure-jpegli"
+name = "pure_jpegli"
 version = "1.0.0"
 dependencies = [
  "proptest",
@@ -2410,7 +2410,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pure-jpegls"
+name = "pure_jpegls"
 version = "1.0.0"
 dependencies = [
  "proptest",
@@ -2418,7 +2418,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pure-jpegrle"
+name = "pure_jpegrle"
 version = "1.0.0"
 dependencies = [
  "proptest",

@@ -1,5 +1,5 @@
 [package]
-name = "pure-jpegls"
+name = "pure_jpegls"
 description = "Pure-Rust JPEG-LS lossless codec (ISO/IEC 14495-1 / ITU-T T.87)"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ homepage.workspace = true
 keywords = ["jpeg-ls", "jpeg", "lossless", "codec", "compression"]
 categories = ["compression", "multimedia::images"]
 
-# Published as `pure-jpegls`, imported as `jpegls`.
+# Published as `pure_jpegls`, imported as `jpegls`.
 [lib]
 name = "jpegls"
 

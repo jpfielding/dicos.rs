@@ -1,5 +1,5 @@
 [package]
-name = "pure-jpegrle"
+name = "pure_jpegrle"
 description = "Pure-Rust DICOM RLE PackBits lossless codec (DICOM Part 5 Section 8.1.1)"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ homepage.workspace = true
 keywords = ["rle", "packbits", "dicom", "lossless", "codec"]
 categories = ["compression", "multimedia::images"]
 
-# Published as `pure-jpegrle`, imported as `jpegrle`.
+# Published as `pure_jpegrle`, imported as `jpegrle`.
 [lib]
 name = "jpegrle"
 

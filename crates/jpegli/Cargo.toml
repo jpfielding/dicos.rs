@@ -1,5 +1,5 @@
 [package]
-name = "pure-jpegli"
+name = "pure_jpegli"
 description = "Pure-Rust JPEG Lossless codec (ITU-T T.81 Annex H, DICOM Process 14 Selection Value 1)"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ homepage.workspace = true
 keywords = ["jpeg", "lossless", "codec", "dicom", "compression"]
 categories = ["compression", "multimedia::images"]
 
-# Published as `pure-jpegli` (the plain `jpegli` name is a native C wrapper on
+# Published as `pure_jpegli` (the plain `jpegli` name is a native C wrapper on
 # crates.io), but the crate is still imported as `jpegli`.
 [lib]
 name = "jpegli"

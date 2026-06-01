@@ -29,14 +29,14 @@ serde_json = "1"
 
 # Workspace crates
 # version = alongside path so these are publishable to crates.io.
-# The codec crates publish under `pure-*` package names (signalling pure Rust,
+# The codec crates publish under `pure_*` package names (signalling pure Rust,
 # and avoiding the taken `jpegli`/`jpeg2k` native-wrapper names) while keeping
 # their plain lib names — imports and the dep keys below are unchanged.
 dicos = { path = "crates/dicos", version = "1.0.0" }
-jpegrle = { path = "crates/jpegrle", package = "pure-jpegrle", version = "1.0.0" }
-jpegls = { path = "crates/jpegls", package = "pure-jpegls", version = "1.0.0" }
-jpegli = { path = "crates/jpegli", package = "pure-jpegli", version = "1.0.0" }
-jpeg2k = { path = "crates/jpeg2k", package = "pure-jpeg2k", version = "1.0.0" }
+jpegrle = { path = "crates/jpegrle", package = "pure_jpegrle", version = "1.0.0" }
+jpegls = { path = "crates/jpegls", package = "pure_jpegls", version = "1.0.0" }
+jpegli = { path = "crates/jpegli", package = "pure_jpegli", version = "1.0.0" }
+jpeg2k = { path = "crates/jpeg2k", package = "pure_jpeg2k", version = "1.0.0" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

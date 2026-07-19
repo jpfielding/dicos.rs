@@ -39,12 +39,20 @@ fn read_pgm(path: &Path) -> (u32, u32, Vec<u16>) {
         while !d[i].is_ascii_whitespace() {
             i += 1;
         }
-        toks.push(std::str::from_utf8(&d[s..i]).unwrap().parse::<u32>().unwrap());
+        toks.push(
+            std::str::from_utf8(&d[s..i])
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+        );
     }
     i += 1; // single whitespace after maxval
     let (w, h, mv) = (toks[0], toks[1], toks[2]);
     let px: Vec<u16> = if mv > 255 {
-        d[i..].chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()
+        d[i..]
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
     } else {
         d[i..].iter().map(|&b| b as u16).collect()
     };
@@ -59,7 +67,11 @@ struct Fixture {
 }
 
 fn fixtures() -> Vec<Fixture> {
-    let g16 = |jpg| Fixture { jpg, src: "g16.pgm", point_transform: 0 };
+    let g16 = |jpg| Fixture {
+        jpg,
+        src: "g16.pgm",
+        point_transform: 0,
+    };
     vec![
         g16("g16_psv1.jpg"),
         g16("g16_psv2.jpg"),
@@ -70,12 +82,24 @@ fn fixtures() -> Vec<Fixture> {
         g16("g16_psv7.jpg"),
         g16("g16_restart.jpg"),
         // Point transform Pt=1: cjpeg stores (sample >> 1) << 1.
-        Fixture { jpg: "g16_psv1_pt1.jpg", src: "g16.pgm", point_transform: 1 },
+        Fixture {
+            jpg: "g16_psv1_pt1.jpg",
+            src: "g16.pgm",
+            point_transform: 1,
+        },
         // Random 16-bit: statistically exercises large modular differences,
         // including the SSSS=16 (32768) case.
-        Fixture { jpg: "r16_psv1.jpg", src: "r16.pgm", point_transform: 0 },
+        Fixture {
+            jpg: "r16_psv1.jpg",
+            src: "r16.pgm",
+            point_transform: 0,
+        },
         // 8-bit precision.
-        Fixture { jpg: "g8_psv1.jpg", src: "g8.pgm", point_transform: 0 },
+        Fixture {
+            jpg: "g8_psv1.jpg",
+            src: "g8.pgm",
+            point_transform: 0,
+        },
     ]
 }
 
@@ -96,7 +120,11 @@ fn decode_cjpeg_fixtures() {
         let (decoded, dw, dh) = jpegli::decode(&bytes, w, h)
             .unwrap_or_else(|e| panic!("{}: decode failed: {e}", f.jpg));
         assert_eq!((dw, dh), (w, h), "{}: dimensions", f.jpg);
-        assert_eq!(decoded, expected, "{}: pixel mismatch vs cjpeg source", f.jpg);
+        assert_eq!(
+            decoded, expected,
+            "{}: pixel mismatch vs cjpeg source",
+            f.jpg
+        );
     }
 }
 

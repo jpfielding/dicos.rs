@@ -8,9 +8,15 @@ members = [
     "crates/jpeg2k",
     "crates/roxel",
 ]
-# The cargo-fuzz subcrate is nightly-only and builds against libFuzzer; keep it
-# out of the normal workspace build.
-exclude = ["fuzz"]
+# The cargo-fuzz subcrates are nightly-only and build against libFuzzer; keep
+# them out of the normal workspace build.
+exclude = [
+    "fuzz",
+    "crates/jpeg2k/fuzz",
+    "crates/jpegls/fuzz",
+    "crates/jpegli/fuzz",
+    "crates/jpegrle/fuzz",
+]
 
 [workspace.package]
 version = "1.0.0"

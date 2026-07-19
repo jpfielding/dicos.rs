@@ -429,6 +429,16 @@ pub(crate) fn decode_scan<R: Read>(
             // Decode Huffman symbol (SSSS = number of additional bits)
             let ssss = decode_huffman(&mut br, ht)?;
 
+            // T.81 permits SSSS only in 0..=16; a corrupted DHT can map a
+            // valid code to a larger symbol, which must be rejected before
+            // read_bits (a count > 24 is unrepresentable in the bit buffer).
+            if ssss > 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("SSSS category {ssss} out of range (T.81 allows 0..=16)"),
+                ));
+            }
+
             // Read additional bits and sign-extend.  SSSS==16 is the T.81
             // H.1.2.2 / Table H.2 special case: the modular difference 32768
             // carries NO appended bits (it can only occur at P'==16).

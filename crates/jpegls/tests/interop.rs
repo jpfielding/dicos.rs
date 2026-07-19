@@ -41,12 +41,20 @@ fn read_pgm(path: &Path) -> (u32, u32, Vec<u16>) {
         while !d[i].is_ascii_whitespace() {
             i += 1;
         }
-        toks.push(std::str::from_utf8(&d[s..i]).unwrap().parse::<u32>().unwrap());
+        toks.push(
+            std::str::from_utf8(&d[s..i])
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+        );
     }
     i += 1;
     let (w, h, mv) = (toks[0], toks[1], toks[2]);
     let px: Vec<u16> = if mv > 255 {
-        d[i..].chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()
+        d[i..]
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
     } else {
         d[i..].iter().map(|&b| b as u16).collect()
     };

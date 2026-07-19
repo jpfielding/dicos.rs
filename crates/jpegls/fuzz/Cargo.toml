@@ -1,0 +1,27 @@
+[package]
+name = "jpegls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.75"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jpegls = { path = "..", package = "pure_jpegls" }
+
+# Prevent this fuzzing crate from being merged into the root workspace; it is
+# nightly/cargo-fuzz-only and is listed in the root `[workspace] exclude`.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly + on-demand triggers exist solely for the `fuzz-smoke` job, which is
+  # gated to these events via its `if:` (it must never run on push/PR).
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,3 +49,69 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Package all crates
         run: cargo package --workspace --locked
+
+  # Codec interop against reference tools + checked-in fixtures.
+  interop:
+    name: interop (openjpeg + fixtures)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Provides opj_compress / opj_decompress for the jpeg2k round-trip.
+      - name: Install OpenJPEG CLI tools
+        run: sudo apt-get update && sudo apt-get install -y libopenjp2-tools
+
+      # jpeg2k: both directions. With libopenjp2-tools present, DICOS_INTEROP=1
+      # runs decode_openjpeg_fixtures (checked-in .j2k) AND the encode round-trip
+      # through opj_decompress.
+      - name: jpeg2k interop (decode + encode via opj_decompress)
+        run: DICOS_INTEROP=1 cargo test -p pure_jpeg2k --test interop -- --nocapture
+
+      # jpegli: DECODE DIRECTION ONLY. The encode round-trip (encode_roundtrip_via_djpeg)
+      # needs djpeg from libjpeg-turbo >= 3.0 for JPEG-lossless; ubuntu ships
+      # 2.1.x, which cannot decode our lossless output. We therefore deliberately
+      # do NOT set DICOS_INTEROP and do NOT install djpeg, so that test self-skips
+      # and only decode_cjpeg_fixtures runs -- it reads checked-in .jpg fixtures
+      # and needs no external tool.
+      - name: jpegli interop (fixture decode only; encode needs libjpeg-turbo >= 3.0)
+        run: cargo test -p pure_jpegli --test interop -- --nocapture
+
+      # jpegls: fixture-gated. No charls CLI here and no *.jls fixtures checked
+      # in, so decode_charls_fixtures self-skips. Run anyway so the harness stays
+      # compiled and its skip path is exercised on every CI run.
+      - name: jpegls interop (fixture-gated, self-skips when empty)
+        run: cargo test -p pure_jpegls --test interop -- --nocapture
+
+  # Weekly (and on-demand) libFuzzer smoke run over every fuzz target. Gated to
+  # schedule/workflow_dispatch: fuzzing is nightly-only and slow, so it MUST NOT
+  # run on push/PR. A crash fails the job (continue-on-error: false).
+  fuzz-smoke:
+    name: fuzz smoke (nightly, 60s/target)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # cargo-fuzz manages its own sanitizer RUSTFLAGS; the workflow-level
+    # "-D warnings" would collide with that, so clear it for this job.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run every fuzz target for 60s
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          for dir in fuzz crates/jpeg2k/fuzz crates/jpegls/fuzz crates/jpegli/fuzz crates/jpegrle/fuzz; do
+            echo "::group::$dir"
+            for target in $(cargo fuzz list --fuzz-dir "$dir"); do
+              echo "fuzzing $dir :: $target"
+              cargo fuzz run --fuzz-dir "$dir" "$target" -- -max_total_time=60
+            done
+            echo "::endgroup::"
+          done

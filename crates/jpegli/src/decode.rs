@@ -36,7 +36,6 @@ struct Decoder {
     dc_tables: [Option<HuffmanTable>; 4],
     predictor: u8,
     point_transform: u8,
-    #[allow(dead_code)]
     restart_interval: u16,
 }
 
@@ -145,6 +144,17 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         .as_ref()
         .ok_or_else(|| CodecError::InvalidData("missing Huffman table".into()))?;
 
+    // Restart interval (DRI) validation.  T.81 H.1.1: for a non-interleaved
+    // single-component lossless scan 1 MCU = 1 sample, and Ri must be an
+    // integer multiple of the samples-per-row (== width), so restarts fall on
+    // row boundaries only.
+    let restart_interval = dec.restart_interval as usize;
+    if restart_interval != 0 && restart_interval % (jpeg_w as usize) != 0 {
+        return Err(CodecError::InvalidData(format!(
+            "restart interval {restart_interval} is not a multiple of width {jpeg_w} (H.1.1)"
+        )));
+    }
+
     // Decode the scan data (remaining bytes after SOS header)
     let remaining = &data[cursor.position() as usize..];
     let pixels = scan::decode_scan(
@@ -155,6 +165,7 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         dec.precision,
         dec.predictor,
         dec.point_transform,
+        restart_interval,
     )
     .map_err(|e| CodecError::InvalidData(format!("scan decode error: {e}")))?;
 
@@ -701,5 +712,239 @@ mod tests {
 
         let (decoded, _, _) = decode(&encoded, 1, 128).unwrap();
         assert_eq!(decoded, pixels);
+    }
+
+    // -----------------------------------------------------------------------
+    // Restart intervals (J4): T.81 Annex H.1.1 row-aligned restarts.
+    // -----------------------------------------------------------------------
+
+    use crate::encode::{encode_with_options, EncodeOptions};
+
+    /// Deterministic image whose samples all fit in `precision` bits.
+    fn det_image(w: usize, h: usize, precision: u8) -> Vec<u16> {
+        let modulus: u64 = 1u64 << precision;
+        (0..(w * h))
+            .map(|i| ((i as u64 * 2_654_435_761 + 12345) % modulus) as u16)
+            .collect()
+    }
+
+    fn restart_opts(predictor: u8, pt: u8, precision: u8, rows: u16) -> EncodeOptions {
+        EncodeOptions {
+            predictor,
+            point_transform: pt,
+            restart_interval_rows: rows,
+            precision,
+        }
+    }
+
+    /// Collect the restart-marker indices (RST0..RST7 -> 0..7) appearing in the
+    /// stream, in order.  Any `0xFF Dn` with n in 0xD0..=0xD7 is unambiguously a
+    /// restart marker: entropy `0xFF` bytes are always stuffed as `0xFF 0x00`.
+    fn restart_markers(buf: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < buf.len() {
+            if buf[i] == 0xFF && (0xD0..=0xD7).contains(&buf[i + 1]) {
+                out.push(buf[i + 1] - 0xD0);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn restart_roundtrip_matrix() {
+        // rows x predictor x pt x precision on several deterministic images.
+        for &(w, h) in &[(8usize, 6usize), (5, 5), (1, 4)] {
+            for &precision in &[8u8, 16u8] {
+                let pixels = det_image(w, h, precision);
+                for &rows in &[1u16, 2, 3, h as u16] {
+                    for &predictor in &[1u8, 4, 7] {
+                        for &pt in &[0u8, 2u8] {
+                            if pt >= precision {
+                                continue;
+                            }
+                            let opts = restart_opts(predictor, pt, precision, rows);
+                            let mut buf = Vec::new();
+                            encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf)
+                                .unwrap();
+                            let (decoded, dw, dh) = decode(&buf, w as u32, h as u32).unwrap();
+                            assert_eq!((dw, dh), (w as u32, h as u32));
+                            let expected: Vec<u16> =
+                                pixels.iter().map(|&p| (p >> pt) << pt).collect();
+                            assert_eq!(
+                                decoded, expected,
+                                "restart roundtrip mismatch w={w} h={h} rows={rows} \
+                                 predictor={predictor} pt={pt} precision={precision}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restart_markers_cycle_mod_8() {
+        // A tall 1-wide image with rows=1 forces one restart per row after the
+        // first: 10 rows -> 9 restarts, indices cycling 0..7 then wrapping to 0.
+        let (w, h) = (1usize, 10usize);
+        let pixels = det_image(w, h, 8);
+        let opts = restart_opts(1, 0, 8, 1);
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+
+        assert_eq!(
+            restart_markers(&buf),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 0],
+            "restart indices must cycle mod 8"
+        );
+
+        // And it still round-trips exactly.
+        let (decoded, _, _) = decode(&buf, w as u32, h as u32).unwrap();
+        assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn restart_dri_value_is_rows_times_width() {
+        let (w, h) = (6usize, 4usize);
+        let pixels = det_image(w, h, 8);
+        let opts = restart_opts(1, 0, 8, 2); // 2 rows x 6 width = 12
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+
+        let dri = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDD)
+            .expect("DRI present");
+        assert_eq!(&buf[dri + 2..dri + 4], &[0x00, 0x04]);
+        assert_eq!(
+            u16::from_be_bytes([buf[dri + 4], buf[dri + 5]]),
+            12,
+            "Ri must equal rows * width"
+        );
+    }
+
+    /// Restart resets prediction (H.1.2.1): the segment after a restart is coded
+    /// independently of the rows before it, so two images that share row 1 but
+    /// differ in row 0 must produce byte-identical entropy after the RST0 marker.
+    /// A decoder that failed to reset would make row 1 depend on row 0.
+    #[test]
+    fn restart_resets_predictor_row_independence() {
+        let (w, h) = (3usize, 2usize);
+        let row1 = [100u16, 110, 120];
+        let img_a: Vec<u16> = [10, 20, 30].into_iter().chain(row1).collect();
+        let img_b: Vec<u16> = [200, 150, 90].into_iter().chain(row1).collect();
+        let opts = restart_opts(4, 0, 8, 1); // restart after every row
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        encode_with_options(&img_a, w as u32, h as u32, &opts, &mut a).unwrap();
+        encode_with_options(&img_b, w as u32, h as u32, &opts, &mut b).unwrap();
+
+        // Slice from the RST0 marker (0xFF 0xD0) to just before EOI (0xFF 0xD9).
+        let tail = |buf: &[u8]| -> Vec<u8> {
+            let start = buf
+                .windows(2)
+                .position(|x| x[0] == 0xFF && x[1] == 0xD0)
+                .expect("RST0 present");
+            let end = buf.len() - 2; // strip trailing EOI
+            buf[start..end].to_vec()
+        };
+        assert_eq!(
+            tail(&a),
+            tail(&b),
+            "row-1 entropy must be independent of row 0 across a restart"
+        );
+
+        // Both must also decode exactly.
+        assert_eq!(decode(&a, w as u32, h as u32).unwrap().0, img_a);
+        assert_eq!(decode(&b, w as u32, h as u32).unwrap().0, img_b);
+    }
+
+    // --- Error cases -------------------------------------------------------
+
+    /// Build a valid restart-bearing stream for corruption tests.
+    fn restart_stream(w: usize, h: usize, rows: u16) -> Vec<u8> {
+        let pixels = det_image(w, h, 8);
+        let opts = restart_opts(1, 0, 8, rows);
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn reject_ri_not_multiple_of_width() {
+        // width 4, valid Ri = 4; corrupt the DRI value to 3 (not a multiple).
+        let mut buf = restart_stream(4, 4, 1);
+        let dri = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDD)
+            .unwrap();
+        buf[dri + 4] = 0x00;
+        buf[dri + 5] = 0x03;
+        assert!(matches!(
+            decode(&buf, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_restart_out_of_order() {
+        // Corrupt the first RST0 (0xD0) into RST3 (0xD3): expected index mismatch.
+        let mut buf = restart_stream(4, 4, 1);
+        let rst = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xD0)
+            .unwrap();
+        buf[rst + 1] = 0xD3;
+        assert!(matches!(
+            decode(&buf, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_restart_without_dri() {
+        // Remove the DRI segment (6 bytes: marker + len + Ri) but keep the RSTn
+        // markers in the entropy: an unexpected restart must be rejected.
+        let mut buf = restart_stream(4, 4, 1);
+        let dri = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDD)
+            .unwrap();
+        buf.drain(dri..dri + 6);
+        assert!(matches!(
+            decode(&buf, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_missing_restart_marker() {
+        // Splice out the first RST marker bytes so the expected restart is gone.
+        let mut buf = restart_stream(4, 6, 1);
+        let rst = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xD0)
+            .unwrap();
+        buf.drain(rst..rst + 2);
+        assert!(decode(&buf, 4, 6).is_err());
+    }
+
+    #[test]
+    fn truncation_inside_restart_interval_errors_not_panics() {
+        // Truncating mid-scan (before later restarts / EOI) must error, not panic.
+        let full = restart_stream(4, 8, 1);
+        let sos = full
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDA)
+            .unwrap();
+        // Keep the SOS header (8 bytes) plus a few entropy bytes, drop the rest.
+        let cut = sos + 8 + 3;
+        let truncated = &full[..cut.min(full.len())];
+        assert!(decode(truncated, 4, 8).is_err());
     }
 }

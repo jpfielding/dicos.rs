@@ -144,10 +144,9 @@ pub fn encode_with_options(
         }
     }
 
-    // Restart-interval math must fit in the 16-bit DRI field.  Validate before
-    // deciding what to emit so an out-of-range request is a validation error,
-    // not an "unsupported" one.
-    if opts.restart_interval_rows > 0 {
+    // Restart-interval math must fit in the 16-bit DRI field (T.81 H.1.1: the
+    // DRI value is `restart_interval_rows * width` MCUs, one MCU per sample).
+    let restart_interval: u16 = if opts.restart_interval_rows > 0 {
         let dri = (opts.restart_interval_rows as u32) * (width_usize as u32);
         if dri == 0 || dri > 65535 {
             return Err(CodecError::InvalidData(format!(
@@ -155,13 +154,10 @@ pub fn encode_with_options(
                 opts.restart_interval_rows, width_usize, dri
             )));
         }
-        // The DRI marker itself is well-defined, but emitting the RSTn markers
-        // during the scan is task J4.  Until that lands, refuse rather than
-        // produce a half-formed stream.
-        return Err(CodecError::Unsupported(
-            "restart emission lands in J4".into(),
-        ));
-    }
+        dri as u16
+    } else {
+        0
+    };
 
     let ht = build_default_table();
 
@@ -169,6 +165,9 @@ pub fn encode_with_options(
     write_app0(w)?;
     write_sof3(w, width_usize, height_usize, opts.precision)?;
     write_dht(w, &ht)?;
+    if restart_interval > 0 {
+        write_dri(w, restart_interval)?;
+    }
     write_sos_and_scan(
         w,
         &ht,
@@ -178,6 +177,7 @@ pub fn encode_with_options(
         opts.precision,
         opts.predictor,
         opts.point_transform,
+        opts.restart_interval_rows as usize,
     )?;
     write_marker(w, MARKER_EOI)?;
 
@@ -248,6 +248,17 @@ fn write_dht(w: &mut dyn Write, ht: &HuffmanTable) -> Result<(), CodecError> {
     Ok(())
 }
 
+/// Write DRI (Define Restart Interval) marker segment (T.81 B.2.4).
+fn write_dri(w: &mut dyn Write, restart_interval: u16) -> Result<(), CodecError> {
+    write_marker(w, MARKER_DRI)?;
+    // Length = 4 (2 length bytes + 2 interval bytes), then Ri.
+    let mut data = [0u8; 4];
+    data[0..2].copy_from_slice(&4u16.to_be_bytes());
+    data[2..4].copy_from_slice(&restart_interval.to_be_bytes());
+    w.write_all(&data)?;
+    Ok(())
+}
+
 /// Write SOS header and entropy-coded scan data.
 #[allow(clippy::too_many_arguments)]
 fn write_sos_and_scan(
@@ -259,6 +270,7 @@ fn write_sos_and_scan(
     precision: u8,
     predictor: u8,
     point_transform: u8,
+    restart_interval_rows: usize,
 ) -> Result<(), CodecError> {
     write_marker(w, MARKER_SOS)?;
     // Length = 2(len) + 1(ncomp) + 2(comp spec) + 3(Ss,Se,Ah|Al) = 8
@@ -285,6 +297,7 @@ fn write_sos_and_scan(
         precision,
         predictor,
         point_transform,
+        restart_interval_rows,
     )?;
 
     Ok(())
@@ -485,8 +498,8 @@ mod tests {
     }
 
     #[test]
-    fn restart_interval_returns_unsupported() {
-        // Valid restart math (1 row x 4 width = 4 <= 65535) but emission is J4.
+    fn restart_interval_emits_dri_marker() {
+        // Valid restart math (1 row x 4 width = 4 <= 65535); J4 emits DRI + RSTn.
         let pixels = vec![0u16; 16];
         let mut buf = Vec::new();
         let o = EncodeOptions {
@@ -495,10 +508,30 @@ mod tests {
             restart_interval_rows: 1,
             precision: 16,
         };
-        assert!(matches!(
-            encode_with_options(&pixels, 4, 4, &o, &mut buf),
-            Err(CodecError::Unsupported(_))
-        ));
+        encode_with_options(&pixels, 4, 4, &o, &mut buf).unwrap();
+
+        // DRI marker 0xFFDD carrying Ri = rows * width = 1 * 4 = 4, positioned
+        // before SOS.
+        let dri = buf
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == 0xDD)
+            .expect("DRI present");
+        let sos = buf
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == 0xDA)
+            .expect("SOS present");
+        assert!(dri < sos, "DRI must precede SOS");
+        // Layout: FF DD, len(2)=0004, Ri(2).
+        assert_eq!(
+            &buf[dri + 2..dri + 4],
+            &[0x00, 0x04],
+            "DRI length must be 4"
+        );
+        assert_eq!(
+            &buf[dri + 4..dri + 6],
+            &[0x00, 0x04],
+            "Ri must be rows*width"
+        );
     }
 
     #[test]

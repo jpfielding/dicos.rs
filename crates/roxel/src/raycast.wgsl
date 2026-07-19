@@ -153,6 +153,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             color = color * (ambient + diffuse) + vec3<f32>(spec * u.specular_intensity);
 
             // Edge enhancement.
+            // NOTE: this is the "gradient edge boost" factor of the opacity
+            // model -- see the "Opacity model" doc on `TransferFunction` in
+            // src/transfer.rs for how this composes with the density curve,
+            // per-band alpha, and global opacity.
             alpha *= 1.0 + grad_mag * 0.5;
         } else {
             color = color * u.ambient_intensity;

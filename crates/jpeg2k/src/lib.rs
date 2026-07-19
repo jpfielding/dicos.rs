@@ -7,37 +7,35 @@ use crate::error::CodecError;
 
 pub mod error;
 
-// TODO(t800): drop these `dead_code` allows as the conformant tier-1/tier-2
-// pipeline (packet/geometry/tagtree + EBCOT rewrite) wires these modules in.
+// `bitstream` still carries the bit-granularity `BitReader`/`BitWriter` helpers
+// that the conformant pipeline does not use (packet I/O has its own stuffing bit
+// codec); only `ByteReader`/`ByteWriter` are live. `rct` (multi-component
+// transform) is unused while the profile is single-component MCT=0. Both keep a
+// `dead_code` allow for those genuinely-unused helpers.
 #[allow(dead_code)]
 mod bitstream;
 mod codestream;
 mod dwt;
-#[allow(dead_code)]
 mod ebcot;
-// TODO(t800): wired in tier-2 (packet/tier-1 pipeline consumes these).
-#[allow(dead_code)]
 mod geometry;
-// Frozen v1.0.0 raw-DWT tile pipeline; still what public encode/decode route
-// through (codestream rewiring is Workstream 1 step 9).
+// Frozen v1.0.0 raw-DWT tile pipeline, gated behind `legacy-decode`. Only its
+// `TileDecoder` is live now (the conformant encoder replaced `TileEncoder`), so
+// the frozen encoder half is a genuinely-unused legacy helper.
+#[cfg(feature = "legacy-decode")]
+#[allow(dead_code)]
 mod legacy;
+// `markers` exposes structural helpers (tile counts, code-block dims) that are
+// part of its API surface but not all consumed by the single-tile pipeline.
 #[allow(dead_code)]
 mod markers;
-#[allow(dead_code)]
 mod mq;
-// TODO(t800): conformant tier-2 packet-header codec; wired in step 9.
-#[allow(dead_code)]
 mod packet;
 #[allow(dead_code)]
 mod rct;
-// TODO(t800): wired in tier-2 (packet-header codec consumes this).
-#[allow(dead_code)]
 mod tagtree;
-// TODO(t800): conformant DWT/geometry/EBCOT/packet pipeline; wired in step 9.
-#[allow(dead_code)]
 mod tile;
 
-pub use codestream::{decode, encode};
+pub use codestream::{decode, decode_with_options, encode, DecodeOptions, LegacyPolicy};
 
 /// Options for JPEG 2000 encoding.
 #[derive(Debug, Clone)]

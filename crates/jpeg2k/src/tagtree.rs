@@ -44,6 +44,7 @@ impl Node {
 
 struct Level {
     w: u32,
+    #[allow(dead_code)] // kept for symmetry with `w`; not read after construction
     h: u32,
     nodes: Vec<Node>,
 }
@@ -114,6 +115,7 @@ impl TagTree {
 
     /// Clear coding state (`low` and the emitted-bit flags) while keeping the
     /// leaf/interior values. Lets one tree be re-coded from scratch.
+    #[allow(dead_code)] // exercised by tagtree tests; not needed by the single-layer pipeline
     pub fn reset(&mut self) {
         for level in &mut self.levels {
             for node in &mut level.nodes {

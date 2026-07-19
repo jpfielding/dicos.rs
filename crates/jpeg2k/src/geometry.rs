@@ -53,11 +53,13 @@ impl Rect {
     }
 
     /// Number of samples covered.
+    #[allow(dead_code)] // used by geometry/packet tests and invariant checks
     pub fn area(&self) -> u64 {
         self.width() as u64 * self.height() as u64
     }
 
     /// `true` when the rect covers no samples.
+    #[allow(dead_code)] // used by geometry/packet tests
     pub fn is_empty(&self) -> bool {
         self.width() == 0 || self.height() == 0
     }

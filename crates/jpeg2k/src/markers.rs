@@ -19,12 +19,34 @@ pub const MARKER_COC: u16 = 0xFF53;
 pub const MARKER_QCD: u16 = 0xFF5C;
 /// Quantization component.
 pub const MARKER_QCC: u16 = 0xFF5D;
+/// Region of interest.
+pub const MARKER_RGN: u16 = 0xFF5E;
+/// Progression order change.
+pub const MARKER_POC: u16 = 0xFF5F;
+/// Tile-part lengths, main header.
+pub const MARKER_TLM: u16 = 0xFF55;
+/// Packet length, main header.
+pub const MARKER_PLM: u16 = 0xFF57;
+/// Packet length, tile-part header.
+pub const MARKER_PLT: u16 = 0xFF58;
+/// Packed packet headers, main header.
+pub const MARKER_PPM: u16 = 0xFF60;
+/// Packed packet headers, tile-part header.
+pub const MARKER_PPT: u16 = 0xFF61;
 /// Start of tile-part.
 pub const MARKER_SOT: u16 = 0xFF90;
-/// Start of data.
-pub const MARKER_SOD: u16 = 0xFFD3;
+/// Start of data (ITU-T T.800 Table A-1: `0xFF93`).
+pub const MARKER_SOD: u16 = 0xFF93;
+/// Start of data as emitted by the non-conformant v1.0.0 / Go writer (`0xFFD3`).
+///
+/// The legacy codestream writer used the wrong SOD code; the conformant decoder
+/// accepts this value **only** on the frozen legacy decode path so archived
+/// v1.0.0 files keep decoding.
+pub const MARKER_SOD_LEGACY: u16 = 0xFFD3;
 /// End of codestream.
 pub const MARKER_EOC: u16 = 0xFFD9;
+/// Component registration.
+pub const MARKER_CRG: u16 = 0xFF63;
 /// Comment.
 pub const MARKER_COM: u16 = 0xFF64;
 
@@ -89,8 +111,12 @@ impl TransformType {
 // Coding style flags (ITU-T T.800 Table A.13)
 // ---------------------------------------------------------------------------
 
-/// Custom precinct sizes present.
+/// Custom precinct sizes present (Scod bit 0).
 pub const CODING_STYLE_PRECINCTS_USER: u8 = 0x01;
+/// SOP marker segments used (Scod bit 1).
+pub const CODING_STYLE_SOP: u8 = 0x02;
+/// EPH marker segments used (Scod bit 2).
+pub const CODING_STYLE_EPH: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // Component info
@@ -260,29 +286,26 @@ pub fn build_siz(
     }
 }
 
-/// Build a default COD marker for lossless encoding.
-pub fn build_default_cod(decomp_levels: u8, num_layers: u16, mct: bool) -> CodMarker {
+/// Build the COD marker for the supported lossless profile.
+///
+/// `cb_width_exp` / `cb_height_exp` are the **actual** code-block exponents
+/// (block size `2^exp`, legal range `2..=10`). Per T.800 A.6.1 the COD stores
+/// them offset by `−2` (`SPcod` carries `exp − 2`), so the [`CodMarker`] fields
+/// hold `exp − 2`. The profile fixes: `Scod = 0` (no precinct/SOP/EPH flags),
+/// LRCP progression, one quality layer, no multi-component transform,
+/// `cb_style = 0`, reversible 5/3 transform.
+pub fn build_cod(num_decomp_levels: u8, cb_width_exp: u8, cb_height_exp: u8) -> CodMarker {
     CodMarker {
         scod: 0,
         progression: ProgressionOrder::Lrcp,
-        num_layers,
-        mct: if mct { 1 } else { 0 },
-        decomp_levels,
-        cb_width_exp: 4, // 64x64 code-blocks
-        cb_height_exp: 4,
+        num_layers: 1,
+        mct: 0,
+        decomp_levels: num_decomp_levels,
+        cb_width_exp: cb_width_exp.saturating_sub(2),
+        cb_height_exp: cb_height_exp.saturating_sub(2),
         cb_style: 0,
         transform: TransformType::Reversible53,
         precinct_sizes: Vec::new(),
-    }
-}
-
-/// Build a default QCD marker for lossless (reversible) encoding.
-pub fn build_default_qcd(decomp_levels: u8, guard_bits: u8) -> QcdMarker {
-    let num_subbands = 3 * (decomp_levels as usize) + 1;
-    QcdMarker {
-        sqcd: 0, // Reversible, no quantization
-        guard_bits,
-        step_sizes: vec![0i16; num_subbands],
     }
 }
 
@@ -343,15 +366,23 @@ mod tests {
 
     #[test]
     fn cod_code_block_dims() {
-        let cod = build_default_cod(5, 1, false);
+        // Actual exponent 6 → 64×64 blocks; the marker stores exp − 2 = 4.
+        let cod = build_cod(5, 6, 6);
+        assert_eq!(cod.cb_width_exp, 4);
+        assert_eq!(cod.cb_height_exp, 4);
         assert_eq!(cod.code_block_width(), 64);
         assert_eq!(cod.code_block_height(), 64);
+        assert_eq!(cod.num_layers, 1);
+        assert_eq!(cod.mct, 0);
+        assert_eq!(cod.scod, 0);
     }
 
     #[test]
-    fn qcd_subband_count() {
-        let qcd = build_default_qcd(5, 2);
-        assert_eq!(qcd.step_sizes.len(), 16); // 3*5 + 1
+    fn cod_smallest_blocks() {
+        // Actual exponent 2 → 4×4 blocks; stored exp − 2 = 0.
+        let cod = build_cod(1, 2, 2);
+        assert_eq!(cod.cb_width_exp, 0);
+        assert_eq!(cod.code_block_width(), 4);
     }
 
     #[test]

@@ -499,11 +499,13 @@ impl MqEncoder {
     }
 
     /// Consume the encoder and return the output buffer.
+    #[allow(dead_code)] // convenience API; the pipeline uses `bytes()`
     pub fn into_bytes(self) -> Vec<u8> {
         self.output
     }
 
     /// Reset the encoder for reuse with a new code-block.
+    #[allow(dead_code)] // convenience API; the pipeline builds a fresh encoder per block
     pub fn reset(&mut self) {
         self.output.clear();
         self.a = 0x8000;

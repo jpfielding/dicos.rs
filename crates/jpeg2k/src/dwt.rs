@@ -120,6 +120,7 @@ pub fn inverse_1d(signal: &mut [i32]) {
 
 /// Legacy forward 1-D 5/3 transform (truncating division). Frozen for byte
 /// compatibility with 1.0.0 codestreams -- see `tests/legacy_fixtures.rs`.
+#[allow(dead_code)] // frozen legacy (v1.0.0) DWT helper; live only via `legacy` decode
 fn legacy_forward_1d(signal: &mut [i32]) {
     let n = signal.len();
     if n < 2 {
@@ -163,6 +164,7 @@ fn legacy_forward_1d(signal: &mut [i32]) {
 
 /// Legacy inverse 1-D 5/3 transform (truncating division). Frozen for byte
 /// compatibility with 1.0.0 codestreams -- see `tests/legacy_fixtures.rs`.
+#[allow(dead_code)] // frozen legacy (v1.0.0) DWT helper; live only via `legacy` decode
 fn legacy_inverse_1d(signal: &mut [i32]) {
     let n = signal.len();
     if n < 2 {
@@ -278,6 +280,7 @@ pub fn inverse_2d(data: &mut [i32], width: usize, height: usize) {
 /// This is the path wired through `encode`; it uses [`legacy_forward_1d`] and
 /// stops early on degenerate sub-regions, matching 1.0.0 byte output. Do not
 /// change its behaviour -- use the `*_conformant` entry points for new work.
+#[allow(dead_code)] // frozen legacy (v1.0.0) DWT helper; live only via `legacy` decode
 pub fn forward_multi_level(
     data: &mut [i32],
     width: usize,
@@ -301,6 +304,7 @@ pub fn forward_multi_level(
 /// Inverse multi-level 2-D DWT.
 ///
 /// Levels are processed in reverse order, from smallest to largest.
+#[allow(dead_code)] // frozen legacy (v1.0.0) DWT helper; live only via `legacy` decode
 pub fn inverse_multi_level(data: &mut [i32], width: usize, height: usize, levels: usize) {
     // Pre-calculate LL dimensions at each level.
     let mut dims = vec![(0usize, 0usize); levels + 1];
@@ -323,6 +327,7 @@ pub fn inverse_multi_level(data: &mut [i32], width: usize, height: usize, levels
 // Helpers -- forward/inverse on the LL sub-region
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // frozen legacy (v1.0.0) DWT helper; live only via `legacy` decode
 fn forward_ll_region(data: &mut [i32], stride: usize, width: usize, height: usize) {
     if width < 2 || height < 2 {
         return;
@@ -350,6 +355,7 @@ fn forward_ll_region(data: &mut [i32], stride: usize, width: usize, height: usiz
     }
 }
 
+#[allow(dead_code)] // frozen legacy (v1.0.0) DWT helper; live only via `legacy` decode
 fn inverse_ll_region(data: &mut [i32], stride: usize, width: usize, height: usize) {
     if width < 2 || height < 2 {
         return;

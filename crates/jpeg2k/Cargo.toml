@@ -16,6 +16,12 @@ categories = ["compression", "multimedia::images"]
 [lib]
 name = "jpeg2k"
 
+[features]
+default = ["legacy-decode"]
+# Decode v1.0.0 / Go raw-DWT "legacy" codestreams. On by default; with it off,
+# `LegacyPolicy::Auto` behaves as `StandardOnly` and `LegacyOnly` errors.
+legacy-decode = []
+
 [dependencies]
 thiserror.workspace = true
 

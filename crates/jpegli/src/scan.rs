@@ -155,6 +155,18 @@ impl<R: Read> BitReader<R> {
         self.pending_marker
     }
 
+    /// True when no more real entropy bits are available: the buffer is empty
+    /// and the underlying reader has reached EOF or stopped at a marker.
+    ///
+    /// Callers use this to turn a premature end of the entropy stream into an
+    /// explicit truncation error instead of decoding fabricated SSSS=0 symbols.
+    fn at_end(&mut self) -> io::Result<bool> {
+        if self.bits == 0 && !self.eof {
+            self.fill()?;
+        }
+        Ok(self.bits == 0 && self.eof)
+    }
+
     /// Read exactly `n` bits (n <= 24).
     pub fn read_bits(&mut self, n: u8) -> io::Result<u32> {
         debug_assert!(n <= 24);
@@ -164,12 +176,13 @@ impl<R: Read> BitReader<R> {
         while self.bits < n {
             self.fill()?;
             if self.eof && self.bits < n {
-                // Pad with zeros on EOF (match Go behavior)
-                let have = self.buf & ((1 << self.bits) - 1);
-                let missing = n - self.bits;
-                let result = have << missing;
-                self.bits = 0;
-                return Ok(result);
+                // T.81-conformant: the entropy stream ended before the requested
+                // bits were available. Report truncation rather than fabricating
+                // zero-padded (wrong) sample data.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated entropy stream: not enough bits for value",
+                ));
             }
         }
         self.bits -= n;
@@ -286,27 +299,37 @@ impl<W: Write> BitWriter<W> {
 
 /// Decode one Huffman symbol from the bit reader using `ht`.
 pub(crate) fn decode_huffman<R: Read>(br: &mut BitReader<R>, ht: &HuffmanTable) -> io::Result<u8> {
+    // A genuinely exhausted entropy stream must NOT be silently decoded as a run
+    // of SSSS=0 symbols -- that fabricates a full-size but wrong image. Report
+    // truncation instead (T.81-conformant strict decoding).
+    if br.at_end()? {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated entropy stream: no data for Huffman symbol",
+        ));
+    }
+
     // Fast path: 8-bit lookup. This can resolve any code of length <= 8 even
     // when the buffer is short (peek zero-pads beyond EOF, and codes that
     // resolve within 8 bits are unaffected by the padding).
     let peek = br.peek_bits(8)? as u8;
     if let Some((size, value)) = ht.fast_lookup(peek) {
+        // A match that consumed more bits than are actually buffered at EOF
+        // relied on zero-padding past the end of the data: that is truncation.
+        if br.eof && size > br.bits {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated entropy stream: Huffman code past end of data",
+            ));
+        }
         br.consume_bits(size);
         return Ok(value);
     }
 
     // Slow path: decode bit by bit (codes 9..=16 bits, e.g. the SSSS=16 code).
-    //
-    // A JPEG encoder pads the final byte with 1-bits, which may not form a
-    // valid Huffman code. Only when the buffer is genuinely exhausted at EOF
-    // do we treat the remainder as padding and report SSSS=0 (no difference).
+    // `read_bits` errors if the stream is exhausted before the code completes.
     let mut code: u16 = 0;
     for size in 1..=16u8 {
-        if br.eof && br.bits == 0 {
-            // Nothing left but end-of-stream: remaining bits (if any were
-            // consumed) were padding.
-            return Ok(0);
-        }
         let bit = br.read_bits(1)?;
         code = (code << 1) | (bit as u16);
         if let Some(value) = ht.decode_slow(code, size) {
@@ -427,7 +450,25 @@ pub(crate) fn decode_scan<R: Read>(
 
         for x in 0..width {
             // Decode Huffman symbol (SSSS = number of additional bits)
-            let ssss = decode_huffman(&mut br, ht)?;
+            let ssss = match decode_huffman(&mut br, ht) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // A reader that stopped at a restart marker while no DRI was
+                    // declared is an illegal restart (H.1.1), not truncation.
+                    if restart_interval == 0 {
+                        if let Some(m) = br.pending_marker() {
+                            if (0xD0..=0xD7).contains(&m) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "unexpected restart marker without DRI (H.1.1)",
+                                ));
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
 
             // T.81 permits SSSS only in 0..=16; a corrupted DHT can map a
             // valid code to a larger symbol, which must be rejected before
@@ -443,6 +484,18 @@ pub(crate) fn decode_scan<R: Read>(
             // H.1.2.2 / Table H.2 special case: the modular difference 32768
             // carries NO appended bits (it can only occur at P'==16).
             let diff = if ssss == 16 {
+                // T.81 H.1.2.2 / Table H.2: category 16 (the modular difference
+                // 32768, no appended bits) is only legal when P' == 16. At lower
+                // reduced precision it must be rejected, not masked into a wrong
+                // sample.
+                if p_prime < 16 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "SSSS category 16 is only valid at P' == 16, got P' = {p_prime} (H.1.2.2)"
+                        ),
+                    ));
+                }
                 32768
             } else if ssss > 0 {
                 let bits = br.read_bits(ssss)?;
@@ -795,6 +848,21 @@ mod tests {
         // And it must decode back to the original sample.
         let decoded = decode_scan(&encoded[..], &ht, 1, 1, 16, 1, 0, 0).unwrap();
         assert_eq!(decoded, pixels);
+    }
+
+    /// SSSS=16 is only legal at P' == 16 (H.1.2.2). The same entropy carrying a
+    /// category-16 code, decoded as a lower-precision (P' < 16) stream, must be
+    /// rejected instead of masking the 32768 difference into a wrong sample.
+    #[test]
+    fn ssss16_rejected_below_full_precision() {
+        let ht = crate::huffman::build_default_table();
+        // A 16-bit sample of 0 encodes as the category-16 code (DIFF = -32768).
+        let mut encoded = Vec::new();
+        encode_scan(&mut encoded, &ht, &[0u16], 1, 1, 16, 1, 0, 0).unwrap();
+
+        // Decode the identical entropy as an 8-bit (P' = 8) stream: must error.
+        let res = decode_scan(&encoded[..], &ht, 1, 1, 8, 1, 0, 0);
+        assert!(res.is_err(), "SSSS=16 at P' < 16 must be rejected");
     }
 
     #[test]

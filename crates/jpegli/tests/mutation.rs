@@ -97,15 +97,13 @@ fn bit_flips_never_panic() {
 
 /// (c) Chop the trailing EOI marker.
 ///
-/// The plan expected jpegli to *require* the trailing EOI (as jpegls/jpeg2k do)
-/// and reject a stream without it. It does NOT: the scan decoder zero-pads at
-/// EOF ("match Go behavior", `scan.rs:167`), so once every sample has been
-/// decoded from the entropy bytes the EOI is never consulted and the decode
-/// still returns a correctly-sized `Ok`. This is a deliberate lenient/Go-compat
-/// design choice, not a defect — so the robustness property here is only that
-/// the decode stays well-formed (Err or correctly-sized Ok), never a wrong-sized
-/// Ok or a panic. (Divergence from the plan's assumption is intentional and
-/// documented rather than forced to `Err`.)
+/// Removing only the trailing EOI leaves the entire entropy-coded scan intact,
+/// so every sample is still decoded from real bits and the decode returns a
+/// correctly-sized `Ok`; the missing end marker does not corrupt the output.
+/// (The decoder is now strict about *entropy* exhaustion — see (e) — but a
+/// complete-but-unterminated stream is not an exhaustion.) The property checked
+/// here is only that the decode stays well-formed (Err or correctly-sized Ok),
+/// never a wrong-sized Ok or a panic.
 #[test]
 fn chopped_trailing_marker_still_wellformed() {
     let base = base_stream();
@@ -116,6 +114,34 @@ fn chopped_trailing_marker_still_wellformed() {
     );
     let chopped = &base[..base.len() - 2];
     assert_wellformed(decode(chopped, W, H));
+}
+
+/// (e) Truncating a valid stream mid-entropy must be rejected, not silently
+/// completed with fabricated zero-valued samples.
+///
+/// The base stream is 16×16; cutting a handful of bytes into the entropy leaves
+/// far too little data to decode all 256 samples, so strict decoding must
+/// surface `CodecError::Truncated` (a wrong-but-full-size `Ok` here would be the
+/// exact vulnerability this asserts against). Genuinely complete streams that
+/// merely lack the EOI stay `Ok` — that case is covered by (c).
+#[test]
+fn mid_entropy_truncation_is_err() {
+    let base = base_stream();
+    let sos = base
+        .windows(2)
+        .position(|w| w[0] == 0xFF && w[1] == 0xDA)
+        .expect("SOS present");
+    // Entropy begins right after the 8-byte SOS segment (2 marker bytes + 6
+    // payload bytes, of which the first two are the length field).
+    let entropy_start = sos + 2 + 8;
+    for extra in [0usize, 1, 2, 4, 8] {
+        let cut = entropy_start + extra;
+        let res = decode(&base[..cut], W, H);
+        assert!(
+            matches!(res, Err(CodecError::Truncated { .. })),
+            "mid-entropy truncation at entropy+{extra} must be Truncated, got {res:?}"
+        );
+    }
 }
 
 /// (d) Restart markers must appear in strictly increasing mod-8 order.

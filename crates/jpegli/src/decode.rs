@@ -158,8 +158,12 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
     } else {
         0
     };
-    let ht = dec.dc_tables[table_idx]
-        .as_ref()
+    // `.get` (not direct indexing) keeps an out-of-range `table_idx` -- e.g. a
+    // SOF3 component whose Tq nibble is >= 4 -- from panicking.
+    let ht = dec
+        .dc_tables
+        .get(table_idx)
+        .and_then(|t| t.as_ref())
         .ok_or_else(|| CodecError::InvalidData("missing Huffman table".into()))?;
 
     // Restart interval (DRI) validation.  T.81 H.1.1: for a non-interleaved
@@ -185,7 +189,19 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         dec.point_transform,
         restart_interval,
     )
-    .map_err(|e| CodecError::InvalidData(format!("scan decode error: {e}")))?;
+    .map_err(|e| {
+        // A prematurely exhausted entropy stream surfaces as UnexpectedEof; map
+        // it to the dedicated Truncated variant so callers can distinguish
+        // truncation from other malformed-scan errors.
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            CodecError::Truncated {
+                offset: cursor.position() as usize,
+                context: "entropy scan",
+            }
+        } else {
+            CodecError::InvalidData(format!("scan decode error: {e}"))
+        }
+    })?;
 
     let pixel_count = pixels.len();
     let expected = num_pixels;
@@ -254,6 +270,17 @@ fn parse_sof3<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
     dec.height = u16::from_be_bytes([data[1], data[2]]);
     dec.width = u16::from_be_bytes([data[3], data[4]]);
     dec.components = data[5];
+
+    // T.81 B.2.2: Y (lines) and X (samples/line) must be > 0. A zero dimension
+    // yields an empty image and, with a DRI present, a division by zero in the
+    // restart-interval validation (`restart_interval % width`).
+    if dec.width == 0 || dec.height == 0 {
+        return Err(CodecError::InvalidParameter {
+            name: "dimensions",
+            value: 0,
+            allowed: "width > 0 && height > 0",
+        });
+    }
 
     // T.81 B.2.2: sample precision P for lossless is 2..=16.  Rejecting the
     // out-of-range values here prevents the `1 << (precision - 1)` underflow
@@ -353,6 +380,15 @@ fn parse_dht<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
         let values = data[offset..offset + total_codes].to_vec();
         offset += total_codes;
 
+        // Reject an oversubscribed (invalid) code assignment before building the
+        // table: canonical code generation on such counts overflows the 8-bit
+        // fast-lookup index (T.81 Annex C / Kraft inequality).
+        if !crate::huffman::bits_valid(&bits) {
+            return Err(CodecError::InvalidData(
+                "oversubscribed Huffman table (T.81 Annex C)".into(),
+            ));
+        }
+
         dec.dc_tables[table_id] = Some(HuffmanTable::from_bits_values(bits, values));
     }
 
@@ -387,6 +423,18 @@ fn parse_sos<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
         let selector = data[offset];
         let table_mapping = data[offset + 1];
         offset += 2;
+
+        // Td (high nibble) selects the DC Huffman table; it indexes the 4-entry
+        // `dc_tables` array, so a value >= 4 is out of range and would panic on
+        // lookup (T.81 B.2.3: Td in 0..=3).
+        let dc_selector = (table_mapping >> 4) as usize;
+        if dc_selector >= dec.dc_tables.len() {
+            return Err(CodecError::InvalidParameter {
+                name: "dc_table_selector",
+                value: dc_selector as i64,
+                allowed: "< 4",
+            });
+        }
 
         // Update table index for the matching component
         for ci in &mut dec.comp_info {
@@ -665,6 +713,85 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// An oversubscribed DHT (three length-1 codes -- length-consistent but far
+    /// beyond the 2-code length-1 space) must be rejected, not panic while
+    /// building the fast-lookup index.
+    #[test]
+    fn reject_oversubscribed_dht() {
+        let mut v = vec![0xFF, 0xD8]; // SOI
+                                      // DHT payload: Tc|Th = 0 (DC, id 0), BITS[1..=16], HUFFVAL.
+        let mut bits = [0u8; 16];
+        bits[0] = 3; // three 1-bit codes -> oversubscribed (max is 2)
+        let mut payload = vec![0x00u8];
+        payload.extend_from_slice(&bits);
+        payload.extend_from_slice(&[0u8, 1, 2]); // 3 HUFFVAL entries
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC4]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+
+        assert!(matches!(decode(&v, 1, 1), Err(CodecError::InvalidData(_))));
+    }
+
+    /// A SOS DC table selector (Td, high nibble) of 4 indexes past the 4-entry
+    /// table array; it must be rejected rather than panicking on lookup.
+    #[test]
+    fn reject_dc_selector_out_of_range() {
+        let mut v = sof3_stream(8, 1);
+        // SOS payload: Ns=1, (Cs=1, Td|Ta=0x40 -> Td=4), Ss=1, Se=0, Ah|Al=0.
+        let payload = vec![1u8, 1, 0x40, 1, 0, 0];
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+
+        assert!(matches!(
+            decode(&v, 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "dc_table_selector",
+                ..
+            })
+        ));
+    }
+
+    /// Zero width or height in SOF3 must be rejected (T.81 B.2.2). A DRI in the
+    /// same stream must not trigger a division by zero in restart validation.
+    #[test]
+    fn reject_zero_dimensions() {
+        // Build SOI + SOF3 with explicit width/height.
+        let sof3 = |w: u16, h: u16| {
+            let mut v = vec![0xFF, 0xD8];
+            let mut payload = vec![8u8];
+            payload.extend_from_slice(&h.to_be_bytes());
+            payload.extend_from_slice(&w.to_be_bytes());
+            payload.extend_from_slice(&[1u8, 1, 0x11, 0x00]); // Nf=1, comp spec
+            let len = (payload.len() + 2) as u16;
+            v.extend_from_slice(&[0xFF, 0xC3]);
+            v.extend_from_slice(&len.to_be_bytes());
+            v.extend_from_slice(&payload);
+            v
+        };
+
+        for (w, h) in [(0u16, 4u16), (4, 0)] {
+            assert!(
+                matches!(
+                    decode(&sof3(w, h), w as u32, h as u32),
+                    Err(CodecError::InvalidParameter {
+                        name: "dimensions",
+                        ..
+                    })
+                ),
+                "expected zero-dimension rejection for {w}x{h}"
+            );
+        }
+
+        // DRI + zero-width SOF3: must error (no div-by-zero), not panic.
+        let mut with_dri = vec![0xFF, 0xD8];
+        with_dri.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04, 0x00, 0x04]); // DRI, Ri=4
+        with_dri.extend_from_slice(&sof3(0, 4)[2..]); // append SOF3 (skip its SOI)
+        assert!(decode(&with_dri, 0, 4).is_err());
     }
 
     // -----------------------------------------------------------------------

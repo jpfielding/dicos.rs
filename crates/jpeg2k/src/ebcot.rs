@@ -1,370 +1,601 @@
 //! EBCOT (Embedded Block Coding with Optimal Truncation) -- ITU-T T.800 Annex D.
 //!
-//! Simplified tier-1 implementation for lossless encoding: significance
-//! propagation, magnitude refinement, and cleanup passes over bit-planes
-//! using the MQ arithmetic coder.
+//! Conformant tier-1 coder for lossless (reversible) code-blocks. A single
+//! shared [`Tier1`] state machine drives BOTH encoding and decoding: the scan
+//! order, flag grid, and all context-formation logic (zero-coding,
+//! sign-coding, magnitude-refinement) are written exactly once and dispatch to
+//! the MQ arithmetic coder through one `code()` primitive. This kills the
+//! former encoder/decoder duplication that could silently drift out of sync.
+//!
+//! Coding is organized in 4-row stripes (Figure D.2). Within a stripe the scan
+//! visits every column left-to-right and, within a column, every row
+//! top-to-bottom. Each bit-plane is coded with up to three passes:
+//! significance propagation (SPP, D.3.1), magnitude refinement (MRP, D.3.3),
+//! and cleanup (CU, D.4) with run-length mode. The most-significant bit-plane
+//! carries a cleanup pass only, giving `num_passes = 3*nb - 2` where `nb` is
+//! the number of magnitude bit-planes.
 
+use crate::error::CodecError;
+use crate::geometry::BandKind;
 use crate::mq::{
     setup_default_contexts, MqDecoder, MqEncoder, MqState, CTX_MR_START, CTX_RUN_LENGTH,
-    CTX_SC_START, CTX_UNIFORM,
+    CTX_SC_START, CTX_UNIFORM, CTX_ZC_START,
 };
 
 // ---------------------------------------------------------------------------
-// Code-block encoder
+// Public API
 // ---------------------------------------------------------------------------
 
-/// Encodes a single code-block using EBCOT tier-1.
-pub struct CodeBlockEncoder {
-    mq: MqEncoder,
-    contexts: Vec<MqState>,
-    width: usize,
-    height: usize,
-    /// Significance state with 1-pixel border: stride = width + 2.
-    sigma: Vec<u8>,
-    /// Snapshot of sigma at the start of each bit-plane, used to determine
-    /// which coefficients belong to sig-prop vs cleanup.
-    sigma_snapshot: Vec<u8>,
+/// A tier-1 coded code-block: the MQ codeword segment plus the metadata a
+/// tier-2 packet header must signal to make it decodable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodedBlock {
+    /// The single MQ codeword segment (empty for an all-zero block).
+    pub data: Vec<u8>,
+    /// Total number of coding passes emitted (`3*num_bitplanes - 2`, or 0).
+    pub num_passes: u32,
+    /// Number of magnitude bit-planes (0 for an all-zero block).
+    pub num_bitplanes: u32,
 }
 
-impl CodeBlockEncoder {
-    pub fn new(width: usize, height: usize) -> Self {
-        let n = (width + 2) * (height + 2);
+/// Encode a single code-block of signed subband samples.
+///
+/// `coeffs` holds `w * h` samples in row-major order. Sign-magnitude coding is
+/// internal. An all-zero block returns `CodedBlock { data: vec![], num_passes:
+/// 0, num_bitplanes: 0 }`.
+pub fn encode_code_block(coeffs: &[i32], w: usize, h: usize, band: BandKind) -> CodedBlock {
+    debug_assert_eq!(coeffs.len(), w * h, "coeffs length must equal w*h");
+
+    let max_mag = coeffs.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+    if max_mag == 0 {
+        return CodedBlock {
+            data: Vec::new(),
+            num_passes: 0,
+            num_bitplanes: 0,
+        };
+    }
+    let nb = 32 - max_mag.leading_zeros();
+
+    let mut t = Tier1::new_encoder(w, h, band);
+    // Pre-populate magnitudes and sign flags. `sc_context` only ever consults
+    // the SIGN of a *significant* neighbour, and a neighbour's sign is coded at
+    // the exact moment it becomes significant, so pre-seeding every negative
+    // sample's SIGN bit is safe and matches what the decoder reconstructs.
+    for y in 0..h {
+        for x in 0..w {
+            let v = coeffs[y * w + x];
+            t.mag[y * w + x] = v.unsigned_abs();
+            if v < 0 {
+                let idx = t.flags.idx(x, y);
+                t.flags.set(idx, SIGN);
+            }
+        }
+    }
+
+    let mut passes = 0u32;
+    // Most-significant plane: cleanup only.
+    t.cleanup_pass(nb - 1);
+    passes += 1;
+    // Remaining planes: SPP, MRP, CU.
+    for p in (0..nb - 1).rev() {
+        t.sig_prop_pass(p);
+        t.mag_ref_pass(p);
+        t.cleanup_pass(p);
+        passes += 3;
+    }
+
+    let data = t.finish_encoder();
+    CodedBlock {
+        data,
+        num_passes: passes,
+        num_bitplanes: nb,
+    }
+}
+
+/// Decode a single code-block back into signed subband samples.
+///
+/// `num_bitplanes` and `num_passes` come from the tier-2 packet header. Our
+/// encoder always emits all `3*nb - 2` passes, but the decoder honours any
+/// prefix `1..=3*nb-2` (tier-2 truncation) and never panics on malformed input:
+/// the MQ decoder feeds synthetic 1-bits past end-of-data.
+pub fn decode_code_block(
+    data: &[u8],
+    w: usize,
+    h: usize,
+    band: BandKind,
+    num_bitplanes: u32,
+    num_passes: u32,
+) -> Result<Vec<i32>, CodecError> {
+    if num_bitplanes == 0 {
+        if num_passes != 0 {
+            return Err(CodecError::InvalidData(
+                "num_bitplanes == 0 but num_passes != 0".into(),
+            ));
+        }
+        return Ok(vec![0i32; w * h]);
+    }
+
+    let nb = num_bitplanes;
+    let max_passes = 3 * nb - 2;
+    if num_passes == 0 || num_passes > max_passes {
+        return Err(CodecError::InvalidData(format!(
+            "num_passes {num_passes} out of range 1..={max_passes} for num_bitplanes {nb}"
+        )));
+    }
+
+    let mut t = Tier1::new_decoder(data, w, h, band);
+
+    let mut done = 0u32;
+    // Pass 0 is always the most-significant-plane cleanup.
+    t.cleanup_pass(nb - 1);
+    done += 1;
+    for p in (0..nb - 1).rev() {
+        if done >= num_passes {
+            break;
+        }
+        t.sig_prop_pass(p);
+        done += 1;
+        if done >= num_passes {
+            break;
+        }
+        t.mag_ref_pass(p);
+        done += 1;
+        if done >= num_passes {
+            break;
+        }
+        t.cleanup_pass(p);
+        done += 1;
+    }
+
+    let mut out = vec![0i32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let ci = y * w + x;
+            let m = t.mag[ci] as i32;
+            let idx = t.flags.idx(x, y);
+            out[ci] = if t.flags.get(idx, SIGN) { -m } else { m };
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Shared flag grid
+// ---------------------------------------------------------------------------
+
+/// Significant (σ): the sample has a coded 1 magnitude bit.
+const SIG: u16 = 1 << 0;
+/// Visited (π): coded in this bit-plane's significance-propagation pass.
+const VISITED: u16 = 1 << 1;
+/// Refined (σ'): has had at least one magnitude-refinement bit coded.
+const REFINED: u16 = 1 << 2;
+/// Sign: set when the sample is negative.
+const SIGN: u16 = 1 << 3;
+
+/// Per-sample coding state with a one-cell insignificant border all around, so
+/// neighbourhood queries never need edge tests.
+struct BlockFlags {
+    flags: Vec<u16>,
+    stride: usize,
+}
+
+impl BlockFlags {
+    fn new(w: usize, h: usize) -> Self {
+        let stride = w + 2;
         Self {
-            mq: MqEncoder::new(),
-            contexts: setup_default_contexts(),
-            width,
-            height,
-            sigma: vec![0u8; n],
-            sigma_snapshot: vec![0u8; n],
+            flags: vec![0u16; stride * (h + 2)],
+            stride,
         }
     }
 
-    /// Encode the coefficients and return `(coded_data, num_passes, num_bit_planes)`.
-    ///
-    /// Returns `(empty vec, 0, 0)` when all coefficients are zero.
-    pub fn encode(&mut self, data: &[i32]) -> (Vec<u8>, usize, usize) {
-        // Find maximum magnitude.
-        let max_val = data.iter().map(|&v| v.unsigned_abs()).max().unwrap_or(0);
-        if max_val == 0 {
-            return (Vec::new(), 0, 0);
-        }
-
-        let num_bit_planes = 32 - max_val.leading_zeros() as usize;
-        let mut passes = 0usize;
-
-        for bp in (0..num_bit_planes).rev() {
-            let mask = 1u32 << bp;
-
-            // Snapshot sigma before this bit-plane so that sig-prop and
-            // cleanup agree on which coefficients have significant neighbors
-            // from *previous* bit-planes (not the current one).
-            self.sigma_snapshot.copy_from_slice(&self.sigma);
-
-            // Significance propagation pass.
-            self.sig_prop_pass(data, mask);
-            passes += 1;
-
-            // Magnitude refinement pass (not for the first bit-plane).
-            if bp < num_bit_planes - 1 {
-                self.mag_ref_pass(data, mask);
-                passes += 1;
-            }
-
-            // Cleanup pass.
-            self.cleanup_pass(data, mask);
-            passes += 1;
-        }
-
-        self.mq.flush();
-        let bytes = self.mq.bytes().to_vec();
-        (bytes, passes, num_bit_planes)
+    /// Linear index of sample `(x, y)` inside the bordered grid.
+    #[inline]
+    fn idx(&self, x: usize, y: usize) -> usize {
+        (y + 1) * self.stride + (x + 1)
     }
 
-    /// Reset for a new code-block.
-    pub fn reset(&mut self) {
-        self.mq.reset();
-        self.contexts = setup_default_contexts();
-        self.sigma.fill(0);
-        self.sigma_snapshot.fill(0);
+    #[inline]
+    fn get(&self, idx: usize, bit: u16) -> bool {
+        self.flags[idx] & bit != 0
     }
 
-    // -- Coding passes -------------------------------------------------------
-
-    fn sig_prop_pass(&mut self, data: &[i32], mask: u32) {
-        let stride = self.width + 2;
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y + 1) * stride + (x + 1);
-                if self.sigma_snapshot[idx] != 0 {
-                    continue; // already significant from previous bit-planes
-                }
-                if !Self::has_significant_neighbor_in(&self.sigma_snapshot, idx, stride) {
-                    continue;
-                }
-
-                let abs_val = data[y * self.width + x].unsigned_abs();
-                let sig = if (abs_val & mask) != 0 { 1u8 } else { 0u8 };
-
-                let ctx = Self::zc_context_in(&self.sigma_snapshot, idx, stride);
-                self.mq.encode(sig, &mut self.contexts[ctx]);
-
-                if sig == 1 {
-                    self.sigma[idx] = 1;
-                    let sign_bit = if data[y * self.width + x] < 0 {
-                        1u8
-                    } else {
-                        0u8
-                    };
-                    self.mq.encode(sign_bit, &mut self.contexts[CTX_SC_START]);
-                }
-            }
-        }
+    #[inline]
+    fn set(&mut self, idx: usize, bit: u16) {
+        self.flags[idx] |= bit;
     }
 
-    fn mag_ref_pass(&mut self, data: &[i32], mask: u32) {
-        let stride = self.width + 2;
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y + 1) * stride + (x + 1);
-                // Only refine coefficients that were significant BEFORE this
-                // bit-plane (i.e., in the snapshot).
-                if self.sigma_snapshot[idx] == 0 {
-                    continue;
-                }
-
-                let abs_val = data[y * self.width + x].unsigned_abs();
-                let bit = if (abs_val & mask) != 0 { 1u8 } else { 0u8 };
-                self.mq.encode(bit, &mut self.contexts[CTX_MR_START]);
-            }
+    /// Clear the π (VISITED) flag everywhere; run at the end of each cleanup.
+    fn clear_visited(&mut self) {
+        for f in &mut self.flags {
+            *f &= !VISITED;
         }
-    }
-
-    fn cleanup_pass(&mut self, data: &[i32], mask: u32) {
-        let stride = self.width + 2;
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y + 1) * stride + (x + 1);
-                if self.sigma[idx] != 0 {
-                    continue; // already significant (from previous bit-planes or sig-prop)
-                }
-                // Use the snapshot to determine if this position was handled in
-                // sig-prop.  Positions whose neighbors only became significant
-                // during the *current* sig-prop or cleanup pass must still be
-                // coded here.
-                if Self::has_significant_neighbor_in(&self.sigma_snapshot, idx, stride) {
-                    continue; // handled in sig-prop
-                }
-
-                let abs_val = data[y * self.width + x].unsigned_abs();
-                let sig = if (abs_val & mask) != 0 { 1u8 } else { 0u8 };
-                self.mq.encode(sig, &mut self.contexts[CTX_RUN_LENGTH]);
-
-                if sig == 1 {
-                    self.sigma[idx] = 1;
-                    let sign_bit = if data[y * self.width + x] < 0 {
-                        1u8
-                    } else {
-                        0u8
-                    };
-                    self.mq.encode(sign_bit, &mut self.contexts[CTX_UNIFORM]);
-                }
-            }
-        }
-    }
-
-    // -- Context helpers ------------------------------------------------------
-
-    fn has_significant_neighbor_in(sigma: &[u8], idx: usize, stride: usize) -> bool {
-        sigma[idx - stride - 1] != 0
-            || sigma[idx - stride] != 0
-            || sigma[idx - stride + 1] != 0
-            || sigma[idx - 1] != 0
-            || sigma[idx + 1] != 0
-            || sigma[idx + stride - 1] != 0
-            || sigma[idx + stride] != 0
-            || sigma[idx + stride + 1] != 0
-    }
-
-    fn zc_context_in(sigma: &[u8], idx: usize, stride: usize) -> usize {
-        let mut count = 0usize;
-        if sigma[idx - 1] != 0 {
-            count += 1;
-        }
-        if sigma[idx + 1] != 0 {
-            count += 1;
-        }
-        if sigma[idx - stride] != 0 {
-            count += 1;
-        }
-        if sigma[idx + stride] != 0 {
-            count += 1;
-        }
-        count.min(4) // context indices 0..=4
     }
 }
 
 // ---------------------------------------------------------------------------
-// Code-block decoder
+// Context formation (shared, ITU-T T.800 Tables D.1-D.4)
 // ---------------------------------------------------------------------------
 
-/// Decodes a single code-block using EBCOT tier-1.
-pub struct CodeBlockDecoder<'a> {
-    mq: MqDecoder<'a>,
+/// Zero-coding context for the LL/LH orientation ("H-major" table, T.800
+/// Table D.1). `h`/`v`/`d` are significant horizontal/vertical/diagonal
+/// neighbour counts. Returns a label in `0..=8`.
+fn zc_ll(h: u32, v: u32, d: u32) -> u8 {
+    if h == 2 {
+        8
+    } else if h == 1 {
+        if v >= 1 {
+            7
+        } else if d >= 1 {
+            6
+        } else {
+            5
+        }
+    } else if v == 2 {
+        4
+    } else if v == 1 {
+        3
+    } else if d >= 2 {
+        2
+    } else if d == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Zero-coding context for the HH orientation ("D-major" table, T.800
+/// Table D.1). Returns a label in `0..=8`.
+fn zc_hh(h: u32, v: u32, d: u32) -> u8 {
+    let hv = h + v;
+    if d >= 3 {
+        8
+    } else if d == 2 {
+        if hv >= 1 {
+            7
+        } else {
+            6
+        }
+    } else if d == 1 {
+        if hv >= 2 {
+            5
+        } else if hv == 1 {
+            4
+        } else {
+            3
+        }
+    } else if hv >= 2 {
+        2
+    } else if hv == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Orientation-aware zero-coding context (T.800 Table D.1). LL and LH use the
+/// H-major table directly; HL swaps the horizontal and vertical roles; HH uses
+/// the diagonal-major table.
+fn zc_context(h: u32, v: u32, d: u32, band: BandKind) -> u8 {
+    match band {
+        BandKind::LL | BandKind::LH => zc_ll(h, v, d),
+        BandKind::HL => zc_ll(v, h, d),
+        BandKind::HH => zc_hh(h, v, d),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier-1 state machine (drives both directions)
+// ---------------------------------------------------------------------------
+
+enum Mq<'d> {
+    Enc(MqEncoder),
+    Dec(MqDecoder<'d>),
+}
+
+struct Tier1<'d> {
+    mq: Mq<'d>,
     contexts: Vec<MqState>,
-    width: usize,
-    height: usize,
-    sigma: Vec<u8>,
-    sigma_snapshot: Vec<u8>,
+    flags: BlockFlags,
+    /// Accumulated magnitudes: source data on encode, reconstruction on decode.
+    mag: Vec<u32>,
+    w: usize,
+    h: usize,
+    band: BandKind,
 }
 
-impl<'a> CodeBlockDecoder<'a> {
-    pub fn new(data: &'a [u8], width: usize, height: usize) -> Self {
-        let n = (width + 2) * (height + 2);
-        Self {
-            mq: MqDecoder::new(data),
+impl Tier1<'static> {
+    fn new_encoder(w: usize, h: usize, band: BandKind) -> Self {
+        Tier1 {
+            mq: Mq::Enc(MqEncoder::new()),
             contexts: setup_default_contexts(),
-            width,
-            height,
-            sigma: vec![0u8; n],
-            sigma_snapshot: vec![0u8; n],
+            flags: BlockFlags::new(w, h),
+            mag: vec![0u32; w * h],
+            w,
+            h,
+            band,
+        }
+    }
+}
+
+impl<'d> Tier1<'d> {
+    fn new_decoder(data: &'d [u8], w: usize, h: usize, band: BandKind) -> Self {
+        Tier1 {
+            mq: Mq::Dec(MqDecoder::new(data)),
+            contexts: setup_default_contexts(),
+            flags: BlockFlags::new(w, h),
+            mag: vec![0u32; w * h],
+            w,
+            h,
+            band,
         }
     }
 
-    /// Decode the code-block data and return reconstructed coefficients.
-    pub fn decode(&mut self, num_bit_planes: usize, num_passes: usize) -> Vec<i32> {
-        let n = self.width * self.height;
-        let mut coeffs = vec![0u32; n];
-        let mut signs = vec![0u8; n];
-
-        let mut pass_idx = 0usize;
-        for bp in (0..num_bit_planes).rev() {
-            let mask = 1u32 << bp;
-
-            // Snapshot sigma before this bit-plane (must match encoder).
-            self.sigma_snapshot.copy_from_slice(&self.sigma);
-
-            // Significance propagation pass.
-            if pass_idx < num_passes {
-                self.decode_sig_prop_pass(&mut coeffs, &mut signs, mask);
-                pass_idx += 1;
-            }
-
-            // Magnitude refinement pass.
-            if bp < num_bit_planes - 1 && pass_idx < num_passes {
-                self.decode_mag_ref_pass(&mut coeffs, mask);
-                pass_idx += 1;
-            }
-
-            // Cleanup pass.
-            if pass_idx < num_passes {
-                self.decode_cleanup_pass(&mut coeffs, &mut signs, mask);
-                pass_idx += 1;
-            }
-        }
-
-        // Apply signs.
-        coeffs
-            .iter()
-            .zip(signs.iter())
-            .map(|(&c, &s)| if s != 0 { -(c as i32) } else { c as i32 })
-            .collect()
+    #[inline]
+    fn encoding(&self) -> bool {
+        matches!(self.mq, Mq::Enc(_))
     }
 
-    // -- Decoding passes ------------------------------------------------------
-
-    fn decode_sig_prop_pass(&mut self, coeffs: &mut [u32], signs: &mut [u8], mask: u32) {
-        let stride = self.width + 2;
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y + 1) * stride + (x + 1);
-                if self.sigma_snapshot[idx] != 0 {
-                    continue; // already significant from previous bit-planes
-                }
-                if !Self::has_significant_neighbor_in(&self.sigma_snapshot, idx, stride) {
-                    continue;
-                }
-
-                let ctx = Self::zc_context_in(&self.sigma_snapshot, idx, stride);
-                let sig = self.mq.decode(&mut self.contexts[ctx]);
-
-                if sig == 1 {
-                    self.sigma[idx] = 1;
-                    coeffs[y * self.width + x] |= mask;
-                    signs[y * self.width + x] = self.mq.decode(&mut self.contexts[CTX_SC_START]);
-                }
+    /// The single coding primitive. On encode, `known` is coded in `ctx` and
+    /// returned unchanged; on decode, `known` is ignored and the decoded bit is
+    /// returned. Every pass routes through here, so encoder and decoder share a
+    /// single control flow.
+    #[inline]
+    fn code(&mut self, ctx: usize, known: u8) -> u8 {
+        match &mut self.mq {
+            Mq::Enc(e) => {
+                e.encode(known, &mut self.contexts[ctx]);
+                known
             }
+            Mq::Dec(dc) => dc.decode(&mut self.contexts[ctx]),
         }
     }
 
-    fn decode_mag_ref_pass(&mut self, coeffs: &mut [u32], mask: u32) {
-        let stride = self.width + 2;
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y + 1) * stride + (x + 1);
-                // Only refine coefficients that were significant BEFORE this
-                // bit-plane (matching the encoder).
-                if self.sigma_snapshot[idx] == 0 {
-                    continue;
-                }
-                let bit = self.mq.decode(&mut self.contexts[CTX_MR_START]);
-                if bit == 1 {
-                    coeffs[y * self.width + x] |= mask;
+    fn finish_encoder(&mut self) -> Vec<u8> {
+        match &mut self.mq {
+            Mq::Enc(e) => {
+                e.flush();
+                e.bytes().to_vec()
+            }
+            Mq::Dec(_) => Vec::new(),
+        }
+    }
+
+    // -- neighbourhood queries ----------------------------------------------
+
+    /// `(h, v, d)` significant-neighbour counts for the sample at `idx`.
+    #[inline]
+    fn neighbor_counts(&self, idx: usize) -> (u32, u32, u32) {
+        let s = self.flags.stride;
+        let sig = |i: usize| (self.flags.flags[i] & SIG != 0) as u32;
+        let h = sig(idx - 1) + sig(idx + 1);
+        let v = sig(idx - s) + sig(idx + s);
+        let d = sig(idx - s - 1) + sig(idx - s + 1) + sig(idx + s - 1) + sig(idx + s + 1);
+        (h, v, d)
+    }
+
+    #[inline]
+    fn has_sig_neighbor(&self, idx: usize) -> bool {
+        let (h, v, d) = self.neighbor_counts(idx);
+        h + v + d > 0
+    }
+
+    /// Signed sign contribution of the neighbour at `idx`: 0 if insignificant,
+    /// +1 if significant-positive, -1 if significant-negative.
+    #[inline]
+    fn sign_contrib(&self, idx: usize) -> i32 {
+        if self.flags.get(idx, SIG) {
+            if self.flags.get(idx, SIGN) {
+                -1
+            } else {
+                1
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Sign-coding context and XOR bit (T.800 Tables D.2/D.3).
+    fn sc_context_and_xor(&self, idx: usize) -> (u8, u8) {
+        let s = self.flags.stride;
+        let hc = (self.sign_contrib(idx - 1) + self.sign_contrib(idx + 1)).clamp(-1, 1);
+        let vc = (self.sign_contrib(idx - s) + self.sign_contrib(idx + s)).clamp(-1, 1);
+        match (hc, vc) {
+            (1, 1) => (4, 0),
+            (1, 0) => (3, 0),
+            (1, -1) => (2, 0),
+            (0, 1) => (1, 0),
+            (0, 0) => (0, 0),
+            (0, -1) => (1, 1),
+            (-1, 1) => (2, 1),
+            (-1, 0) => (3, 1),
+            (-1, -1) => (4, 1),
+            _ => unreachable!("clamped contributions are in -1..=1"),
+        }
+    }
+
+    /// Magnitude-refinement context (T.800 Table D.4).
+    fn mr_context(&self, idx: usize) -> u8 {
+        if self.flags.get(idx, REFINED) {
+            2
+        } else if self.has_sig_neighbor(idx) {
+            1
+        } else {
+            0
+        }
+    }
+
+    // -- shared coding primitives -------------------------------------------
+
+    /// Code the sign of the (just-significant) sample at `(idx, ci)` and record
+    /// it in the SIGN flag.
+    fn code_sign(&mut self, idx: usize) {
+        let (sc_ctx, xor) = self.sc_context_and_xor(idx);
+        let known_sym = if self.encoding() {
+            (self.flags.get(idx, SIGN) as u8) ^ xor
+        } else {
+            0
+        };
+        let sym = self.code(CTX_SC_START + sc_ctx as usize, known_sym);
+        if (sym ^ xor) == 1 {
+            self.flags.set(idx, SIGN);
+        }
+    }
+
+    /// Zero-coding of the plane-`p` significance bit for a not-yet-significant
+    /// sample, followed by sign coding on a 1. Used by SPP and by cleanup
+    /// normal mode.
+    fn code_significance(&mut self, x: usize, y: usize, p: u32, zc_ctx: u8) {
+        let idx = self.flags.idx(x, y);
+        let ci = y * self.w + x;
+        let known = ((self.mag[ci] >> p) & 1) as u8;
+        let bit = self.code(CTX_ZC_START + zc_ctx as usize, known);
+        if bit == 1 {
+            self.flags.set(idx, SIG);
+            self.mag[ci] |= 1u32 << p;
+            self.code_sign(idx);
+        }
+    }
+
+    // -- coding passes ------------------------------------------------------
+
+    /// Significance-propagation pass (T.800 D.3.1). A sample is a candidate iff
+    /// it is not yet significant and has at least one significant neighbour
+    /// (LIVE state -- no snapshot). Every candidate is marked VISITED.
+    fn sig_prop_pass(&mut self, p: u32) {
+        let mut y0 = 0;
+        while y0 < self.h {
+            let rows = (self.h - y0).min(4);
+            for x in 0..self.w {
+                for r in 0..rows {
+                    let y = y0 + r;
+                    let idx = self.flags.idx(x, y);
+                    if self.flags.get(idx, SIG) {
+                        continue;
+                    }
+                    let (h, v, d) = self.neighbor_counts(idx);
+                    let zc = zc_context(h, v, d, self.band);
+                    if zc == 0 {
+                        continue;
+                    }
+                    self.flags.set(idx, VISITED);
+                    self.code_significance(x, y, p, zc);
                 }
             }
+            y0 += 4;
         }
     }
 
-    fn decode_cleanup_pass(&mut self, coeffs: &mut [u32], signs: &mut [u8], mask: u32) {
-        let stride = self.width + 2;
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y + 1) * stride + (x + 1);
-                if self.sigma[idx] != 0 {
-                    continue; // already significant (from previous bit-planes or sig-prop)
-                }
-                // Use snapshot to determine if handled in sig-prop (matches encoder).
-                if Self::has_significant_neighbor_in(&self.sigma_snapshot, idx, stride) {
-                    continue;
-                }
-
-                let sig = self.mq.decode(&mut self.contexts[CTX_RUN_LENGTH]);
-                if sig == 1 {
-                    self.sigma[idx] = 1;
-                    coeffs[y * self.width + x] |= mask;
-                    signs[y * self.width + x] = self.mq.decode(&mut self.contexts[CTX_UNIFORM]);
+    /// Magnitude-refinement pass (T.800 D.3.3). Refines samples that are
+    /// significant but were not coded in this plane's SPP (π clear).
+    fn mag_ref_pass(&mut self, p: u32) {
+        let mut y0 = 0;
+        while y0 < self.h {
+            let rows = (self.h - y0).min(4);
+            for x in 0..self.w {
+                for r in 0..rows {
+                    let y = y0 + r;
+                    let idx = self.flags.idx(x, y);
+                    if !self.flags.get(idx, SIG) || self.flags.get(idx, VISITED) {
+                        continue;
+                    }
+                    let mrc = self.mr_context(idx);
+                    let ci = y * self.w + x;
+                    let known = ((self.mag[ci] >> p) & 1) as u8;
+                    let bit = self.code(CTX_MR_START + mrc as usize, known);
+                    self.mag[ci] |= (bit as u32) << p;
+                    self.flags.set(idx, REFINED);
                 }
             }
+            y0 += 4;
         }
     }
 
-    // -- Context helpers ------------------------------------------------------
-
-    fn has_significant_neighbor_in(sigma: &[u8], idx: usize, stride: usize) -> bool {
-        sigma[idx - stride - 1] != 0
-            || sigma[idx - stride] != 0
-            || sigma[idx - stride + 1] != 0
-            || sigma[idx - 1] != 0
-            || sigma[idx + 1] != 0
-            || sigma[idx + stride - 1] != 0
-            || sigma[idx + stride] != 0
-            || sigma[idx + stride + 1] != 0
+    /// Cleanup pass (T.800 D.4) with run-length mode. Codes samples that are
+    /// still insignificant and were not visited by SPP, then clears all π flags.
+    fn cleanup_pass(&mut self, p: u32) {
+        let mut y0 = 0;
+        while y0 < self.h {
+            let rows = (self.h - y0).min(4);
+            for x in 0..self.w {
+                if rows == 4 && self.rl_eligible(x, y0) {
+                    self.cleanup_rl(x, y0, p);
+                } else {
+                    for r in 0..rows {
+                        let y = y0 + r;
+                        let idx = self.flags.idx(x, y);
+                        if self.flags.get(idx, SIG) || self.flags.get(idx, VISITED) {
+                            continue;
+                        }
+                        let (h, v, d) = self.neighbor_counts(idx);
+                        let zc = zc_context(h, v, d, self.band);
+                        self.code_significance(x, y, p, zc);
+                    }
+                }
+            }
+            y0 += 4;
+        }
+        self.flags.clear_visited();
     }
 
-    fn zc_context_in(sigma: &[u8], idx: usize, stride: usize) -> usize {
-        let mut count = 0usize;
-        if sigma[idx - 1] != 0 {
-            count += 1;
+    /// Whether the 4 samples of a full stripe column all qualify for run-length
+    /// mode: not significant, not visited, and zero zero-coding context.
+    fn rl_eligible(&self, x: usize, y0: usize) -> bool {
+        (0..4).all(|r| {
+            let idx = self.flags.idx(x, y0 + r);
+            if self.flags.get(idx, SIG) || self.flags.get(idx, VISITED) {
+                return false;
+            }
+            let (h, v, d) = self.neighbor_counts(idx);
+            zc_context(h, v, d, self.band) == 0
+        })
+    }
+
+    /// Run-length coding of one eligible full stripe column (T.800 D.4.2).
+    fn cleanup_rl(&mut self, x: usize, y0: usize, p: u32) {
+        // Encoder derives the run bit and first-significant index from the
+        // magnitudes; the decoder receives (0, 0) and reads them back.
+        let (run_known, r_known) = if self.encoding() {
+            let mut first = None;
+            for r in 0..4 {
+                let ci = (y0 + r) * self.w + x;
+                if (self.mag[ci] >> p) & 1 == 1 {
+                    first = Some(r as u8);
+                    break;
+                }
+            }
+            match first {
+                Some(r) => (1u8, r),
+                None => (0, 0),
+            }
+        } else {
+            (0, 0)
+        };
+
+        let run = self.code(CTX_RUN_LENGTH, run_known);
+        if run == 0 {
+            return;
         }
-        if sigma[idx + 1] != 0 {
-            count += 1;
+
+        // Two uniform-context bits, MSB first, give the first-significant row.
+        let b1 = self.code(CTX_UNIFORM, (r_known >> 1) & 1);
+        let b0 = self.code(CTX_UNIFORM, r_known & 1);
+        let r = ((b1 << 1) | b0) as usize;
+
+        // Sample r becomes significant now; code its sign.
+        let idx = self.flags.idx(x, y0 + r);
+        let ci = (y0 + r) * self.w + x;
+        self.flags.set(idx, SIG);
+        self.mag[ci] |= 1u32 << p;
+        self.code_sign(idx);
+
+        // Samples r+1..4 are coded normally (rows 0..r stay insignificant).
+        for rr in (r + 1)..4 {
+            let y = y0 + rr;
+            let nidx = self.flags.idx(x, y);
+            let (h, v, d) = self.neighbor_counts(nidx);
+            let zc = zc_context(h, v, d, self.band);
+            self.code_significance(x, y, p, zc);
         }
-        if sigma[idx - stride] != 0 {
-            count += 1;
-        }
-        if sigma[idx + stride] != 0 {
-            count += 1;
-        }
-        count.min(4)
     }
 }
 
@@ -375,119 +606,217 @@ impl<'a> CodeBlockDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    #[test]
-    fn ebcot_all_zeros() {
-        let mut enc = CodeBlockEncoder::new(4, 4);
-        let data = vec![0i32; 16];
-        let (bytes, passes, bit_planes) = enc.encode(&data);
-        assert!(bytes.is_empty());
-        assert_eq!(passes, 0);
-        assert_eq!(bit_planes, 0);
+    const BANDS: [BandKind; 4] = [BandKind::LL, BandKind::HL, BandKind::LH, BandKind::HH];
+
+    // Self-golden constants (see `golden_8x8_bitstream`). Replaced by an
+    // OpenJPEG cross-check in Workstream 1 step 10.
+    const GOLDEN_LEN: usize = 47;
+    const GOLDEN_DATA: [u8; GOLDEN_LEN] = [
+        238, 133, 42, 55, 211, 207, 236, 200, 103, 252, 141, 52, 127, 161, 27, 19, 232, 205, 218,
+        188, 104, 219, 98, 37, 135, 76, 213, 153, 25, 112, 172, 67, 207, 232, 6, 241, 200, 75, 252,
+        74, 25, 115, 222, 184, 28, 212, 15,
+    ];
+    const GOLDEN_BITPLANES: u32 = 7;
+    const GOLDEN_PASSES: u32 = 19;
+
+    fn roundtrip(coeffs: &[i32], w: usize, h: usize, band: BandKind) {
+        let cb = encode_code_block(coeffs, w, h, band);
+        let decoded = decode_code_block(&cb.data, w, h, band, cb.num_bitplanes, cb.num_passes)
+            .expect("decode of self-produced block must succeed");
+        assert_eq!(
+            decoded, coeffs,
+            "round-trip mismatch (band {band:?}, {w}x{h})"
+        );
     }
 
     #[test]
-
-    fn ebcot_roundtrip_small() {
-        let w = 4;
-        let h = 4;
-        let data: Vec<i32> = vec![
-            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
-        ];
-
-        let mut enc = CodeBlockEncoder::new(w, h);
-        let (bytes, passes, bit_planes) = enc.encode(&data);
-        assert!(!bytes.is_empty());
-        assert!(passes > 0);
-        assert!(bit_planes > 0);
-
-        let mut dec = CodeBlockDecoder::new(&bytes, w, h);
-        let decoded = dec.decode(bit_planes, passes);
-        assert_eq!(decoded, data);
+    fn all_zero_is_empty() {
+        for &band in &BANDS {
+            let cb = encode_code_block(&[0i32; 16], 4, 4, band);
+            assert!(cb.data.is_empty());
+            assert_eq!(cb.num_passes, 0);
+            assert_eq!(cb.num_bitplanes, 0);
+            let decoded = decode_code_block(&[], 4, 4, band, 0, 0).unwrap();
+            assert_eq!(decoded, vec![0i32; 16]);
+        }
     }
 
     #[test]
-
-    fn ebcot_roundtrip_uniform() {
-        let w = 8;
-        let h = 8;
-        let data = vec![42i32; w * h];
-
-        let mut enc = CodeBlockEncoder::new(w, h);
-        let (bytes, passes, bit_planes) = enc.encode(&data);
-
-        let mut dec = CodeBlockDecoder::new(&bytes, w, h);
-        let decoded = dec.decode(bit_planes, passes);
-        assert_eq!(decoded, data);
+    fn pass_count_relationship() {
+        for &band in &BANDS {
+            let coeffs: Vec<i32> = (0..64).map(|i| i - 32).collect();
+            let cb = encode_code_block(&coeffs, 8, 8, band);
+            assert!(cb.num_bitplanes > 0);
+            assert_eq!(cb.num_passes, 3 * cb.num_bitplanes - 2);
+        }
     }
 
     #[test]
-    fn ebcot_roundtrip_single_nonzero() {
-        let w = 4;
-        let h = 4;
-        let mut data = vec![0i32; w * h];
-        data[5] = 255;
-
-        let mut enc = CodeBlockEncoder::new(w, h);
-        let (bytes, passes, bit_planes) = enc.encode(&data);
-
-        let mut dec = CodeBlockDecoder::new(&bytes, w, h);
-        let decoded = dec.decode(bit_planes, passes);
-        assert_eq!(decoded, data);
+    fn exhaustive_1x1() {
+        for &band in &BANDS {
+            for v in -3..=3 {
+                roundtrip(&[v], 1, 1, band);
+            }
+        }
     }
 
     #[test]
-
-    fn ebcot_roundtrip_negative_values() {
-        let w = 4;
-        let h = 4;
-        let data: Vec<i32> = (-8..8).collect();
-
-        let mut enc = CodeBlockEncoder::new(w, h);
-        let (bytes, passes, bit_planes) = enc.encode(&data);
-
-        let mut dec = CodeBlockDecoder::new(&bytes, w, h);
-        let decoded = dec.decode(bit_planes, passes);
-        assert_eq!(decoded, data);
+    fn deterministic_2x2_patterns() {
+        // A few hundred deterministic-random 2x2 blocks per band.
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 65) - 32
+        };
+        for &band in &BANDS {
+            for _ in 0..300 {
+                let block = [next(), next(), next(), next()];
+                roundtrip(&block, 2, 2, band);
+            }
+        }
     }
 
     #[test]
-
-    fn ebcot_roundtrip_large_values() {
-        let w = 4;
-        let h = 4;
-        let data: Vec<i32> = (0..16).map(|i| (i * 1000) - 8000).collect();
-
-        let mut enc = CodeBlockEncoder::new(w, h);
-        let (bytes, passes, bit_planes) = enc.encode(&data);
-
-        let mut dec = CodeBlockDecoder::new(&bytes, w, h);
-        let decoded = dec.decode(bit_planes, passes);
-        assert_eq!(decoded, data);
+    fn single_nonzero_deep() {
+        // An isolated value late in the block forces run-length coding of the
+        // long insignificant prefix.
+        for &band in &BANDS {
+            let mut block = vec![0i32; 64];
+            block[57] = 12345;
+            roundtrip(&block, 8, 8, band);
+        }
     }
 
     #[test]
+    fn first_significant_at_each_stripe_row() {
+        // In an 8-wide, 4-tall (single full stripe) block, place the sole
+        // significant sample at each of the 4 stripe-row positions so the RL
+        // index (0..=3) is exercised for every value.
+        for &band in &BANDS {
+            for row in 0..4 {
+                let mut block = vec![0i32; 32];
+                block[row * 8] = -777; // column 0, the given stripe row
+                roundtrip(&block, 8, 4, band);
+            }
+        }
+    }
 
-    fn ebcot_encoder_reset() {
-        let w = 4;
-        let h = 4;
-        let data1 = vec![10i32; w * h];
-        let data2: Vec<i32> = (1..=16).collect();
+    #[test]
+    fn sparse_blocks_force_run_length() {
+        for &band in &BANDS {
+            let mut block = vec![0i32; 64 * 64];
+            block[0] = 3;
+            block[64 * 30 + 31] = -9;
+            block[64 * 63 + 63] = 100;
+            roundtrip(&block, 64, 64, band);
+        }
+    }
 
-        let mut enc = CodeBlockEncoder::new(w, h);
+    #[test]
+    fn stripe_and_partial_boundaries() {
+        // Dimensions that cross stripe boundaries and leave partial stripes.
+        for &band in &BANDS {
+            for &(w, h) in &[(1, 1), (3, 5), (7, 4), (7, 6), (13, 13), (17, 3), (5, 17)] {
+                let coeffs: Vec<i32> = (0..w * h).map(|i| (i as i32 * 37 % 511) - 255).collect();
+                roundtrip(&coeffs, w, h, band);
+            }
+        }
+    }
 
-        // Encode first block.
-        let (bytes1, passes1, bp1) = enc.encode(&data1);
-        enc.reset();
+    #[test]
+    fn truncated_data_never_panics() {
+        let coeffs: Vec<i32> = (0..64 * 8).map(|i| (i * 101 % 4096) - 2048).collect();
+        let cb = encode_code_block(&coeffs, 64, 8, BandKind::LH);
+        for cut in 0..=cb.data.len() {
+            // Any prefix, decoded with the full pass count, must return Ok or
+            // Err but never panic.
+            let _ = decode_code_block(
+                &cb.data[..cut],
+                64,
+                8,
+                BandKind::LH,
+                cb.num_bitplanes,
+                cb.num_passes,
+            );
+        }
+    }
 
-        // Encode second block.
-        let (bytes2, passes2, bp2) = enc.encode(&data2);
+    #[test]
+    fn invalid_metadata_is_rejected() {
+        // num_passes beyond the maximum for the declared bit-planes.
+        let err = decode_code_block(&[], 4, 4, BandKind::LL, 3, 100);
+        assert!(matches!(err, Err(CodecError::InvalidData(_))));
+        // num_bitplanes 0 with non-zero passes.
+        let err = decode_code_block(&[], 4, 4, BandKind::LL, 0, 1);
+        assert!(matches!(err, Err(CodecError::InvalidData(_))));
+    }
 
-        // Decode both independently.
-        let mut dec1 = CodeBlockDecoder::new(&bytes1, w, h);
-        assert_eq!(dec1.decode(bp1, passes1), data1);
+    /// Self-golden regression: a fixed 8x8 block must encode to these exact
+    /// bytes. Locks the bitstream against silent refactors.
+    ///
+    /// NOTE: self-golden -- computed from this implementation, to be replaced
+    /// by an OpenJPEG cross-check in Workstream 1 step 10.
+    #[test]
+    fn golden_8x8_bitstream() {
+        let coeffs: Vec<i32> = (0..64)
+            .map(|i| {
+                let v = (i * 2654435761u64.wrapping_rem(97) as usize) % 200;
+                v as i32 - 100
+            })
+            .collect();
+        let cb = encode_code_block(&coeffs, 8, 8, BandKind::HL);
+        const GOLDEN: &[u8] = &GOLDEN_BYTES;
+        assert_eq!(
+            cb.data.as_slice(),
+            GOLDEN,
+            "bitstream changed; if intentional update GOLDEN_BYTES to {:?}",
+            cb.data
+        );
+        assert_eq!(cb.num_bitplanes, GOLDEN_BITPLANES);
+        assert_eq!(cb.num_passes, GOLDEN_PASSES);
+        // And it must still round-trip.
+        roundtrip(&coeffs, 8, 8, BandKind::HL);
+    }
 
-        let mut dec2 = CodeBlockDecoder::new(&bytes2, w, h);
-        assert_eq!(dec2.decode(bp2, passes2), data2);
+    const GOLDEN_BYTES: [u8; GOLDEN_LEN] = GOLDEN_DATA;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        #[test]
+        fn prop_roundtrip(
+            w in 1usize..=68,
+            h in 1usize..=68,
+            band_idx in 0usize..4,
+            seed in any::<u64>(),
+        ) {
+            let band = BANDS[band_idx];
+            let mut rng = seed | 1;
+            let n = w * h;
+            let mut coeffs = Vec::with_capacity(n);
+            for _ in 0..n {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // Magnitudes up to 2^17, signed.
+                let mag = (rng >> 40) as i32 & ((1 << 17) - 1);
+                let neg = (rng >> 39) & 1 == 1;
+                coeffs.push(if neg { -mag } else { mag });
+            }
+
+            let cb = encode_code_block(&coeffs, w, h, band);
+            if coeffs.iter().all(|&v| v == 0) {
+                prop_assert!(cb.data.is_empty());
+                prop_assert_eq!(cb.num_passes, 0);
+                prop_assert_eq!(cb.num_bitplanes, 0);
+            } else {
+                prop_assert_eq!(cb.num_passes, 3 * cb.num_bitplanes - 2);
+            }
+
+            let decoded = decode_code_block(
+                &cb.data, w, h, band, cb.num_bitplanes, cb.num_passes,
+            ).unwrap();
+            prop_assert_eq!(decoded, coeffs);
+        }
     }
 }

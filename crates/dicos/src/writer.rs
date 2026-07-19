@@ -126,7 +126,7 @@ fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> 
         w.write_u32::<LittleEndian>(length)?;
     } else {
         if is_undefined_length {
-            return Err(DicosError::InvalidFile(format!(
+            return Err(DicosError::Validation(format!(
                 "undefined length not supported for short VR {}",
                 elem.vr
             )));

@@ -10,6 +10,7 @@
 //! Supports Implicit VR Little Endian, Explicit VR Little Endian, and
 //! encapsulated pixel data.
 
+use std::fmt;
 use std::io::{self, Read};
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -19,6 +20,44 @@ use crate::tag::{self, Tag};
 use crate::transfer;
 use crate::types::{Dataset, Element, PixelData, Value};
 use crate::vr::Vr;
+
+/// A non-fatal issue detected while parsing.
+///
+/// Returned by [`parse_with_warnings`] and [`parse_with_warnings_and_limit`].
+/// The convenience [`parse`]/[`parse_with_limit`] entry points log each
+/// warning via `log::warn!` instead of returning them.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseWarning {
+    /// Native pixel data had an odd byte length; the trailing byte was ignored.
+    OddPixelDataLength {
+        /// The odd byte length of the raw pixel data.
+        length: usize,
+    },
+    /// Native pixel count did not match `rows * columns * frames`.
+    PixelCountMismatch {
+        /// The number of pixels actually decoded.
+        actual: usize,
+        /// The number of pixels expected from the image geometry.
+        expected: usize,
+    },
+}
+
+impl fmt::Display for ParseWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseWarning::OddPixelDataLength { length } => write!(
+                f,
+                "native pixel data has an odd byte length ({length}); trailing byte ignored"
+            ),
+            ParseWarning::PixelCountMismatch { actual, expected } => write!(
+                f,
+                "native pixel data size ({actual} pixels) does not match rows*cols*frames \
+                 ({expected}); storing as a single frame"
+            ),
+        }
+    }
+}
 
 /// The 4-byte DICOM magic number.
 const DICM_MAGIC: &[u8; 4] = b"DICM";
@@ -40,23 +79,16 @@ const MAX_NESTING_DEPTH: usize = 64;
 fn checked_alloc(len: u32, limit: usize) -> Result<Vec<u8>, DicosError> {
     let n = len as usize;
     if n > limit {
-        return Err(DicosError::InvalidFile(format!(
-            "element length {n} exceeds limit ({limit})"
-        )));
+        return Err(DicosError::LengthExceedsLimit { length: n, limit });
     }
     Ok(vec![0u8; n])
-}
-
-/// Skip `len` bytes without allocating.
-fn skip_bytes<R: Read>(reader: &mut R, len: u32) -> Result<(), DicosError> {
-    io::copy(&mut reader.take(len as u64), &mut io::sink())?;
-    Ok(())
 }
 
 /// Parses a DICOS/DICOM file from a reader.
 ///
 /// Uses a default per-element allocation limit of 1 GB. For custom limits,
-/// use [`parse_with_limit`].
+/// use [`parse_with_limit`]. Any [`ParseWarning`]s are logged via `log::warn!`;
+/// use [`parse_with_warnings`] to receive them instead.
 pub fn parse<R: Read>(reader: R) -> Result<Dataset, DicosError> {
     parse_with_limit(reader, DEFAULT_MAX_ELEMENT_LENGTH)
 }
@@ -65,11 +97,33 @@ pub fn parse<R: Read>(reader: R) -> Result<Dataset, DicosError> {
 ///
 /// Any single element whose on-disk length exceeds `max_element_bytes` is
 /// rejected. This guards against malicious files without restricting
-/// legitimate large volumes.
+/// legitimate large volumes. Any [`ParseWarning`]s are logged via `log::warn!`.
 pub fn parse_with_limit<R: Read>(
     reader: R,
     max_element_bytes: usize,
 ) -> Result<Dataset, DicosError> {
+    let (ds, warnings) = parse_with_warnings_and_limit(reader, max_element_bytes)?;
+    for w in &warnings {
+        log::warn!("{w}");
+    }
+    Ok(ds)
+}
+
+/// Parses a DICOS/DICOM file, returning the dataset alongside any
+/// [`ParseWarning`]s rather than logging them.
+///
+/// Uses a default per-element allocation limit of 1 GB. Warnings are not stored
+/// on the returned [`Dataset`].
+pub fn parse_with_warnings<R: Read>(reader: R) -> Result<(Dataset, Vec<ParseWarning>), DicosError> {
+    parse_with_warnings_and_limit(reader, DEFAULT_MAX_ELEMENT_LENGTH)
+}
+
+/// Parses a DICOS/DICOM file with a custom per-element allocation limit,
+/// returning the dataset alongside any [`ParseWarning`]s.
+pub fn parse_with_warnings_and_limit<R: Read>(
+    reader: R,
+    max_element_bytes: usize,
+) -> Result<(Dataset, Vec<ParseWarning>), DicosError> {
     let mut r = DicosReader::new(reader, max_element_bytes);
     r.read_dataset()
 }
@@ -83,6 +137,8 @@ struct DicosReader<R> {
     in_meta: bool,
     /// Per-element allocation ceiling in bytes.
     max_element_bytes: usize,
+    /// Number of bytes consumed from `inner`, used for truncation offsets.
+    bytes_read: u64,
 }
 
 impl<R: Read> DicosReader<R> {
@@ -93,83 +149,193 @@ impl<R: Read> DicosReader<R> {
             transfer_syntax_uid: None,
             in_meta: true,
             max_element_bytes,
+            bytes_read: 0,
         }
     }
 
-    fn read_dataset(&mut self) -> Result<Dataset, DicosError> {
+    /// Reads into `buf`, returning how many bytes were actually read.
+    ///
+    /// Distinguishes a clean end-of-stream (`Ok(0)` at a boundary) from a short
+    /// read; callers decide whether a short read is a truncation.
+    fn fill(&mut self, buf: &mut [u8]) -> Result<usize, DicosError> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.inner.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.bytes_read += filled as u64;
+                    return Err(DicosError::Io(e));
+                }
+            }
+        }
+        self.bytes_read += filled as u64;
+        Ok(filled)
+    }
+
+    /// Reads exactly `buf.len()` bytes, mapping a short read to `Truncated`.
+    fn read_exact_ctx(&mut self, buf: &mut [u8], context: &'static str) -> Result<(), DicosError> {
+        let offset = self.bytes_read;
+        let n = self.fill(buf)?;
+        if n < buf.len() {
+            return Err(DicosError::Truncated { offset, context });
+        }
+        Ok(())
+    }
+
+    /// Reads a little-endian `u16`, mapping a short read to `Truncated`.
+    fn read_u16_ctx(&mut self, context: &'static str) -> Result<u16, DicosError> {
+        let mut b = [0u8; 2];
+        self.read_exact_ctx(&mut b, context)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    /// Reads a little-endian `u32`, mapping a short read to `Truncated`.
+    fn read_u32_ctx(&mut self, context: &'static str) -> Result<u32, DicosError> {
+        let mut b = [0u8; 4];
+        self.read_exact_ctx(&mut b, context)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    /// Reads a 4-byte tag at an element boundary.
+    ///
+    /// Returns `Ok(None)` on a clean EOF (zero bytes available), `Ok(Some(tag))`
+    /// for a full tag, and `Err(Truncated)` when only part of a tag is present.
+    fn read_boundary_tag(&mut self, context: &'static str) -> Result<Option<Tag>, DicosError> {
+        let offset = self.bytes_read;
+        let mut buf = [0u8; 4];
+        let n = self.fill(&mut buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if n < 4 {
+            return Err(DicosError::Truncated { offset, context });
+        }
+        let group = u16::from_le_bytes([buf[0], buf[1]]);
+        let element = u16::from_le_bytes([buf[2], buf[3]]);
+        Ok(Some(Tag::new(group, element)))
+    }
+
+    /// Reads a tag that must be present; a clean EOF here is a truncation.
+    fn read_tag_required(&mut self, context: &'static str) -> Result<Tag, DicosError> {
+        match self.read_boundary_tag(context)? {
+            Some(t) => Ok(t),
+            None => Err(DicosError::Truncated {
+                offset: self.bytes_read,
+                context,
+            }),
+        }
+    }
+
+    /// Skips `len` bytes, verifying the full count was consumed.
+    fn skip_bytes(&mut self, len: u32) -> Result<(), DicosError> {
+        let offset = self.bytes_read;
+        let copied = io::copy(&mut (&mut self.inner).take(u64::from(len)), &mut io::sink())?;
+        self.bytes_read += copied;
+        if copied != u64::from(len) {
+            return Err(DicosError::Truncated {
+                offset,
+                context: "skipped element body",
+            });
+        }
+        Ok(())
+    }
+
+    /// Applies the dataset transfer syntax when crossing out of group 0002.
+    ///
+    /// No-op unless we are still in the File Meta Information group and the tag
+    /// belongs to the dataset proper. Rejects big-endian transfer syntaxes.
+    fn enter_dataset_if_needed(&mut self, tag: Tag) -> Result<(), DicosError> {
+        if tag.group == 0x0002 || !self.in_meta {
+            return Ok(());
+        }
+        self.in_meta = false;
+        if self.transfer_syntax_uid.is_none() {
+            // No TransferSyntaxUID was present; default to Implicit VR LE per
+            // DICOM PS3.5 §10.1.
+            self.transfer_syntax_uid = Some(transfer::IMPLICIT_VR_LITTLE_ENDIAN.to_string());
+        }
+        self.update_transfer_syntax();
+
+        if let Some(uid) = &self.transfer_syntax_uid {
+            let ts = transfer::TransferSyntax::new(uid.as_str());
+            if !ts.is_little_endian() {
+                return Err(DicosError::UnsupportedTransferSyntax(uid.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads elements until a clean EOF or a group-`0xFFFE` delimiter tag.
+    ///
+    /// Each parsed element is passed to `on_element`. Returns the delimiter tag
+    /// that stopped the loop, or `None` on a clean end-of-stream. The delimiter's
+    /// trailing length field is left unconsumed for the caller to handle.
+    fn parse_elements_until(
+        &mut self,
+        depth: usize,
+        mut on_element: impl FnMut(&mut Self, Element) -> Result<(), DicosError>,
+    ) -> Result<Option<Tag>, DicosError> {
+        loop {
+            let tag = match self.read_boundary_tag("element tag")? {
+                None => return Ok(None),
+                Some(t) if t.group == 0xFFFE => return Ok(Some(t)),
+                Some(t) => t,
+            };
+            self.enter_dataset_if_needed(tag)?;
+            let elem = self.read_element_with_tag(tag, depth)?;
+            on_element(self, elem)?;
+        }
+    }
+
+    fn read_dataset(&mut self) -> Result<(Dataset, Vec<ParseWarning>), DicosError> {
         let mut ds = Dataset::new();
 
         // 1. Read 128-byte preamble
         let mut preamble = [0u8; 128];
-        self.inner
-            .read_exact(&mut preamble)
-            .map_err(|e| DicosError::InvalidFile(format!("failed to read preamble: {e}")))?;
+        if self.fill(&mut preamble)? != preamble.len() {
+            return Err(DicosError::BadPreamble {
+                reason: "preamble too short",
+            });
+        }
 
         // 2. Read "DICM" magic
         let mut magic = [0u8; 4];
-        self.inner
-            .read_exact(&mut magic)
-            .map_err(|e| DicosError::InvalidFile(format!("failed to read DICM magic: {e}")))?;
-        if &magic != DICM_MAGIC {
-            return Err(DicosError::InvalidFile("missing DICM magic number".into()));
+        if self.fill(&mut magic)? != magic.len() || &magic != DICM_MAGIC {
+            return Err(DicosError::BadPreamble {
+                reason: "missing DICM magic number",
+            });
         }
 
         // 3. Group 0002 is always Explicit VR Little Endian
         self.explicit_vr = true;
         self.in_meta = true;
 
-        // 4. Read elements
-        loop {
-            let tag = match self.read_tag() {
-                Ok(t) => t,
-                Err(DicosError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
-
-            // Transition out of group 0002: apply dataset transfer syntax
-            if tag.group != 0x0002 && self.in_meta {
-                self.in_meta = false;
-                if self.transfer_syntax_uid.is_none() {
-                    // No TransferSyntaxUID was found; default to Implicit VR LE per DICOM standard.
-                    // Materialize the inferred TS into the dataset so Dataset::transfer_syntax()
-                    // returns the same value the reader actually used.
-                    let default_uid = transfer::IMPLICIT_VR_LITTLE_ENDIAN.to_string();
-                    self.transfer_syntax_uid = Some(default_uid.clone());
-                    ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, default_uid);
-                }
-                self.update_transfer_syntax();
-
-                // Reject big-endian transfer syntaxes — we only decode little-endian.
-                if let Some(uid) = &self.transfer_syntax_uid {
-                    let ts = transfer::TransferSyntax::new(uid.as_str());
-                    if !ts.is_little_endian() {
-                        return Err(DicosError::UnsupportedTransferSyntax(uid.clone()));
-                    }
-                }
-            }
-
-            let elem = self.read_element_with_tag(tag, 0)?;
-
-            // Capture TransferSyntaxUID when we see it (still in group 0002)
-            if tag == tag::TRANSFER_SYNTAX_UID {
+        // 4. Read elements. The transfer-syntax transition happens inside
+        // `enter_dataset_if_needed`; capturing (0002,0010) happens here.
+        self.parse_elements_until(0, |this, elem| {
+            if elem.tag == tag::TRANSFER_SYNTAX_UID {
                 if let Value::Str(ref s) = elem.value {
-                    self.transfer_syntax_uid = Some(s.trim().to_string());
-                    // Do NOT switch VR mode yet -- still reading group 0002
+                    this.transfer_syntax_uid = Some(s.trim().to_string());
+                    // Do NOT switch VR mode yet -- still reading group 0002.
                 }
             }
-
             ds.insert(elem);
+            Ok(())
+        })?;
+
+        // Materialize the inferred default TS so Dataset::transfer_syntax()
+        // agrees with the VR mode the reader actually used (issue #8). This only
+        // fires when the file carried no TransferSyntaxUID of its own.
+        if !ds.contains(tag::TRANSFER_SYNTAX_UID) {
+            if let Some(uid) = self.transfer_syntax_uid.clone() {
+                ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, uid);
+            }
         }
 
-        normalize_native_pixel_data(&mut ds);
-        Ok(ds)
-    }
-
-    /// Reads a 4-byte DICOM tag (group, element).
-    fn read_tag(&mut self) -> Result<Tag, DicosError> {
-        let group = self.inner.read_u16::<LittleEndian>()?;
-        let element = self.inner.read_u16::<LittleEndian>()?;
-        Ok(Tag::new(group, element))
+        let warnings = normalize_native_pixel_data(&mut ds);
+        Ok((ds, warnings))
     }
 
     /// Reads an element after the tag has already been consumed.
@@ -179,10 +345,10 @@ impl<R: Read> DicosReader<R> {
     fn read_element_with_tag(&mut self, tag: Tag, depth: usize) -> Result<Element, DicosError> {
         // Sequence delimiters always have implicit structure: 4-byte length, no VR
         if tag.group == 0xFFFE {
-            let len = self.inner.read_u32::<LittleEndian>()?;
+            let len = self.read_u32_ctx("delimiter length")?;
             let value = if len > 0 && len != UNDEFINED_LENGTH {
                 let mut buf = checked_alloc(len, self.max_element_bytes)?;
-                self.inner.read_exact(&mut buf)?;
+                self.read_exact_ctx(&mut buf, "delimiter body")?;
                 Value::Bytes(buf)
             } else {
                 Value::Bytes(Vec::new())
@@ -209,17 +375,17 @@ impl<R: Read> DicosReader<R> {
     /// Reads VR + length in Explicit VR mode.
     fn read_explicit_vr_header(&mut self) -> Result<(Vr, u32), DicosError> {
         let mut vr_buf = [0u8; 2];
-        self.inner.read_exact(&mut vr_buf)?;
+        self.read_exact_ctx(&mut vr_buf, "explicit VR header")?;
         let vr = Vr::from_bytes(&vr_buf).unwrap_or(Vr::UN);
 
         let vl = if vr.is_long_vr() {
             // 2 reserved bytes + 4-byte length
             let mut reserved = [0u8; 2];
-            self.inner.read_exact(&mut reserved)?;
-            self.inner.read_u32::<LittleEndian>()?
+            self.read_exact_ctx(&mut reserved, "explicit VR header")?;
+            self.read_u32_ctx("explicit VR length")?
         } else {
             // 2-byte length
-            u32::from(self.inner.read_u16::<LittleEndian>()?)
+            u32::from(self.read_u16_ctx("explicit VR length")?)
         };
 
         Ok((vr, vl))
@@ -227,7 +393,7 @@ impl<R: Read> DicosReader<R> {
 
     /// Reads length in Implicit VR mode and infers VR from tag.
     fn read_implicit_vr_header(&mut self, tag: Tag) -> Result<(Vr, u32), DicosError> {
-        let vl = self.inner.read_u32::<LittleEndian>()?;
+        let vl = self.read_u32_ctx("implicit VR length")?;
         let vr = implicit_vr_for_tag(tag);
         Ok((vr, vl))
     }
@@ -239,7 +405,7 @@ impl<R: Read> DicosReader<R> {
         }
 
         let mut data = checked_alloc(vl, self.max_element_bytes)?;
-        self.inner.read_exact(&mut data)?;
+        self.read_exact_ctx(&mut data, "element value")?;
 
         parse_value(vr, &data, self.explicit_vr, self.max_element_bytes, depth)
     }
@@ -269,25 +435,27 @@ impl<R: Read> DicosReader<R> {
     /// Reads sequence items until the Sequence Delimitation Item tag.
     fn read_sequence_items(&mut self, depth: usize) -> Result<Vec<Dataset>, DicosError> {
         if depth >= MAX_NESTING_DEPTH {
-            return Err(DicosError::InvalidFile(format!(
-                "sequence nesting exceeds maximum depth ({MAX_NESTING_DEPTH})"
-            )));
+            return Err(DicosError::NestingTooDeep {
+                max: MAX_NESTING_DEPTH,
+            });
         }
 
         let mut items = Vec::new();
 
         loop {
-            let item_tag = self.read_tag()?;
-            let item_len = self.inner.read_u32::<LittleEndian>()?;
+            let item_tag = self.read_tag_required("sequence item")?;
+            let item_len = self.read_u32_ctx("sequence item length")?;
 
             if item_tag == tag::SEQUENCE_DELIMITATION_ITEM {
                 break;
             }
 
             if item_tag != tag::ITEM {
-                return Err(DicosError::InvalidFile(format!(
-                    "expected Item tag, got {item_tag}"
-                )));
+                return Err(DicosError::UnexpectedTag {
+                    expected: tag::ITEM,
+                    got: item_tag,
+                    context: "sequence item",
+                });
             }
 
             let item_ds = if item_len == UNDEFINED_LENGTH {
@@ -307,11 +475,11 @@ impl<R: Read> DicosReader<R> {
         let mut ds = Dataset::new();
 
         loop {
-            let elem_tag = self.read_tag()?;
+            let elem_tag = self.read_tag_required("sequence item element")?;
 
             if elem_tag == tag::ITEM_DELIMITATION_ITEM {
                 // Read and discard the 4-byte zero length
-                let _len = self.inner.read_u32::<LittleEndian>()?;
+                let _len = self.read_u32_ctx("item delimiter length")?;
                 break;
             }
 
@@ -325,7 +493,7 @@ impl<R: Read> DicosReader<R> {
     /// Reads a sequence item with a known fixed length.
     fn read_item_fixed_length(&mut self, len: u32, depth: usize) -> Result<Dataset, DicosError> {
         let mut buf = checked_alloc(len, self.max_element_bytes)?;
-        self.inner.read_exact(&mut buf)?;
+        self.read_exact_ctx(&mut buf, "fixed-length item body")?;
 
         // Parse the item bytes as a mini-dataset
         let mut sub_reader = DicosReader {
@@ -334,18 +502,14 @@ impl<R: Read> DicosReader<R> {
             transfer_syntax_uid: self.transfer_syntax_uid.clone(),
             in_meta: false,
             max_element_bytes: self.max_element_bytes,
+            bytes_read: 0,
         };
 
         let mut ds = Dataset::new();
-        loop {
-            let tag = match sub_reader.read_tag() {
-                Ok(t) => t,
-                Err(DicosError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
-            let elem = sub_reader.read_element_with_tag(tag, depth + 1)?;
+        sub_reader.parse_elements_until(depth + 1, |_, elem| {
             ds.insert(elem);
-        }
+            Ok(())
+        })?;
 
         Ok(ds)
     }
@@ -356,41 +520,45 @@ impl<R: Read> DicosReader<R> {
         let mut frames = Vec::new();
 
         // Read Basic Offset Table item
-        let bot_tag = self.read_tag()?;
+        let bot_tag = self.read_tag_required("basic offset table")?;
         if bot_tag != tag::ITEM {
-            return Err(DicosError::InvalidFile(format!(
-                "expected BOT item tag, got {bot_tag}"
-            )));
+            return Err(DicosError::UnexpectedTag {
+                expected: tag::ITEM,
+                got: bot_tag,
+                context: "basic offset table",
+            });
         }
 
-        let bot_len = self.inner.read_u32::<LittleEndian>()?;
+        let bot_len = self.read_u32_ctx("basic offset table length")?;
         if bot_len > 0 {
             let num_offsets = bot_len / 4;
             offsets.reserve(num_offsets as usize);
             for _ in 0..num_offsets {
-                offsets.push(self.inner.read_u32::<LittleEndian>()?);
+                offsets.push(self.read_u32_ctx("basic offset table entry")?);
             }
         }
 
         // Read frames until Sequence Delimitation Item
         loop {
-            let item_tag = self.read_tag()?;
+            let item_tag = self.read_tag_required("encapsulated pixel data")?;
 
             if item_tag == tag::SEQUENCE_DELIMITATION_ITEM {
                 // Read and discard length (should be 0)
-                let _len = self.inner.read_u32::<LittleEndian>()?;
+                let _len = self.read_u32_ctx("pixel data delimiter length")?;
                 break;
             }
 
             if item_tag != tag::ITEM {
-                return Err(DicosError::InvalidFile(format!(
-                    "expected item tag in encapsulated pixel data, got {item_tag}"
-                )));
+                return Err(DicosError::UnexpectedTag {
+                    expected: tag::ITEM,
+                    got: item_tag,
+                    context: "encapsulated pixel data",
+                });
             }
 
-            let item_len = self.inner.read_u32::<LittleEndian>()?;
+            let item_len = self.read_u32_ctx("encapsulated frame length")?;
             let mut frame_data = checked_alloc(item_len, self.max_element_bytes)?;
-            self.inner.read_exact(&mut frame_data)?;
+            self.read_exact_ctx(&mut frame_data, "encapsulated frame")?;
 
             frames.push(frame_data);
         }
@@ -401,16 +569,16 @@ impl<R: Read> DicosReader<R> {
     /// Skips an undefined-length element by reading until Sequence Delimitation Item.
     fn skip_undefined_length(&mut self, depth: usize) -> Result<(), DicosError> {
         if depth >= MAX_NESTING_DEPTH {
-            return Err(DicosError::InvalidFile(format!(
-                "sequence nesting exceeds maximum depth ({MAX_NESTING_DEPTH})"
-            )));
+            return Err(DicosError::NestingTooDeep {
+                max: MAX_NESTING_DEPTH,
+            });
         }
 
         loop {
-            let item_tag = self.read_tag()?;
+            let item_tag = self.read_tag_required("skipped sequence")?;
 
             if item_tag.group == 0xFFFE {
-                let len = self.inner.read_u32::<LittleEndian>()?;
+                let len = self.read_u32_ctx("skipped item length")?;
 
                 if item_tag == tag::SEQUENCE_DELIMITATION_ITEM {
                     return Ok(());
@@ -421,41 +589,27 @@ impl<R: Read> DicosReader<R> {
                 }
 
                 // Item start
-                if len != UNDEFINED_LENGTH && len > 0 {
-                    skip_bytes(&mut self.inner, len)?;
-                } else if len == UNDEFINED_LENGTH {
+                if len == UNDEFINED_LENGTH {
                     // Nested undefined length
                     self.skip_undefined_length(depth + 1)?;
+                } else if len > 0 {
+                    self.skip_bytes(len)?;
                 }
                 continue;
             }
 
-            // Regular element within the sequence -- skip it
-            if self.explicit_vr {
-                let mut vr_buf = [0u8; 2];
-                self.inner.read_exact(&mut vr_buf)?;
-                let vr = Vr::from_bytes(&vr_buf).unwrap_or(Vr::UN);
-
-                let vl = if vr.is_long_vr() {
-                    let mut reserved = [0u8; 2];
-                    self.inner.read_exact(&mut reserved)?;
-                    self.inner.read_u32::<LittleEndian>()?
-                } else {
-                    u32::from(self.inner.read_u16::<LittleEndian>()?)
-                };
-
-                if vl != UNDEFINED_LENGTH && vl > 0 {
-                    skip_bytes(&mut self.inner, vl)?;
-                } else if vl == UNDEFINED_LENGTH {
-                    self.skip_undefined_length(depth + 1)?;
-                }
+            // Regular element within the sequence -- skip it, reusing the shared
+            // VR-header readers rather than reimplementing the header parse.
+            let (_vr, vl) = if self.explicit_vr {
+                self.read_explicit_vr_header()?
             } else {
-                let vl = self.inner.read_u32::<LittleEndian>()?;
-                if vl != UNDEFINED_LENGTH && vl > 0 {
-                    skip_bytes(&mut self.inner, vl)?;
-                } else if vl == UNDEFINED_LENGTH {
-                    self.skip_undefined_length(depth + 1)?;
-                }
+                self.read_implicit_vr_header(item_tag)?
+            };
+
+            if vl == UNDEFINED_LENGTH {
+                self.skip_undefined_length(depth + 1)?;
+            } else if vl > 0 {
+                self.skip_bytes(vl)?;
             }
         }
     }
@@ -669,9 +823,9 @@ fn parse_sequence_items(
     depth: usize,
 ) -> Result<Vec<Dataset>, DicosError> {
     if depth >= MAX_NESTING_DEPTH {
-        return Err(DicosError::InvalidFile(format!(
-            "sequence nesting exceeds maximum depth ({MAX_NESTING_DEPTH})"
-        )));
+        return Err(DicosError::NestingTooDeep {
+            max: MAX_NESTING_DEPTH,
+        });
     }
 
     let mut cursor = io::Cursor::new(data);
@@ -692,26 +846,26 @@ fn parse_sequence_items(
         }
 
         if item_tag != tag::ITEM {
-            return Err(DicosError::InvalidFile(format!(
-                "expected Item tag in fixed-length SQ, got {item_tag}"
-            )));
+            return Err(DicosError::UnexpectedTag {
+                expected: tag::ITEM,
+                got: item_tag,
+                context: "fixed-length SQ item",
+            });
         }
 
         let item_len = cursor.read_u32::<LittleEndian>()?;
 
         if item_len == UNDEFINED_LENGTH {
-            return Err(DicosError::InvalidFile(
-                "undefined-length item inside fixed-length SQ".into(),
-            ));
+            return Err(DicosError::UndefinedLengthInFixedSq);
         }
 
         let pos = cursor.position() as usize;
         let end = pos + item_len as usize;
         if end > data.len() {
-            return Err(DicosError::InvalidFile(format!(
-                "SQ item length {item_len} exceeds buffer ({})",
-                data.len() - pos
-            )));
+            return Err(DicosError::LengthExceedsBuffer {
+                length: item_len as usize,
+                remaining: data.len() - pos,
+            });
         }
 
         let item_bytes = &data[pos..end];
@@ -723,24 +877,14 @@ fn parse_sequence_items(
             transfer_syntax_uid: None,
             in_meta: false,
             max_element_bytes,
+            bytes_read: 0,
         };
 
         let mut ds = Dataset::new();
-        loop {
-            let tag = match sub_reader.read_tag() {
-                Ok(t) => t,
-                Err(DicosError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
-
-            if tag.group == 0xFFFE {
-                let _ = sub_reader.inner.read_u32::<LittleEndian>();
-                break;
-            }
-
-            let elem = sub_reader.read_element_with_tag(tag, depth + 1)?;
+        sub_reader.parse_elements_until(depth + 1, |_, elem| {
             ds.insert(elem);
-        }
+            Ok(())
+        })?;
 
         items.push(ds);
     }
@@ -752,13 +896,15 @@ fn parse_sequence_items(
 ///
 /// The reader stores fixed-length (7FE0,0010) as Value::Bytes. This converts
 /// them to PixelData::Native so Dataset::pixel_data() works for all datasets.
-fn normalize_native_pixel_data(ds: &mut Dataset) {
+fn normalize_native_pixel_data(ds: &mut Dataset) -> Vec<ParseWarning> {
+    let mut warnings = Vec::new();
+
     let rows = ds.rows() as usize;
     let cols = ds.columns() as usize;
     let num_frames = ds.number_of_frames() as usize;
 
     if rows == 0 || cols == 0 {
-        return;
+        return warnings;
     }
 
     let frame_pixels = rows * cols;
@@ -770,24 +916,23 @@ fn normalize_native_pixel_data(ds: &mut Dataset) {
     );
 
     if !should_normalize {
-        return;
+        return warnings;
     }
 
     let raw_bytes = match ds.remove(tag::PIXEL_DATA) {
         Some(elem) => match elem.value {
             Value::Bytes(b) => b,
-            _ => return,
+            _ => return warnings,
         },
-        None => return,
+        None => return warnings,
     };
 
     // Decode as little-endian u16 pixels. A trailing odd byte cannot belong to
     // a 16-bit pixel, so flag it rather than dropping it silently.
     if raw_bytes.len() % 2 != 0 {
-        log::warn!(
-            "native pixel data has an odd byte length ({}); trailing byte ignored",
-            raw_bytes.len()
-        );
+        warnings.push(ParseWarning::OddPixelDataLength {
+            length: raw_bytes.len(),
+        });
     }
     let all_pixels: Vec<u16> = raw_bytes
         .chunks_exact(2)
@@ -802,12 +947,10 @@ fn normalize_native_pixel_data(ds: &mut Dataset) {
             .collect()
     } else {
         if all_pixels.len() != expected {
-            log::warn!(
-                "native pixel data size ({} pixels) does not match rows*cols*frames ({}); \
-                 storing as a single frame",
-                all_pixels.len(),
-                expected
-            );
+            warnings.push(ParseWarning::PixelCountMismatch {
+                actual: all_pixels.len(),
+                expected,
+            });
         }
         vec![all_pixels]
     };
@@ -817,6 +960,8 @@ fn normalize_native_pixel_data(ds: &mut Dataset) {
         Vr::OW,
         Value::PixelData(PixelData::Native { frames }),
     ));
+
+    warnings
 }
 
 #[cfg(test)]
@@ -948,9 +1093,10 @@ mod tests {
         let mut buf = vec![0u8; 128]; // preamble
         buf.extend_from_slice(b"XXXX"); // wrong magic
         let result = parse(io::Cursor::new(buf));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(format!("{err}").contains("DICM"));
+        assert!(
+            matches!(result, Err(DicosError::BadPreamble { .. })),
+            "expected BadPreamble, got: {result:?}"
+        );
     }
 
     #[test]
@@ -1276,16 +1422,11 @@ mod tests {
         file.extend_from_slice(&sq_bytes);
 
         let result = parse(io::Cursor::new(file));
+        // The error must describe the length mismatch via the typed variant —
+        // not a swallowed EOF surfaced as a generic I/O error.
         assert!(
-            result.is_err(),
-            "item length exceeding buffer must return an error, got Ok"
-        );
-        let msg = format!("{}", result.unwrap_err());
-        // The error must mention the length mismatch — not just "I/O error"
-        // from a swallowed EOF.
-        assert!(
-            msg.contains("SQ item length") || msg.contains("exceeds"),
-            "error should describe the length mismatch; got: {msg}"
+            matches!(result, Err(DicosError::LengthExceedsBuffer { .. })),
+            "expected LengthExceedsBuffer, got: {result:?}"
         );
     }
 
@@ -1357,7 +1498,7 @@ mod tests {
 
         let result = parse(io::Cursor::new(file));
         assert!(
-            matches!(result, Err(DicosError::InvalidFile(ref m)) if m.contains("depth")),
+            matches!(result, Err(DicosError::NestingTooDeep { .. })),
             "deeply nested sequences must error on depth, got: {result:?}"
         );
     }
@@ -1376,5 +1517,145 @@ mod tests {
 
         let ds = parse(io::Cursor::new(file)).expect("nesting within limit should parse");
         assert!(ds.get(tag::REFERENCED_IMAGE_SEQUENCE).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Truncation semantics
+    // -----------------------------------------------------------------------
+
+    /// A clean EOF exactly at an element boundary is a normal end-of-stream; a
+    /// partial tag one byte later is a `Truncated` error.
+    #[test]
+    fn clean_eof_at_boundary_vs_partial_header() {
+        let elements = vec![
+            Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+            Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+        ];
+        let data = build_minimal_explicit_vr_le(&elements);
+
+        // Preamble (128) + "DICM" (4) = 132: a clean boundary with no elements.
+        let at_magic =
+            parse(io::Cursor::new(data[..132].to_vec())).expect("clean EOF after magic parses");
+        assert!(at_magic.is_empty(), "no elements should be decoded yet");
+
+        // One byte past the magic is a partial tag -> Truncated.
+        let partial = parse(io::Cursor::new(data[..133].to_vec()));
+        assert!(
+            matches!(partial, Err(DicosError::Truncated { .. })),
+            "a partial tag must be Truncated, got: {partial:?}"
+        );
+    }
+
+    /// Every truncated prefix of a valid file must either error cleanly
+    /// (`Truncated`/`Io`/`BadPreamble`, never a panic) or, when it happens to
+    /// end at an element boundary, decode to strictly fewer elements than the
+    /// full file. A truncation must never silently equal the full parse.
+    #[test]
+    fn truncation_at_every_prefix_never_panics_or_silently_matches() {
+        let elements = vec![
+            Element::new(tag::PATIENT_NAME, Vr::PN, Value::Str("DOE^JOHN".into())),
+            Element::new(tag::ROWS, Vr::US, Value::U16(4)),
+            Element::new(tag::COLUMNS, Vr::US, Value::U16(4)),
+            Element::new(tag::BITS_ALLOCATED, Vr::US, Value::U16(16)),
+        ];
+        let data = build_minimal_explicit_vr_le(&elements);
+        let full_len = parse(io::Cursor::new(data.clone()))
+            .expect("full parse should succeed")
+            .len();
+
+        for i in 0..data.len() {
+            match parse(io::Cursor::new(data[..i].to_vec())) {
+                Ok(ds) => assert!(
+                    ds.len() < full_len,
+                    "prefix {i} parsed Ok with the full element count ({}); \
+                     a truncation silently matched the full parse",
+                    ds.len()
+                ),
+                Err(e) => assert!(
+                    matches!(
+                        e,
+                        DicosError::Truncated { .. }
+                            | DicosError::Io(_)
+                            | DicosError::BadPreamble { .. }
+                    ),
+                    "prefix {i} produced an unexpected error: {e:?}"
+                ),
+            }
+        }
+
+        assert_eq!(
+            parse(io::Cursor::new(data)).unwrap().len(),
+            full_len,
+            "the full-length file must decode to the full element set"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Parse warnings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_with_warnings_reports_odd_pixel_length() {
+        // 2x2 image with an odd (5-byte) native pixel payload.
+        let elements = vec![
+            Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+            Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+            Element::new(tag::PIXEL_DATA, Vr::OW, Value::Bytes(vec![1, 0, 2, 0, 3])),
+        ];
+        let data = build_minimal_explicit_vr_le(&elements);
+
+        let (ds, warnings) =
+            parse_with_warnings(io::Cursor::new(data)).expect("parse should succeed");
+        assert!(ds.pixel_data().is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ParseWarning::OddPixelDataLength { length: 5 })),
+            "expected OddPixelDataLength warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn parse_with_warnings_reports_pixel_count_mismatch() {
+        // 2x2 image (4 pixels expected) but only 2 pixels of data.
+        let elements = vec![
+            Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+            Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+            Element::new(tag::PIXEL_DATA, Vr::OW, Value::Bytes(vec![1, 0, 2, 0])),
+        ];
+        let data = build_minimal_explicit_vr_le(&elements);
+
+        let (_ds, warnings) =
+            parse_with_warnings(io::Cursor::new(data)).expect("parse should succeed");
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ParseWarning::PixelCountMismatch {
+                    actual: 2,
+                    expected: 4
+                }
+            )),
+            "expected PixelCountMismatch warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn parse_without_warnings_still_succeeds_on_clean_file() {
+        let elements = vec![
+            Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+            Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+            Element::new(
+                tag::PIXEL_DATA,
+                Vr::OW,
+                Value::Bytes(vec![1, 0, 2, 0, 3, 0, 4, 0]),
+            ),
+        ];
+        let data = build_minimal_explicit_vr_le(&elements);
+
+        let (ds, warnings) =
+            parse_with_warnings(io::Cursor::new(data)).expect("parse should succeed");
+        assert!(warnings.is_empty(), "clean file should have no warnings");
+        let pd = ds.pixel_data().expect("pixel data present");
+        assert_eq!(pd.native_frames().unwrap()[0], vec![1u16, 2, 3, 4]);
     }
 }

@@ -226,6 +226,24 @@ fn parse_sof3<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
     dec.width = u16::from_be_bytes([data[3], data[4]]);
     dec.components = data[5];
 
+    // T.81 B.2.2: sample precision P for lossless is 2..=16.  Rejecting the
+    // out-of-range values here prevents the `1 << (precision - 1)` underflow
+    // (P == 0/1) and out-of-bounds shifts (P > 16) in the DPCM loop.
+    if !(2..=16).contains(&dec.precision) {
+        return Err(CodecError::InvalidData(format!(
+            "invalid SOF3 sample precision: {} (must be 2..=16)",
+            dec.precision
+        )));
+    }
+
+    // This codec supports single-component (grayscale) frames only.
+    if dec.components != 1 {
+        return Err(CodecError::Unsupported(format!(
+            "SOF3 with {} components; only single-component frames are supported",
+            dec.components
+        )));
+    }
+
     dec.comp_info.clear();
     for i in 0..dec.components as usize {
         let offset = 6 + i * 3;
@@ -349,23 +367,49 @@ fn parse_sos<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
         }
     }
 
-    if offset >= data.len() {
+    // Need three more bytes: Ss, Se, Ah|Al (T.81 B.2.3).
+    if offset + 2 >= data.len() {
         return Err(CodecError::InvalidData(
             "SOS payload too short for spectral selection".into(),
         ));
     }
 
-    // Ss = predictor selection
+    // Ss = predictor selection.  Table B.3 restricts lossless Ss to 1..=7:
+    // 0 selects the hierarchical-only "no prediction" mode and > 7 is undefined.
     dec.predictor = data[offset];
     offset += 1;
-
-    // Se = always 0 for lossless
-    offset += 1;
-
-    // Ah (high nibble) | Al (low nibble) = point transform
-    if offset < data.len() {
-        dec.point_transform = data[offset] & 0x0F;
+    if !(1..=7).contains(&dec.predictor) {
+        return Err(CodecError::InvalidData(format!(
+            "invalid SOS predictor selector Ss={} (must be 1..=7)",
+            dec.predictor
+        )));
     }
+
+    // Se must be 0 for lossless.
+    let se = data[offset];
+    offset += 1;
+    if se != 0 {
+        return Err(CodecError::InvalidData(format!(
+            "invalid SOS Se={se} (must be 0 for lossless)"
+        )));
+    }
+
+    // Ah (high nibble) must be 0; Al (low nibble) = Pt = point transform.
+    let ah = data[offset] >> 4;
+    let al = data[offset] & 0x0F;
+    if ah != 0 {
+        return Err(CodecError::InvalidData(format!(
+            "invalid SOS Ah={ah} (must be 0 for lossless)"
+        )));
+    }
+    // Pt must be strictly less than the sample precision (T.81 Table B.3).
+    if al >= dec.precision {
+        return Err(CodecError::InvalidData(format!(
+            "invalid SOS point transform Al={al} (must be < precision {})",
+            dec.precision
+        )));
+    }
+    dec.point_transform = al;
 
     Ok(())
 }
@@ -429,6 +473,153 @@ mod tests {
         let data = [0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x02];
         let result = decode(&data, 1, 1);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation (J1): SOF3 / SOS contract per T.81 Table B.3.
+    // -----------------------------------------------------------------------
+
+    /// Build a SOI + SOF3 (only) stream with the given precision / component count.
+    fn sof3_stream(precision: u8, ncomp: u8) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8]; // SOI
+                                      // payload: P, H(2), W(2), Nf, then Nf * (Ci, Hi|Vi, Tqi)
+        let mut payload = vec![precision, 0x00, 0x01, 0x00, 0x01, ncomp];
+        for i in 0..ncomp {
+            payload.extend_from_slice(&[i + 1, 0x11, 0x00]);
+        }
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC3]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    /// Build a SOI + valid-SOF3 (P=8, 1 comp) + SOS stream with the given
+    /// Ss / Se / (Ah|Al) bytes so SOS validation can be exercised in isolation.
+    fn sos_stream(ss: u8, se: u8, ah_al: u8) -> Vec<u8> {
+        let mut v = sof3_stream(8, 1);
+        let payload = vec![1u8, 1, 0x00, ss, se, ah_al];
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn reject_precision_zero() {
+        assert!(matches!(
+            decode(&sof3_stream(0, 1), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_precision_one() {
+        assert!(matches!(
+            decode(&sof3_stream(1, 1), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_precision_seventeen() {
+        assert!(matches!(
+            decode(&sof3_stream(17, 1), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_multi_component() {
+        // Nf = 3 must be rejected as Unsupported (single-component only).
+        assert!(matches!(
+            decode(&sof3_stream(8, 3), 1, 1),
+            Err(CodecError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn reject_predictor_zero() {
+        // Ss = 0 (hierarchical-only) is illegal for lossless.
+        assert!(matches!(
+            decode(&sos_stream(0, 0, 0), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_predictor_eight() {
+        assert!(matches!(
+            decode(&sos_stream(8, 0, 0), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_nonzero_se() {
+        assert!(matches!(
+            decode(&sos_stream(1, 5, 0), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_nonzero_ah() {
+        // Ah = high nibble = 1.
+        assert!(matches!(
+            decode(&sos_stream(1, 0, 0x10), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_point_transform_ge_precision() {
+        // precision = 8, Al = 8 must be rejected.
+        assert!(matches!(
+            decode(&sos_stream(1, 0, 0x08), 1, 1),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-pipeline round-trips: predictor x point-transform x precision.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_matrix_predictor_pt_precision() {
+        use crate::encode::{encode_with_options, EncodeOptions};
+        let (w, h) = (5usize, 4usize);
+        for &precision in &[2u8, 8, 12, 16] {
+            let modulus: u64 = 1u64 << precision;
+            // Deterministic image whose samples all fit in `precision` bits.
+            let pixels: Vec<u16> = (0..(w * h))
+                .map(|i| ((i as u64 * 2_654_435_761) % modulus) as u16)
+                .collect();
+            for predictor in 1..=7u8 {
+                for &pt in &[0u8, 2u8] {
+                    if pt >= precision {
+                        continue;
+                    }
+                    let opts = EncodeOptions {
+                        predictor,
+                        point_transform: pt,
+                        restart_interval_rows: 0,
+                        precision,
+                    };
+
+                    let mut buf = Vec::new();
+                    encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+                    let (decoded, dw, dh) = decode(&buf, w as u32, h as u32).unwrap();
+                    assert_eq!((dw, dh), (w as u32, h as u32));
+                    let expected: Vec<u16> = pixels.iter().map(|&p| (p >> pt) << pt).collect();
+                    assert_eq!(
+                        decoded, expected,
+                        "roundtrip mismatch predictor={predictor} pt={pt} precision={precision}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

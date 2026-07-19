@@ -182,24 +182,27 @@ impl<W: Write> BitWriter<W> {
 
 /// Decode one Huffman symbol from the bit reader using `ht`.
 pub(crate) fn decode_huffman<R: Read>(br: &mut BitReader<R>, ht: &HuffmanTable) -> io::Result<u8> {
-    // Fast path: 8-bit lookup
+    // Fast path: 8-bit lookup. This can resolve any code of length <= 8 even
+    // when the buffer is short (peek zero-pads beyond EOF, and codes that
+    // resolve within 8 bits are unaffected by the padding).
     let peek = br.peek_bits(8)? as u8;
     if let Some((size, value)) = ht.fast_lookup(peek) {
         br.consume_bits(size);
         return Ok(value);
     }
 
-    // At EOF with only padding bits remaining: treat as SSSS=0 (no difference).
-    // JPEG encoders pad the final byte with 1-bits, which may not form a valid
-    // Huffman code. When the stream is exhausted, remaining bits are padding.
-    if br.eof {
-        br.consume_bits(br.bits);
-        return Ok(0);
-    }
-
-    // Slow path: decode bit by bit
+    // Slow path: decode bit by bit (codes 9..=16 bits, e.g. the SSSS=16 code).
+    //
+    // A JPEG encoder pads the final byte with 1-bits, which may not form a
+    // valid Huffman code. Only when the buffer is genuinely exhausted at EOF
+    // do we treat the remainder as padding and report SSSS=0 (no difference).
     let mut code: u16 = 0;
     for size in 1..=16u8 {
+        if br.eof && br.bits == 0 {
+            // Nothing left but end-of-stream: remaining bits (if any were
+            // consumed) were padding.
+            return Ok(0);
+        }
         let bit = br.read_bits(1)?;
         code = (code << 1) | (bit as u16);
         if let Some(value) = ht.decode_slow(code, size) {
@@ -280,7 +283,10 @@ pub(crate) fn decode_scan<R: Read>(
     predictor: u8,
     point_transform: u8,
 ) -> io::Result<Vec<u16>> {
-    let max_val: i32 = (1i32 << precision) - 1;
+    // The codec operates entirely in the reduced domain P' = P - Pt.  The DPCM
+    // loop reconstructs P'-bit samples; each is shifted left by Pt on store.
+    let p_prime = precision - point_transform;
+    let max_val: i32 = (1i32 << p_prime) - 1;
     let mut br = BitReader::new(reader);
 
     let mut pixels = vec![0u16; width * height];
@@ -292,27 +298,25 @@ pub(crate) fn decode_scan<R: Read>(
             // Decode Huffman symbol (SSSS = number of additional bits)
             let ssss = decode_huffman(&mut br, ht)?;
 
-            // Read additional bits and sign-extend
-            let diff = if ssss > 0 {
+            // Read additional bits and sign-extend.  SSSS==16 is the T.81
+            // H.1.2.2 / Table H.2 special case: the modular difference 32768
+            // carries NO appended bits (it can only occur at P'==16).
+            let diff = if ssss == 16 {
+                32768
+            } else if ssss > 0 {
                 let bits = br.read_bits(ssss)?;
                 extend(bits, ssss)
             } else {
                 0
             };
 
-            // Apply point transform
-            let diff = if point_transform > 0 {
-                diff << point_transform
-            } else {
-                diff
-            };
-
-            // Predict and reconstruct
-            let pred = predict(&curr_row, &prev_row, x, y, predictor, precision);
+            // Predict and reconstruct in the reduced domain.
+            let pred = predict(&curr_row, &prev_row, x, y, predictor, p_prime);
             let val = (pred + diff) & max_val;
 
             curr_row[x] = val;
-            pixels[y * width + x] = val as u16;
+            // Store back at full precision by re-applying the point transform.
+            pixels[y * width + x] = (val << point_transform) as u16;
         }
         std::mem::swap(&mut prev_row, &mut curr_row);
         curr_row.fill(0);
@@ -328,6 +332,7 @@ pub(crate) fn decode_scan<R: Read>(
 /// Encode a full scan of pixel data into JPEG Lossless format.
 ///
 /// Writes the entropy-coded segment (no markers) to `writer`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_scan<W: Write>(
     writer: W,
     ht: &HuffmanTable,
@@ -336,8 +341,12 @@ pub(crate) fn encode_scan<W: Write>(
     height: usize,
     precision: u8,
     predictor: u8,
+    point_transform: u8,
 ) -> io::Result<()> {
-    let max_val: i32 = (1i32 << precision) - 1;
+    // Operate entirely in the reduced domain P' = P - Pt: every input sample is
+    // shifted right by Pt before entering the DPCM loop.
+    let p_prime = precision - point_transform;
+    let max_val: i32 = (1i32 << p_prime) - 1;
     let mut bw = BitWriter::new(writer);
 
     let mut prev_row = vec![0i32; width];
@@ -345,10 +354,10 @@ pub(crate) fn encode_scan<W: Write>(
 
     for y in 0..height {
         for x in 0..width {
-            let val = pixels[y * width + x] as i32;
+            let val = (pixels[y * width + x] >> point_transform) as i32;
             curr_row[x] = val;
 
-            let pred = predict(&curr_row, &prev_row, x, y, predictor, precision);
+            let pred = predict(&curr_row, &prev_row, x, y, predictor, p_prime);
 
             // Compute modular difference
             let mut diff = (val - pred) & max_val;
@@ -363,8 +372,9 @@ pub(crate) fn encode_scan<W: Write>(
                 bw.write_bits(code as u32, size)?;
             }
 
-            // Write additional bits
-            if ssss > 0 {
+            // Write additional bits.  SSSS==16 is the T.81 H.1.2.2 / Table H.2
+            // special case for the modular difference 32768: NO appended bits.
+            if ssss > 0 && ssss < 16 {
                 let additional = if diff < 0 {
                     (diff + (1 << ssss) - 1) as u32
                 } else {
@@ -482,7 +492,7 @@ mod tests {
         let (w, h) = (3, 3);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 8, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 8, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 8, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
@@ -495,7 +505,7 @@ mod tests {
         let (w, h) = (3, 3);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
@@ -512,7 +522,7 @@ mod tests {
 
         for predictor in 1..=7u8 {
             let mut encoded = Vec::new();
-            encode_scan(&mut encoded, &ht, &pixels, w, h, 16, predictor).unwrap();
+            encode_scan(&mut encoded, &ht, &pixels, w, h, 16, predictor, 0).unwrap();
 
             let decoded = decode_scan(&encoded[..], &ht, w, h, 16, predictor, 0).unwrap();
             assert_eq!(
@@ -529,7 +539,7 @@ mod tests {
         let (w, h) = (4, 4);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
@@ -543,7 +553,7 @@ mod tests {
         let (w, h) = (2, 2);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
@@ -556,7 +566,7 @@ mod tests {
         let (w, h) = (1, 1);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
@@ -569,7 +579,7 @@ mod tests {
         let (w, h) = (100, 1);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
@@ -582,9 +592,97 @@ mod tests {
         let (w, h) = (1, 100);
 
         let mut encoded = Vec::new();
-        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1).unwrap();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
 
         let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
         assert_eq!(decoded, pixels);
+    }
+
+    // -----------------------------------------------------------------------
+    // SSSS = 16 special case (T.81 H.1.2.2 / Table H.2): the modular
+    // difference 32768 is coded as category 16 with NO appended bits.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ssss16_emits_no_appended_bits_exact_vector() {
+        // A 1x1, 16-bit image whose only sample is 0.  The first-pixel
+        // prediction is 2^15 = 32768, so DIFF = (0 - 32768) mod 65536 = 32768,
+        // mapped to the signed value -32768 => category 16.
+        let ht = crate::huffman::build_default_table();
+        let pixels: Vec<u16> = vec![0];
+
+        let mut encoded = Vec::new();
+        encode_scan(&mut encoded, &ht, &pixels, 1, 1, 16, 1, 0).unwrap();
+
+        // The default table's category-16 code is 14 bits (0b11111111111110).
+        // With no appended bits, flushing pads the trailing 6 bits with 1s.
+        // The first byte is 0xFF, which the byte-stuffer follows with 0x00,
+        // then the padded final byte 0xFB.  Had the (buggy) 16 appended bits
+        // been written, the payload would have been 30 bits => 4 bytes.
+        assert_eq!(
+            encoded,
+            vec![0xFF, 0x00, 0xFB],
+            "category-16 code must carry no appended bits"
+        );
+
+        // And it must decode back to the original sample.
+        let decoded = decode_scan(&encoded[..], &ht, 1, 1, 16, 1, 0).unwrap();
+        assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn ssss16_roundtrip_boundary_values() {
+        // Values that force the -32768 modular difference at various positions.
+        let ht = crate::huffman::build_default_table();
+        let pixels: Vec<u16> = vec![0, 32768, 65535, 32767, 0, 32768];
+        let (w, h) = (3, 2);
+
+        let mut encoded = Vec::new();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 16, 1, 0).unwrap();
+
+        let decoded = decode_scan(&encoded[..], &ht, w, h, 16, 1, 0).unwrap();
+        assert_eq!(decoded, pixels);
+    }
+
+    // -----------------------------------------------------------------------
+    // Point transform: reduced-domain (P' = P - Pt) round-trips.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_point_transform_reduced_domain() {
+        let ht = crate::huffman::build_default_table();
+        // 12-bit-ish values; Pt=2 keeps only the top 10 bits (P' = 10).
+        let pixels: Vec<u16> = vec![0, 4, 8, 12, 2044, 4092, 100, 2048, 4000];
+        let (w, h) = (3, 3);
+
+        let mut encoded = Vec::new();
+        encode_scan(&mut encoded, &ht, &pixels, w, h, 12, 1, 2).unwrap();
+
+        let decoded = decode_scan(&encoded[..], &ht, w, h, 12, 1, 2).unwrap();
+        // Decoded values equal (orig >> 2) << 2.
+        let expected: Vec<u16> = pixels.iter().map(|&p| (p >> 2) << 2).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn scan_point_transform_property_all_predictors() {
+        let ht = crate::huffman::build_default_table();
+        let pixels: Vec<u16> = vec![
+            1000, 1005, 1010, 1008, 1002, 1007, 1012, 1009, 1004, 1008, 1015, 1011, 1003, 1006,
+            1013, 1010,
+        ];
+        let (w, h) = (4, 4);
+        for predictor in 1..=7u8 {
+            for &pt in &[0u8, 2u8] {
+                let mut encoded = Vec::new();
+                encode_scan(&mut encoded, &ht, &pixels, w, h, 12, predictor, pt).unwrap();
+                let decoded = decode_scan(&encoded[..], &ht, w, h, 12, predictor, pt).unwrap();
+                let expected: Vec<u16> = pixels.iter().map(|&p| (p >> pt) << pt).collect();
+                assert_eq!(
+                    decoded, expected,
+                    "point-transform property failed for predictor {predictor}, pt {pt}"
+                );
+            }
+        }
     }
 }

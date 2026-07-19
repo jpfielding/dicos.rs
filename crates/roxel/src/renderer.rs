@@ -595,7 +595,10 @@ impl VolumeRenderer {
 
         let max_dim = self.dim_x.max(self.dim_y).max(self.dim_z) as f32;
         let base_voxel_size = if max_dim > 0.0 { 1.0 / max_dim } else { 0.01 };
-        let zoom_factor = 1.0 / camera.distance.clamp(0.5, 5.0);
+        let zoom_factor = 1.0
+            / camera
+                .distance
+                .clamp(Camera::MIN_DISTANCE, Camera::MAX_DISTANCE);
 
         let step_size = match self.quality {
             Quality::Fast => base_voxel_size * zoom_factor * 1.5,

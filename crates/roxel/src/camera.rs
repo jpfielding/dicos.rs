@@ -33,6 +33,11 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// Minimum allowed orbit distance (closest zoom-in).
+    pub const MIN_DISTANCE: f32 = 0.5;
+    /// Maximum allowed orbit distance (furthest zoom-out).
+    pub const MAX_DISTANCE: f32 = 5.0;
+
     /// Compute the camera position in world space.
     pub fn position(&self) -> Vec3 {
         let (sin_az, cos_az) = self.azimuth.sin_cos();
@@ -70,7 +75,7 @@ impl Camera {
 
     /// Zoom by a multiplicative factor (>1 zooms in, <1 zooms out).
     pub fn zoom(&mut self, factor: f32) {
-        self.distance = (self.distance / factor).clamp(0.5, 5.0);
+        self.distance = (self.distance / factor).clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE);
     }
 
     /// Pan the camera target in view space using pixel deltas.

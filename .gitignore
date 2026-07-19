@@ -17,3 +17,13 @@
 # intermediate from blender to dicos
 voxels.raw
 
+# Test fixtures are generated on demand (see README "Test data"), not tracked.
+# The 1.x tree checked these in (~37 MB); 2.0 generates them via the
+# gen-luggage-fishtank example. Untrack once with:
+#   git rm -r --cached testdata roxel-lrg.gif
+/testdata/
+
+# Large release-only demo asset; distributed as a GitHub release attachment,
+# not committed (README links to the v2.0.0 release download).
+/roxel-lrg.gif
+

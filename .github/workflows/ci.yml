@@ -35,6 +35,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
+      # testdata/ is no longer checked in (2.0 forward-only cleanup). Generate a
+      # small synthetic fixture from the example so the generator stays exercised
+      # on every run. The integration tests that read testdata/ files skip
+      # gracefully when their specific curated fixtures are absent, so this does
+      # not gate the suite; it validates the example builds and produces a valid
+      # DICOS file end to end.
+      - name: Generate synthetic fixture
+        run: |
+          mkdir -p testdata/synthetic
+          cargo run -p dicos --example gen-luggage-fishtank -- \
+            --size 64,64,48 \
+            --out testdata/synthetic/luggage_fishtank_ct.dcs
+
       - name: Test
         run: cargo test --workspace --all-features
 

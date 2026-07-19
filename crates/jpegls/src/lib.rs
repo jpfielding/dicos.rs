@@ -3,6 +3,13 @@
 //! Implements the LOCO-I algorithm with context-based Golomb-Rice coding
 //! and run-length mode for uniform regions.
 //!
+//! # Conformance scope
+//!
+//! Conformant T.87 for **single-component** images (`Nf = 1`, `ILV = 0`),
+//! precision `2..=16`, with LSE ID=1 presets, run mode, and near-lossless.
+//! `DRI`/restart markers, `Nf ≠ 1`, and `ILV ≠ 0` are rejected as
+//! `Unsupported`. Verified against CharLS fixtures.
+//!
 //! # Profiles
 //!
 //! The default [`Profile::T87`] path is ITU-T T.87 conformant. The

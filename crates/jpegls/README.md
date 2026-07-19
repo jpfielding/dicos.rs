@@ -2,13 +2,31 @@
 
 Pure Rust implementation of JPEG-LS (ITU-T T.87 / ISO/IEC 14495-1) encoder and decoder.
 
+## Conformance scope (2.0.0)
+
+This crate emits **conformant ITU-T T.87 streams** for **single-component**
+(`Nf = 1`, `ILV = 0`) images. Supported: LSE ID=1 presets
+(MAXVAL/T1/T2/T3/RESET) honored on decode, run mode, near-lossless, sample
+precision `2..=16`. `DRI`/restart markers, multi-component (`Nf ≠ 1`), and
+interleaved scans (`ILV ≠ 0`) are rejected as `Unsupported`. Interop is verified
+against **CharLS** `.jls` fixtures (including an LSE-bearing stream).
+
+### Profiles
+
+- `Profile::T87` (default) — ITU-T T.87 conformant output.
+- `Profile::LegacyGo` — reproduces the frozen 1.0.0 / Go-compatible bytes
+  (T.81-style `0xFF00` stuffing, no run mode, uncapped Golomb); lossless only.
+
+Near-lossless and explicit precision are set through `EncodeOptions` via
+`encode_with_options`; `DecodeOptions` selects the decode profile.
+
 ## Features
 
-- **Lossless compression** using the LOCO-I algorithm
+- **Lossless and near-lossless** compression using the LOCO-I algorithm
 - **Context-based adaptive prediction** with Median Edge Detection (MED)
 - **Golomb-Rice entropy coding** with adaptive parameter selection
 - **Run-length mode** for efficient coding of uniform regions
-- **8-bit and 16-bit** grayscale images
+- **Single-component** grayscale images, precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.80`
 - **Pure Rust**: No external codec dependencies
 
@@ -22,7 +40,7 @@ Add the package under the plain import name:
 
 ```toml
 [dependencies]
-jpegls = { package = "pure_jpegls", version = "1.0" }
+jpegls = { package = "pure_jpegls", version = "2.0" }
 ```
 
 ### Encoding
@@ -78,10 +96,9 @@ selection, allowing the codec to adapt to local image characteristics.
 
 ## Supported Image Types
 
-| Pixel Type | Precision | Description |
-|------------|-----------|-------------|
-| `u8` | 8-bit | 8-bit grayscale |
-| `u16` | 16-bit | 16-bit grayscale |
+| Pixel Type | Precision | Components | Description |
+|------------|-----------|------------|-------------|
+| `u16` | `2..=16` bits | 1 (`Nf = 1`, `ILV = 0`) | single-component grayscale |
 
 ## JPEG-LS Stream Format
 

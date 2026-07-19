@@ -32,12 +32,26 @@ Pure Rust implementations of the lossless image compression formats used by
 DICOS and DICOM. Each codec is a standalone crate with **zero dependency on
 `dicos`**, so they can be used independently in any imaging pipeline.
 
+As of 2.0.0 these codecs emit **standards-conformant** streams within an
+explicit, documented scope; anything legal-but-unsupported is rejected loudly
+rather than encoded incorrectly. See the "Conformance scope" table below and
+each crate's README for the full support matrix.
+
 | Package | Imported as | Standard | Algorithm |
 |---------|-------------|----------|-----------|
-| **pure_jpeg2k** | `jpeg2k` | ITU-T T.800 | Wavelet (DWT + EBCOT) |
+| **pure_jpeg2k** | `jpeg2k` | ITU-T T.800 | Wavelet (5/3 DWT + EBCOT + MQ) |
 | **pure_jpegli** | `jpegli` | ITU-T T.81 Annex H | DPCM (Process 14 SV1) |
 | **pure_jpegls** | `jpegls` | ISO/IEC 14495-1 / ITU-T T.87 | LOCO-I |
 | **pure_jpegrle** | `jpegrle` | DICOM Part 5 Section 8.1.1 | PackBits RLE |
+
+#### Conformance scope (2.0.0)
+
+| Codec | Conformant profile | Verified against |
+|-------|--------------------|------------------|
+| **pure_jpeg2k** | T.800 lossless codestreams: 1 tile, 1 component (unsigned 16-bit), reversible 5/3 DWT, LRCP, 1 layer, `cb_style=0`, zero grid origins. Everything else legal-but-unsupported is rejected via a validated support matrix. v1.0.0 / Go raw-DWT files remain decodable through `LegacyPolicy` (`Auto` by default; the dicos registry adapter uses `StandardOnly`). | **OpenJPEG** (`opj_compress`/`opj_decompress`), both directions, in CI |
+| **pure_jpegls** | T.87 single-component, `ILV=0`, LSE ID=1 presets honored, run mode, near-lossless. `DRI`/restart markers and `Nf≠1`/`ILV≠0` are rejected as `Unsupported`. `Profile::LegacyGo` reproduces the frozen 1.0.0 / Go-compatible bytes. | **CharLS** `.jls` fixtures (incl. an LSE-bearing stream) |
+| **pure_jpegli** | T.81 Process 14 SV1: predictors 1–7, point transform, restart intervals (row-aligned per H.1.1). | **libjpeg-turbo ≥ 3.0** (`cjpeg -lossless` / `djpeg`) |
+| **pure_jpegrle** | DICOM Part 5 §8.1.1 PackBits RLE; 16-bit split into high/low byte segments. | Round-trip + DICOM fixtures |
 
 ### dicosctl -- CLI Inspector
 
@@ -49,7 +63,7 @@ inside the `dicos` crate behind the `cli` feature flag.
 A three-panel desktop application for visualizing 3D CT volumes and 2D slices
 from DICOS files. Uses `wgpu` for GPU ray-casting and `egui` for the UI.
 
-![roxel 3D Rendering](roxel-lrg.gif)
+![roxel 3D Rendering](https://github.com/jpfielding/dicos.rs/releases/download/v2.0.0/roxel-lrg.gif)
 
 ```text
 +------------+------------------------+------------------------+
@@ -80,7 +94,7 @@ Requires a GPU with Vulkan, Metal, or DX12 support.
 ```
 dicos.rs/
   Cargo.toml              # Workspace root
-  testdata/               # Public-safe synthetic fixtures
+  testdata/               # Generated fixtures (gitignored; see "Test data")
   crates/
     dicos/                # Core DICOS library + dicosctl binary
     jpegrle/              # RLE PackBits codec (standalone)
@@ -119,13 +133,32 @@ cargo build -p dicos --features cli
 cargo build -p roxel --release
 ```
 
+## Test data
+
+As of 2.0.0 the `testdata/` directory is **generated on demand and gitignored**
+(the 1.x tree checked in ~37 MB of fixtures). Integration tests that read
+`testdata/` files skip gracefully when a fixture is absent, so a fresh checkout
+tests green with no fixtures present.
+
+To produce a synthetic public-safe CT volume via the example generator:
+
+```sh
+mkdir -p testdata/synthetic
+cargo run -p dicos --example gen-luggage-fishtank -- \
+  --size 64,64,48 --out testdata/synthetic/luggage_fishtank_ct.dcs
+```
+
+`--size x,y,z` accepts any axis ≥ 32 (x/y ≤ 65535); omit `--out` to write the
+default path. CI runs this step before the test suite. See
+[MIGRATION.md](MIGRATION.md) for the full 1.x → 2.0 upgrade guide.
+
 ## Usage
 
 ### dicosctl
 
-The `dicos` crate ships two binaries (`dicosctl` and the
-`dicos-gen-luggage-fishtank` fixture generator), so `cargo run` must be told
-which one to launch with `--bin dicosctl`.
+The `dicos` crate ships `dicosctl` as a binary (behind the `cli` feature); the
+fixture generator now lives at `examples/gen-luggage-fishtank.rs` (run with
+`--example gen-luggage-fishtank`, see [Test data](#test-data)).
 
 ```sh
 # Print a human-readable summary of a DICOS file
@@ -189,14 +222,14 @@ including architecture, rendering pipeline, and GPU requirements.
 Run `cargo test --workspace` to reproduce. Current counts:
 
 ```
-dicos:  102 passed, 0 failed   (99 unit + 3 integration)
-roxel:   51 passed, 0 failed
-jpeg2k:  62 passed, 0 failed
-jpegli:  49 passed, 0 failed
-jpegls:  61 passed, 0 failed
-jpegrle: 29 passed, 0 failed
+dicos:  115 passed, 0 failed
+roxel:   57 passed, 0 failed
+jpeg2k: 137 passed, 0 failed
+jpegli:  90 passed, 0 failed
+jpegls:  86 passed, 0 failed
+jpegrle: 32 passed, 0 failed
 ---------------------------------
-Total:  354 passed, 0 failed, 0 ignored
+Total:  517 passed, 0 failed, 0 ignored
 ```
 
 ## References

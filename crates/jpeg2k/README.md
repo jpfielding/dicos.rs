@@ -2,14 +2,38 @@
 
 Pure Rust implementation of JPEG 2000 Part-1 (ITU-T T.800 / ISO/IEC 15444-1) encoder and decoder.
 
+## Conformance scope (2.0.0)
+
+This crate emits **conformant ITU-T T.800 lossless codestreams** within an
+explicit profile. Everything legal-but-unsupported is **rejected loudly** via a
+validated support matrix rather than mis-encoded.
+
+Supported: 1 tile, 1 component (**unsigned 16-bit**), reversible 5/3 DWT, LRCP
+progression, 1 layer, `cb_style = 0`, zero grid origins, code-block exponents
+`2..=10` (sum ≤ 12). Configurable decomposition levels and code-block size.
+
+Rejected as `Unsupported`: multiple tiles or components, non-16-bit or signed
+precision, MCT ≠ 0, progression ≠ LRCP, layers ≠ 1, `cb_style ≠ 0`, transform ≠
+5/3, non-zero origins, `POC/COC/QCC/PPM/PPT/PLM/PLT`, and `SOP/EPH`.
+
+Interop is verified in CI against **OpenJPEG** (`opj_compress`/`opj_decompress`)
+in both directions.
+
+### Legacy (1.0.0 / Go) files
+
+1.0.0 shipped a non-conformant raw-DWT format. Those files remain decodable via
+`DecodeOptions { legacy: LegacyPolicy }`: `decode()` uses `Auto` (try standard,
+fall back to the legacy fingerprint), and `StandardOnly` / `LegacyOnly` are
+available. The dicos registry adapter uses `StandardOnly` for untrusted,
+transfer-syntax-tagged data.
+
 ## Features
 
 - **Lossless compression** using 5/3 reversible discrete wavelet transform (DWT)
-- **EBCOT tier-1 block coding** with embedded truncation
+- **EBCOT tier-1 block coding** with the MQ arithmetic coder
 - **MQ arithmetic coder** (ITU-T T.800 Annex C)
-- **Reversible Color Transform (RCT)** for multi-component images
 - **Configurable decomposition levels** and code-block sizes
-- **8-bit and 16-bit** grayscale images
+- **Single-component unsigned 16-bit** grayscale images
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.90`
 - **Pure Rust**: No external codec dependencies
 
@@ -23,7 +47,7 @@ Add the package under the plain import name:
 
 ```toml
 [dependencies]
-jpeg2k = { package = "pure_jpeg2k", version = "1.0" }
+jpeg2k = { package = "pure_jpeg2k", version = "2.0" }
 ```
 
 ### Encoding
@@ -66,8 +90,7 @@ assert_eq!(decoded, pixels);
 
 | Pixel Type | Precision | Components | Description |
 |------------|-----------|------------|-------------|
-| `u8` | 8-bit | 1 | 8-bit grayscale |
-| `u16` | 16-bit | 1 | 16-bit grayscale |
+| `u16` | 16-bit unsigned | 1 | 16-bit grayscale (the only conformant profile) |
 
 ## Architecture
 
@@ -114,8 +137,8 @@ SOD  - Start of Data (0xFF93)
 EOC  - End of Codestream (0xFFD9)
 ```
 
-Multiple SOT/SOD pairs may appear for multi-tile images. Each tile-part
-contains packet data organized by progression order.
+The conformant profile emits exactly one SOT/SOD tile-part (single tile);
+multi-tile codestreams are rejected on decode.
 
 ## References
 

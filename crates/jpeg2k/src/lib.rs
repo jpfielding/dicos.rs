@@ -2,6 +2,14 @@
 //!
 //! Implements reversible 5/3 DWT, EBCOT tier-1/tier-2 coding,
 //! and MQ arithmetic coding for lossless image compression.
+//!
+//! # Conformance scope
+//!
+//! Emits conformant T.800 codestreams for a single unsigned-16-bit component,
+//! one tile, LRCP, one layer, `cb_style = 0`, zero grid origins; everything
+//! else legal-but-unsupported is rejected via a validated support matrix.
+//! Verified against OpenJPEG in both directions. 1.0.0 / Go raw-DWT files
+//! remain decodable via [`LegacyPolicy`] (`Auto` by default).
 
 use crate::error::CodecError;
 

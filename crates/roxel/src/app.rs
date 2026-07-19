@@ -224,16 +224,6 @@ impl App {
             self.ui.slice_dirty = false;
         }
 
-        // Sync UI state to renderer.
-        self.renderer.window_center = self.ui.settings.window_center;
-        self.renderer.window_width = self.ui.settings.window_width;
-        self.renderer.alpha_scale = self.ui.settings.global_opacity;
-        self.renderer.density_threshold = self.ui.settings.density_threshold;
-        self.renderer.quality = self.ui.settings.quality;
-        self.renderer.ambient = self.ui.settings.ambient;
-        self.renderer.diffuse = self.ui.settings.diffuse;
-        self.renderer.specular = self.ui.settings.specular;
-
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
 
@@ -275,6 +265,7 @@ impl App {
                 viewport: [width, height],
                 threats: active_3d_threats,
                 show_threats: self.ui.library.show_threats,
+                settings: &self.ui.settings,
             },
         );
 

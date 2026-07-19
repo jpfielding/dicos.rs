@@ -18,15 +18,23 @@ mod ebcot;
 // TODO(t800): wired in tier-2 (packet/tier-1 pipeline consumes these).
 #[allow(dead_code)]
 mod geometry;
+// Frozen v1.0.0 raw-DWT tile pipeline; still what public encode/decode route
+// through (codestream rewiring is Workstream 1 step 9).
+mod legacy;
 #[allow(dead_code)]
 mod markers;
 #[allow(dead_code)]
 mod mq;
+// TODO(t800): conformant tier-2 packet-header codec; wired in step 9.
+#[allow(dead_code)]
+mod packet;
 #[allow(dead_code)]
 mod rct;
 // TODO(t800): wired in tier-2 (packet-header codec consumes this).
 #[allow(dead_code)]
 mod tagtree;
+// TODO(t800): conformant DWT/geometry/EBCOT/packet pipeline; wired in step 9.
+#[allow(dead_code)]
 mod tile;
 
 pub use codestream::{decode, encode};

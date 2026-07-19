@@ -8,8 +8,8 @@ use std::io::Write;
 use crate::error::CodecError;
 
 use crate::bitstream::{ByteReader, ByteWriter};
+use crate::legacy::{TileDecoder, TileEncoder};
 use crate::markers::*;
-use crate::tile::{TileDecoder, TileEncoder};
 use crate::Jpeg2kOptions;
 
 // ---------------------------------------------------------------------------

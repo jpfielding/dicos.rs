@@ -49,8 +49,8 @@ each crate's README for the full support matrix.
 | Codec | Conformant profile | Verified against |
 |-------|--------------------|------------------|
 | **pure_jpeg2k** | T.800 lossless codestreams: 1 tile, 1 component (unsigned 16-bit), reversible 5/3 DWT, LRCP, 1 layer, `cb_style=0`, zero grid origins. Everything else legal-but-unsupported is rejected via a validated support matrix. v1.0.0 / Go raw-DWT files remain decodable through `LegacyPolicy` (`Auto` by default; the dicos registry adapter uses `StandardOnly`). | **OpenJPEG** (`opj_compress`/`opj_decompress`), both directions, in CI |
-| **pure_jpegls** | T.87 single-component, `ILV=0`, LSE ID=1 presets honored, run mode, near-lossless. `DRI`/restart markers and `Nf≠1`/`ILV≠0` are rejected as `Unsupported`. `Profile::LegacyGo` reproduces the frozen 1.0.0 / Go-compatible bytes. | **CharLS** `.jls` fixtures (incl. an LSE-bearing stream) |
-| **pure_jpegli** | T.81 Process 14 SV1: predictors 1–7, point transform, restart intervals (row-aligned per H.1.1). | **libjpeg-turbo ≥ 3.0** (`cjpeg -lossless` / `djpeg`) |
+| **pure_jpegls** | T.87 single-component, `ILV=0`, LSE ID=1 presets honored, run mode, near-lossless. `DRI`/restart markers and `Nf≠1`/`ILV≠0` are rejected as `Unsupported`. `Profile::LegacyGo` reproduces the frozen 1.0.0 / Go-compatible bytes. | Round-trip + a **CharLS** decode harness (`tests/interop.rs`); the harness self-skips until `.jls` fixtures are supplied — see its README for the generation commands |
+| **pure_jpegli** | T.81 Process 14 lossless: default selection value 1 (SV1), predictors 1–7 selectable, point transform, restart intervals (row-aligned per H.1.1). | **libjpeg-turbo ≥ 3.0** (`cjpeg -lossless` / `djpeg`), both directions |
 | **pure_jpegrle** | DICOM Part 5 §8.1.1 PackBits RLE; 16-bit split into high/low byte segments. | Round-trip + DICOM fixtures |
 
 ### dicosctl -- CLI Inspector
@@ -219,17 +219,17 @@ including architecture, rendering pipeline, and GPU requirements.
 
 ## Test Results
 
-Run `cargo test --workspace` to reproduce. Current counts:
+Run `cargo test --workspace --all-features` to reproduce. Current counts:
 
 ```
-dicos:  115 passed, 0 failed
+dicos:  120 passed, 0 failed
 roxel:   57 passed, 0 failed
-jpeg2k: 137 passed, 0 failed
-jpegli:  90 passed, 0 failed
-jpegls:  86 passed, 0 failed
+jpeg2k: 140 passed, 0 failed
+jpegli:  95 passed, 0 failed
+jpegls:  92 passed, 0 failed
 jpegrle: 32 passed, 0 failed
 ---------------------------------
-Total:  517 passed, 0 failed, 0 ignored
+Total:  536 passed, 0 failed, 0 ignored
 ```
 
 ## References

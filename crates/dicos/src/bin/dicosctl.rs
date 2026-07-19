@@ -164,6 +164,8 @@ fn element_to_json(elem: &dicos::types::Element) -> JsonValue {
             "Encapsulated": pd.is_compressed(),
             "Frames": pd.num_frames(),
         }),
+        // `Value` is #[non_exhaustive]; future variants render generically.
+        _ => json!({ "vr": vr_str }),
     }
 }
 

@@ -12,6 +12,7 @@ use crate::vr::Vr;
 
 /// A typed value stored in a DICOM/DICOS data element.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// Single string value.
     Str(String),
@@ -371,6 +372,7 @@ impl fmt::Display for Dataset {
 /// In native format, each frame stores decoded pixel values.
 /// In encapsulated format, each frame stores a compressed bitstream item.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum PixelData {
     /// Native uncompressed pixel data.
     Native {

@@ -22,6 +22,7 @@ Files written by 1.0.0 remain decodable (see the jpeg2k / jpegls rows below).
 | `Dataset::pixel_representation()` | `u16`, defaulted to `0` | `Option<u16>` | `ds.pixel_representation().unwrap_or(0)` to keep the old fallback. |
 | `Dataset::number_of_frames()` | `u32`, default `1` | **unchanged** — `u32`, default `1` | No change; the `1` default is DICOM-defined (absent = single frame). |
 | `Element` fields | public | **unchanged** — still public | No change. `vr`/`value` coherence is now documented as the caller's responsibility. |
+| `Value` / `PixelData` enums | exhaustive | `#[non_exhaustive]` | Add a wildcard `_ => …` arm to any `match` on these outside the `dicos` crate so future variants don't break compilation. |
 | Root re-exports | `Codec`, `CodecError`, `GrayImage` | adds `Dataset`, `Element`, `Value`, `PixelData`, `Tag`, `Vr`, `parse`, `parse_with_limit`, `parse_with_warnings`, `parse_with_warnings_and_limit`, `ParseWarning`, `DicosError`, `write` | Prefer `dicos::Dataset` etc. over the fully-qualified module paths. |
 
 ### PR A4 — Codec registry
@@ -55,7 +56,7 @@ Files written by 1.0.0 remain decodable (see the jpeg2k / jpegls rows below).
 | Area | 1.x | 2.0 | How to migrate |
 | --- | --- | --- | --- |
 | Codestream conformance | emitted **raw DWT coefficients**, not JPEG 2000 (no entropy coding, unreadable by any conformant decoder) | emits **real ITU-T T.800** lossless codestreams (EBCOT + MQ), single tile, single unsigned-16-bit component, LRCP, 1 layer; verified against OpenJPEG both directions | New output is a genuine `.j2c`. Downstream tools that only accepted the old raw format must be updated (they never accepted anything standard before). |
-| Reading 1.0.0 / Go files | that was the only format | `decode()` uses `DecodeOptions { legacy: LegacyPolicy::Auto }` — standard decode first, legacy fingerprint fallback. `LegacyOnly` / `StandardOnly` also available. | No change for `decode()`. To refuse legacy silently-ambiguous data, pass `LegacyPolicy::StandardOnly`. |
+| Reading 1.0.0 / Go files | that was the only format | `decode()` uses `DecodeOptions { legacy: LegacyPolicy::Auto }`. `Auto` fingerprints the QCD first: a conformant reversible 16-bit stream can never carry all-zero quantization exponents, so that signature unambiguously identifies a legacy raw-DWT payload and only then is the legacy decoder used; everything else decodes as standard T.800. `LegacyOnly` / `StandardOnly` also available. | No change for `decode()`. To refuse any legacy payload, pass `LegacyPolicy::StandardOnly`. |
 | Registry adapter | n/a | the `dicos` registry adapter decodes with `LegacyPolicy::StandardOnly` (a legacy stream under the standard transfer-syntax UID is a collision risk) | For legacy archives, decode via the codec crate directly with `LegacyPolicy::Auto`/`LegacyOnly`. |
 | Support matrix | silent on unsupported features | multiple tiles/components, non-16-bit or signed precision, MCT ≠ 0, progression ≠ LRCP, layers ≠ 1, `cb_style ≠ 0`, transform ≠ 5/3, non-zero origins, and `POC/COC/QCC/PPM/PPT/PLM/PLT`, `SOP/EPH` all return `CodecError::Unsupported` | Handle these categories out of band; they were never decoded correctly before. |
 

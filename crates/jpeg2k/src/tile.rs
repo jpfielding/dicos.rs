@@ -119,6 +119,7 @@ impl TileDecoder {
 
     /// Return the byte length consumed by a tile component's data block,
     /// given the tile data starting at the header.
+    #[allow(dead_code)] // TODO(t800): legacy tile helper, used by tests only
     pub fn tile_data_len(data: &[u8]) -> Result<usize, CodecError> {
         if data.len() < 4 {
             return Err(CodecError::InvalidData(

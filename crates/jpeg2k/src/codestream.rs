@@ -324,6 +324,8 @@ pub fn encode(
     options: &Jpeg2kOptions,
     w: &mut dyn Write,
 ) -> Result<(), CodecError> {
+    options.validate()?;
+
     let width = img_width as usize;
     let height = img_height as usize;
     let expected = width * height;
@@ -646,6 +648,47 @@ mod tests {
         encode(&pixels, 2, 2, &opts, &mut buf).unwrap();
         let (decoded, _, _) = decode(&buf, 2, 2).unwrap();
         assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn encode_rejects_multi_tile_options() {
+        let pixels = make_test_pixels(8, 8, |_, _| 100);
+        let opts = Jpeg2kOptions {
+            tile_width: 4,
+            tile_height: 4,
+            ..Jpeg2kOptions::default()
+        };
+        let mut buf = Vec::new();
+        let err = encode(&pixels, 8, 8, &opts, &mut buf).unwrap_err();
+        assert!(matches!(err, CodecError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn encode_rejects_out_of_range_cb_exp() {
+        let pixels = make_test_pixels(8, 8, |_, _| 100);
+        let opts = Jpeg2kOptions {
+            cb_width_exp: 11,
+            ..Jpeg2kOptions::default()
+        };
+        let mut buf = Vec::new();
+        assert!(encode(&pixels, 8, 8, &opts, &mut buf).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_cb_exp_sum_over_12() {
+        let pixels = make_test_pixels(8, 8, |_, _| 100);
+        let opts = Jpeg2kOptions {
+            cb_width_exp: 8,
+            cb_height_exp: 8,
+            ..Jpeg2kOptions::default()
+        };
+        let mut buf = Vec::new();
+        assert!(encode(&pixels, 8, 8, &opts, &mut buf).is_err());
+    }
+
+    #[test]
+    fn default_options_pass_validation() {
+        assert!(Jpeg2kOptions::default().validate().is_ok());
     }
 
     #[test]

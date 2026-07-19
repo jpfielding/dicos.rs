@@ -330,21 +330,31 @@ impl MqState {
 /// Total number of MQ contexts used by EBCOT tier-1.
 pub const NUM_MQ_CONTEXTS: usize = 19;
 
+/// First zero-coding (significance) context. Contexts `0..=8`.
+pub const CTX_ZC_START: usize = 0;
+
+/// First sign-coding context. Contexts `9..=13`.
+pub const CTX_SC_START: usize = 9;
+
+/// First magnitude-refinement context. Contexts `14..=16`.
+pub const CTX_MR_START: usize = 14;
+
+/// Context index for run-length (cleanup) coding (EBCOT).
+pub const CTX_RUN_LENGTH: usize = 17;
+
 /// Context index for the uniform distribution (EBCOT).
 pub const CTX_UNIFORM: usize = 18;
 
-/// Context index for run-length coding (EBCOT).
-pub const CTX_RUN_LENGTH: usize = 17;
-
-/// Context index for magnitude refinement.
-pub const CTX_MAG_REF: usize = 15;
-
-/// Context index for sign coding.
-pub const CTX_SIGN_START: usize = 9;
-
-/// Allocate and initialize the default EBCOT context array.
+/// Allocate and initialize the default EBCOT context array (T.800 Annex D).
+///
+/// All contexts start at MQ table state `0` with MPS `0`, except:
+/// - the all-insignificant zero-coding context (`CTX_ZC_START`) → state `4`;
+/// - the run-length context (`CTX_RUN_LENGTH`) → state `3`;
+/// - the uniform context (`CTX_UNIFORM`) → state `46`.
 pub fn setup_default_contexts() -> Vec<MqState> {
     let mut contexts: Vec<MqState> = (0..NUM_MQ_CONTEXTS).map(|_| MqState::new()).collect();
+    contexts[CTX_ZC_START] = MqState { index: 4, mps: 0 };
+    contexts[CTX_RUN_LENGTH] = MqState { index: 3, mps: 0 };
     contexts[CTX_UNIFORM] = MqState::uniform();
     contexts
 }
@@ -541,6 +551,8 @@ impl<'a> MqDecoder<'a> {
         self.a = 0x8000;
     }
 
+    /// Read and consume the next byte, or the synthetic `0xFF` past end-of-data
+    /// (without advancing the cursor, so it cannot underflow).
     fn next_byte(&mut self) -> u8 {
         if self.pos >= self.data.len() {
             return 0xFF;
@@ -550,20 +562,43 @@ impl<'a> MqDecoder<'a> {
         b
     }
 
+    /// Peek the next byte without consuming it (synthetic `0xFF` past EOF).
+    fn peek_byte(&self) -> u8 {
+        if self.pos >= self.data.len() {
+            0xFF
+        } else {
+            self.data[self.pos]
+        }
+    }
+
+    /// BYTEIN procedure (T.800 C.3.4, Figure C.19).
     fn get_byte(&mut self) {
         if self.b == 0xFF {
-            let b = self.next_byte();
-            if b > 0x8F {
-                self.pos -= 1;
+            let b1 = self.peek_byte();
+            if b1 > 0x8F {
+                // Marker segment reached (or end-of-data, treated identically):
+                // the pointer stays at the marker and 1-bits are fed by adding
+                // 0xFF00 into C. This is the fix over the previous code, which
+                // decremented `pos` (underflowing on empty input) and omitted
+                // the `C += 0xFF00` term.
+                self.c = self.c.wrapping_add(0xFF00);
                 self.t = 8;
             } else {
-                self.b = b;
-                self.c = self.c.wrapping_add((self.b as u32) << 9);
+                // Stuffed byte after 0xFF: only 7 usable bits.
+                self.pos += 1;
+                self.b = b1;
+                self.c = self.c.wrapping_add((b1 as u32) << 9);
                 self.t = 7;
             }
         } else {
-            self.b = self.next_byte();
-            self.c = self.c.wrapping_add((self.b as u32) << 8);
+            let b1 = self.peek_byte();
+            // Advance only when a real byte is present; at end-of-data this
+            // leaves `pos == len` and feeds the synthetic 0xFF next round.
+            if self.pos < self.data.len() {
+                self.pos += 1;
+            }
+            self.b = b1;
+            self.c = self.c.wrapping_add((b1 as u32) << 8);
             self.t = 8;
         }
     }
@@ -777,5 +812,111 @@ mod tests {
 
         enc.reset();
         assert!(enc.bytes().is_empty());
+    }
+
+    #[test]
+    fn mq_initial_context_states() {
+        // T.800 Annex D initialization.
+        let ctx = setup_default_contexts();
+        assert_eq!(ctx.len(), NUM_MQ_CONTEXTS);
+        for (i, state) in ctx.iter().enumerate() {
+            let expected = match i {
+                CTX_ZC_START => 4,
+                CTX_RUN_LENGTH => 3,
+                CTX_UNIFORM => 46,
+                _ => 0,
+            };
+            assert_eq!(state.index, expected, "context {i} initial state");
+            assert_eq!(state.mps, 0, "context {i} initial MPS");
+        }
+    }
+
+    /// Encode `(ctx, bit)` pairs, then decode and compare.
+    fn roundtrip(seq: &[(usize, u8)]) {
+        let mut ctx_enc = setup_default_contexts();
+        let mut enc = MqEncoder::new();
+        for &(c, bit) in seq {
+            enc.encode(bit, &mut ctx_enc[c]);
+        }
+        enc.flush();
+        let encoded = enc.into_bytes();
+
+        let mut ctx_dec = setup_default_contexts();
+        let mut dec = MqDecoder::new(&encoded);
+        for (i, &(c, expected)) in seq.iter().enumerate() {
+            assert_eq!(dec.decode(&mut ctx_dec[c]), expected, "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn mq_roundtrip_all_zeros_all_contexts() {
+        let seq: Vec<(usize, u8)> = (0..NUM_MQ_CONTEXTS)
+            .flat_map(|c| (0..500).map(move |_| (c, 0u8)))
+            .collect();
+        roundtrip(&seq);
+    }
+
+    #[test]
+    fn mq_roundtrip_all_ones_all_contexts() {
+        let seq: Vec<(usize, u8)> = (0..NUM_MQ_CONTEXTS)
+            .flat_map(|c| (0..500).map(move |_| (c, 1u8)))
+            .collect();
+        roundtrip(&seq);
+    }
+
+    #[test]
+    fn mq_roundtrip_alternating_all_contexts() {
+        let seq: Vec<(usize, u8)> = (0..10_000)
+            .map(|i| (i % NUM_MQ_CONTEXTS, (i % 2) as u8))
+            .collect();
+        roundtrip(&seq);
+    }
+
+    #[test]
+    fn mq_roundtrip_random_10k_all_contexts() {
+        // Deterministic LCG over 10k symbols spread across all 19 contexts.
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut seq = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let c = ((rng >> 40) as usize) % NUM_MQ_CONTEXTS;
+            let bit = ((rng >> 33) & 1) as u8;
+            seq.push((c, bit));
+        }
+        roundtrip(&seq);
+    }
+
+    #[test]
+    fn mq_decode_truncated_stream_no_panic() {
+        // Encode a stream, then feed every truncation of it to the decoder and
+        // pull more symbols than were encoded. Must never panic or underflow.
+        let mut ctx_enc = setup_default_contexts();
+        let mut enc = MqEncoder::new();
+        let mut rng = 0x1234_5678u32;
+        for _ in 0..2_000 {
+            rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+            let c = ((rng >> 20) as usize) % NUM_MQ_CONTEXTS;
+            let bit = ((rng >> 16) & 1) as u8;
+            enc.encode(bit, &mut ctx_enc[c]);
+        }
+        enc.flush();
+        let encoded = enc.into_bytes();
+
+        for cut in 0..=encoded.len() {
+            let mut ctx_dec = setup_default_contexts();
+            let mut dec = MqDecoder::new(&encoded[..cut]);
+            for i in 0..3_000 {
+                let _ = dec.decode(&mut ctx_dec[i % NUM_MQ_CONTEXTS]);
+            }
+        }
+    }
+
+    #[test]
+    fn mq_decode_empty_stream_no_panic() {
+        let mut ctx = setup_default_contexts();
+        let mut dec = MqDecoder::new(&[]);
+        for i in 0..1_000 {
+            let _ = dec.decode(&mut ctx[i % NUM_MQ_CONTEXTS]);
+        }
     }
 }

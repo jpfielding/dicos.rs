@@ -1,17 +1,25 @@
-#![allow(dead_code)]
 //! JPEG 2000 Part-1 lossless codec (ITU-T T.800).
 //!
 //! Implements reversible 5/3 DWT, EBCOT tier-1/tier-2 coding,
 //! and MQ arithmetic coding for lossless image compression.
 
+use crate::error::CodecError;
+
 pub mod error;
 
+// TODO(t800): drop these `dead_code` allows as the conformant tier-1/tier-2
+// pipeline (packet/geometry/tagtree + EBCOT rewrite) wires these modules in.
+#[allow(dead_code)]
 mod bitstream;
 mod codestream;
 mod dwt;
+#[allow(dead_code)]
 mod ebcot;
+#[allow(dead_code)]
 mod markers;
+#[allow(dead_code)]
 mod mq;
+#[allow(dead_code)]
 mod rct;
 mod tile;
 
@@ -41,6 +49,48 @@ impl Default for Jpeg2kOptions {
             cb_height_exp: 6,
             num_decomp_levels: 5,
         }
+    }
+}
+
+impl Jpeg2kOptions {
+    /// Validate the options against the supported T.800 profile.
+    ///
+    /// - Code-block width/height exponents must each be in `2..=10` and their
+    ///   sum must not exceed `12` (T.800 Table A.18).
+    /// - Decomposition levels must not exceed `32`.
+    /// - Tiling is not supported: both `tile_width` and `tile_height` must be
+    ///   `0` (single tile spanning the whole image).
+    pub fn validate(&self) -> Result<(), CodecError> {
+        if !(2..=10).contains(&self.cb_width_exp) {
+            return Err(CodecError::InvalidData(format!(
+                "cb_width_exp {} out of range 2..=10 (T.800 Table A.18)",
+                self.cb_width_exp
+            )));
+        }
+        if !(2..=10).contains(&self.cb_height_exp) {
+            return Err(CodecError::InvalidData(format!(
+                "cb_height_exp {} out of range 2..=10 (T.800 Table A.18)",
+                self.cb_height_exp
+            )));
+        }
+        if self.cb_width_exp + self.cb_height_exp > 12 {
+            return Err(CodecError::InvalidData(format!(
+                "cb_width_exp + cb_height_exp = {} exceeds 12 (T.800 Table A.18)",
+                self.cb_width_exp + self.cb_height_exp
+            )));
+        }
+        if self.num_decomp_levels > 32 {
+            return Err(CodecError::InvalidData(format!(
+                "num_decomp_levels {} exceeds 32",
+                self.num_decomp_levels
+            )));
+        }
+        if self.tile_width != 0 || self.tile_height != 0 {
+            return Err(CodecError::Unsupported(
+                "multi-tile encoding not supported".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -5,8 +5,8 @@
 //! using the MQ arithmetic coder.
 
 use crate::mq::{
-    setup_default_contexts, MqDecoder, MqEncoder, MqState, CTX_MAG_REF, CTX_RUN_LENGTH,
-    CTX_SIGN_START, CTX_UNIFORM,
+    setup_default_contexts, MqDecoder, MqEncoder, MqState, CTX_MR_START, CTX_RUN_LENGTH,
+    CTX_SC_START, CTX_UNIFORM,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ impl CodeBlockEncoder {
                     } else {
                         0u8
                     };
-                    self.mq.encode(sign_bit, &mut self.contexts[CTX_SIGN_START]);
+                    self.mq.encode(sign_bit, &mut self.contexts[CTX_SC_START]);
                 }
             }
         }
@@ -134,7 +134,7 @@ impl CodeBlockEncoder {
 
                 let abs_val = data[y * self.width + x].unsigned_abs();
                 let bit = if (abs_val & mask) != 0 { 1u8 } else { 0u8 };
-                self.mq.encode(bit, &mut self.contexts[CTX_MAG_REF]);
+                self.mq.encode(bit, &mut self.contexts[CTX_MR_START]);
             }
         }
     }
@@ -290,7 +290,7 @@ impl<'a> CodeBlockDecoder<'a> {
                 if sig == 1 {
                     self.sigma[idx] = 1;
                     coeffs[y * self.width + x] |= mask;
-                    signs[y * self.width + x] = self.mq.decode(&mut self.contexts[CTX_SIGN_START]);
+                    signs[y * self.width + x] = self.mq.decode(&mut self.contexts[CTX_SC_START]);
                 }
             }
         }
@@ -306,7 +306,7 @@ impl<'a> CodeBlockDecoder<'a> {
                 if self.sigma_snapshot[idx] == 0 {
                     continue;
                 }
-                let bit = self.mq.decode(&mut self.contexts[CTX_MAG_REF]);
+                let bit = self.mq.decode(&mut self.contexts[CTX_MR_START]);
                 if bit == 1 {
                     coeffs[y * self.width + x] |= mask;
                 }

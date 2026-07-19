@@ -8,6 +8,18 @@
 //! - `jpegls` -- JPEG-LS
 //! - `jpegli` -- JPEG Lossless (Process 14, SV1)
 //! - `jpeg2k` -- JPEG 2000
+//!
+//! # UID binding invariant
+//!
+//! Registry encodes always use each codec's **defaults** (predictor 1 for
+//! JPEG Lossless, the T.87 profile for JPEG-LS, no restart intervals, the
+//! default JPEG 2000 options). A DICOM Transfer Syntax UID encodes a specific
+//! compression mode -- for example `1.2.840.10008.1.2.4.70` (JPEG Lossless
+//! SV1) means predictor 1 specifically -- so pinning the registry to defaults
+//! keeps every [`Codec::transfer_syntax_uid`] value truthful for the bytes it
+//! actually produces. Callers that need non-default codec options must use the
+//! individual codec crates directly and take responsibility for advertising a
+//! matching transfer syntax.
 
 use crate::codec::Codec;
 
@@ -17,123 +29,132 @@ use crate::codec::Codec;
     feature = "jpegli",
     feature = "jpeg2k"
 ))]
-use {crate::error::CodecError, crate::img::GrayImage, crate::transfer, std::io::Write};
+use crate::transfer;
 
 // ---------------------------------------------------------------------------
-// Codec adapter structs -- bridge raw codec crate APIs to the Codec trait
+// Codec adapter macro -- bridges a raw codec crate API to the `Codec` trait.
+//
+// `encode` is a parameterized arm so that backends with extra arguments (such
+// as jpeg2k's options) can be expressed inline. Backend errors map to
+// `CodecError::Backend { codec, source }`, preserving the original error via
+// `std::error::Error::source` instead of flattening to a string. The decoded
+// pixel count is captured **before** the `GrayImage::from_data` move so a
+// `DimensionMismatch` reports the real length.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "rle")]
-struct RleAdapter;
+macro_rules! codec_adapter {
+    (
+        struct $adapter:ident;
+        display = $name:literal;
+        transfer_syntax = $ts:expr;
+        encode = |$pixels:ident, $width:ident, $height:ident, $writer:ident| $encode:expr;
+        decode = $decode:path;
+    ) => {
+        struct $adapter;
+
+        impl crate::codec::Codec for $adapter {
+            fn encode(
+                &self,
+                img: &crate::img::GrayImage<u16>,
+                w: &mut dyn std::io::Write,
+            ) -> Result<(), crate::error::CodecError> {
+                let $pixels = img.data();
+                let $width = img.width();
+                let $height = img.height();
+                let $writer: &mut dyn std::io::Write = w;
+                $encode.map_err(|e| crate::error::CodecError::Backend {
+                    codec: $name,
+                    source: Box::new(e),
+                })
+            }
+
+            fn decode(
+                &self,
+                data: &[u8],
+                width: u32,
+                height: u32,
+            ) -> Result<crate::img::GrayImage<u16>, crate::error::CodecError> {
+                let (pixels, out_w, out_h) = $decode(data, width, height).map_err(|e| {
+                    crate::error::CodecError::Backend {
+                        codec: $name,
+                        source: Box::new(e),
+                    }
+                })?;
+                // Capture the real length before `pixels` is moved into the image.
+                let actual = pixels.len();
+                crate::img::GrayImage::from_data(out_w, out_h, pixels).ok_or(
+                    crate::error::CodecError::DimensionMismatch {
+                        expected: (out_w as usize) * (out_h as usize),
+                        actual,
+                    },
+                )
+            }
+
+            fn name(&self) -> &str {
+                $name
+            }
+
+            fn transfer_syntax_uid(&self) -> &str {
+                $ts
+            }
+        }
+    };
+}
 
 #[cfg(feature = "rle")]
-impl Codec for RleAdapter {
-    fn encode(&self, img: &GrayImage<u16>, w: &mut dyn Write) -> Result<(), CodecError> {
-        jpegrle::encode(&img.data, img.width, img.height, w)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))
-    }
-
-    fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<GrayImage<u16>, CodecError> {
-        let (pixels, w, h) = jpegrle::decode(data, width, height)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))?;
-        GrayImage::from_data(w, h, pixels).ok_or_else(|| CodecError::DimensionMismatch {
-            expected: (w as usize) * (h as usize),
-            actual: 0,
-        })
-    }
-
-    fn name(&self) -> &str {
-        "RLE"
-    }
-
-    fn transfer_syntax_uid(&self) -> &str {
-        jpegrle::TRANSFER_SYNTAX_UID
-    }
+codec_adapter! {
+    struct RleAdapter;
+    display = "RLE";
+    transfer_syntax = jpegrle::TRANSFER_SYNTAX_UID;
+    encode = |pixels, width, height, writer| jpegrle::encode(pixels, width, height, writer);
+    decode = jpegrle::decode;
 }
 
 #[cfg(feature = "jpegls")]
-struct JpegLsAdapter;
-
-#[cfg(feature = "jpegls")]
-impl Codec for JpegLsAdapter {
-    fn encode(&self, img: &GrayImage<u16>, w: &mut dyn Write) -> Result<(), CodecError> {
-        jpegls::encode(&img.data, img.width, img.height, w)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))
-    }
-
-    fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<GrayImage<u16>, CodecError> {
-        let (pixels, w, h) = jpegls::decode(data, width, height)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))?;
-        GrayImage::from_data(w, h, pixels).ok_or_else(|| CodecError::DimensionMismatch {
-            expected: (w as usize) * (h as usize),
-            actual: 0,
-        })
-    }
-
-    fn name(&self) -> &str {
-        "JPEG-LS"
-    }
-
-    fn transfer_syntax_uid(&self) -> &str {
-        jpegls::TRANSFER_SYNTAX_UID
-    }
+codec_adapter! {
+    struct JpegLsAdapter;
+    display = "JPEG-LS";
+    transfer_syntax = jpegls::TRANSFER_SYNTAX_UID;
+    encode = |pixels, width, height, writer| jpegls::encode(pixels, width, height, writer);
+    decode = jpegls::decode;
 }
 
 #[cfg(feature = "jpegli")]
-struct JpegLiAdapter;
+codec_adapter! {
+    struct JpegLiAdapter;
+    display = "JPEG Lossless";
+    transfer_syntax = jpegli::TRANSFER_SYNTAX_UID;
+    encode = |pixels, width, height, writer| jpegli::encode(pixels, width, height, writer);
+    decode = jpegli::decode;
+}
 
-#[cfg(feature = "jpegli")]
-impl Codec for JpegLiAdapter {
-    fn encode(&self, img: &GrayImage<u16>, w: &mut dyn Write) -> Result<(), CodecError> {
-        jpegli::encode(&img.data, img.width, img.height, w)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))
-    }
-
-    fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<GrayImage<u16>, CodecError> {
-        let (pixels, w, h) = jpegli::decode(data, width, height)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))?;
-        GrayImage::from_data(w, h, pixels).ok_or_else(|| CodecError::DimensionMismatch {
-            expected: (w as usize) * (h as usize),
-            actual: 0,
-        })
-    }
-
-    fn name(&self) -> &str {
-        "JPEG Lossless"
-    }
-
-    fn transfer_syntax_uid(&self) -> &str {
-        jpegli::TRANSFER_SYNTAX_UID
-    }
+/// Registry decodes of transfer-syntax-tagged pixel data are untrusted input,
+/// so the legacy raw-DWT fallback is disabled here (`StandardOnly`): a
+/// corrupted conformant stream must not be reinterpreted as legacy
+/// coefficients under the same UID. Callers with pre-2.0 archives should
+/// decode those frames directly via `jpeg2k::decode` (its default `Auto`
+/// policy fingerprints the legacy format).
+#[cfg(feature = "jpeg2k")]
+fn jpeg2k_decode_standard(
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(Vec<u16>, u32, u32), jpeg2k::error::CodecError> {
+    let mut opts = jpeg2k::DecodeOptions::default();
+    opts.legacy = jpeg2k::LegacyPolicy::StandardOnly;
+    jpeg2k::decode_with_options(data, width, height, opts)
 }
 
 #[cfg(feature = "jpeg2k")]
-struct Jpeg2kAdapter;
-
-#[cfg(feature = "jpeg2k")]
-impl Codec for Jpeg2kAdapter {
-    fn encode(&self, img: &GrayImage<u16>, w: &mut dyn Write) -> Result<(), CodecError> {
+codec_adapter! {
+    struct Jpeg2kAdapter;
+    display = "JPEG 2000";
+    transfer_syntax = jpeg2k::TRANSFER_SYNTAX_UID;
+    encode = |pixels, width, height, writer| {
         let opts = jpeg2k::Jpeg2kOptions::default();
-        jpeg2k::encode(&img.data, img.width, img.height, &opts, w)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))
-    }
-
-    fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<GrayImage<u16>, CodecError> {
-        let (pixels, w, h) = jpeg2k::decode(data, width, height)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))?;
-        GrayImage::from_data(w, h, pixels).ok_or_else(|| CodecError::DimensionMismatch {
-            expected: (w as usize) * (h as usize),
-            actual: 0,
-        })
-    }
-
-    fn name(&self) -> &str {
-        "JPEG 2000"
-    }
-
-    fn transfer_syntax_uid(&self) -> &str {
-        jpeg2k::TRANSFER_SYNTAX_UID
-    }
+        jpeg2k::encode(pixels, width, height, &opts, writer)
+    };
+    decode = jpeg2k_decode_standard;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,10 +225,17 @@ pub fn codec_for_transfer_syntax(ts_uid: &str) -> Option<&'static dyn Codec> {
 
 /// Attempts to identify the codec from the leading bytes of compressed data.
 ///
-/// This is a best-effort heuristic that checks magic bytes:
-/// - JPEG-LS / JPEG Lossless: starts with `FF D8`
-/// - JPEG 2000: starts with `FF 4F` (codestream) or `00 00 00 0C 6A 50` (JP2 box)
-/// - RLE: checked last if JPEG signatures do not match
+/// Signature-based detection only:
+/// - JPEG 2000: the codestream SOC marker `FF 4F`. The JP2 box format is
+///   intentionally **not** recognized -- the decoder is codestream-only, so
+///   sniffing a JP2 box would select a decoder that cannot decode it.
+/// - JPEG-LS / JPEG Lossless: a structured JPEG marker walk from the `FF D8`
+///   SOI to the first Start-Of-Frame marker (`FF F7` SOF55 → JPEG-LS,
+///   `FF C3` SOF3 → JPEG Lossless). The walk skips length-prefixed segments
+///   (APPn, COM, etc.) and stops at SOS; malformed structure yields `None`.
+///
+/// RLE has no reliable signature and is therefore never sniffed -- it must be
+/// selected via its transfer syntax.
 ///
 /// Returns `None` if the data cannot be identified or the corresponding
 /// feature is not enabled.
@@ -216,68 +244,83 @@ pub fn sniff_codec(data: &[u8]) -> Option<&'static dyn Codec> {
         return None;
     }
 
-    // JPEG 2000 codestream: starts with FF 4F
+    // JPEG 2000 codestream: SOC marker FF 4F.
     #[cfg(feature = "jpeg2k")]
     if data[0] == 0xFF && data[1] == 0x4F {
         return Some(&JPEG2K_CODEC);
     }
 
-    // JPEG 2000 JP2 box format: 00 00 00 0C 6A 50
-    #[cfg(feature = "jpeg2k")]
-    if data.len() >= 6
-        && data[0] == 0x00
-        && data[1] == 0x00
-        && data[2] == 0x00
-        && data[3] == 0x0C
-        && data[4] == 0x6A
-        && data[5] == 0x50
-    {
-        return Some(&JPEG2K_CODEC);
-    }
-
-    // JPEG-LS / JPEG Lossless: SOF markers appear in the header, so limit
-    // the scan to the first 4 KB to avoid scanning multi-MB frames. Only used
-    // when the jpegls/jpegli codec features are enabled.
-    #[allow(unused_variables)]
-    let probe_end = data.len().min(4096);
-
-    // JPEG-LS: starts with FF D8, then SOF55 marker (FF F7)
-    #[cfg(feature = "jpegls")]
-    if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
-        for i in 2..probe_end.saturating_sub(1) {
-            if data[i] == 0xFF && data[i + 1] == 0xF7 {
-                return Some(&JPEGLS_CODEC);
-            }
-        }
-    }
-
-    // JPEG Lossless: starts with FF D8, then SOF3 marker (FF C3)
-    #[cfg(feature = "jpegli")]
-    if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
-        for i in 2..probe_end.saturating_sub(1) {
-            if data[i] == 0xFF && data[i + 1] == 0xC3 {
-                return Some(&JPEGLI_CODEC);
-            }
-        }
-    }
-
-    // RLE: no reliable magic bytes, but if nothing else matched and data is
-    // large enough for the RLE segment header (64 bytes), try RLE.
-    #[cfg(feature = "rle")]
-    if data.len() >= 64 {
-        // RLE header starts with number of segments (1-15) as u32 LE
-        let num_segments = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        if (1..=15).contains(&num_segments) {
-            return Some(&RLE_CODEC);
-        }
+    // JPEG family (SOI = FF D8): structured marker walk to the first SOF.
+    #[cfg(any(feature = "jpegls", feature = "jpegli"))]
+    if data[0] == 0xFF && data[1] == 0xD8 {
+        return sniff_jpeg_sof(data);
     }
 
     None
 }
 
-/// Decode a single compressed frame using the transfer syntax to select the codec.
+/// Walks JPEG marker segments from the SOI to the first Start-Of-Frame marker.
 ///
-/// Falls back to sniffing the data if the transfer syntax is not recognized.
+/// Returns the codec matching the SOF (`FF F7` → JPEG-LS, `FF C3` → JPEG
+/// Lossless), or `None` if SOS is reached first or the marker structure is
+/// malformed. The walk is bounded by the buffer length; it does not scan the
+/// entropy-coded body.
+#[cfg(any(feature = "jpegls", feature = "jpegli"))]
+fn sniff_jpeg_sof(data: &[u8]) -> Option<&'static dyn Codec> {
+    // Start just past the SOI marker.
+    let mut i = 2;
+    loop {
+        // Every segment begins with a 0xFF marker prefix (possibly repeated as
+        // fill bytes). Anything else means the structure is malformed.
+        if i >= data.len() || data[i] != 0xFF {
+            return None;
+        }
+        while i < data.len() && data[i] == 0xFF {
+            i += 1;
+        }
+        if i >= data.len() {
+            return None;
+        }
+        let marker = data[i];
+        i += 1;
+
+        match marker {
+            // Standalone markers with no length payload: TEM, RSTn, SOI, EOI.
+            0x01 | 0xD0..=0xD9 => continue,
+            // Start of Scan: the frame header is behind us; no SOF was found.
+            0xDA => return None,
+            // SOF3 -- JPEG Lossless.
+            #[cfg(feature = "jpegli")]
+            0xC3 => return Some(&JPEGLI_CODEC),
+            // SOF55 -- JPEG-LS.
+            #[cfg(feature = "jpegls")]
+            0xF7 => return Some(&JPEGLS_CODEC),
+            // Any other marker carries a 2-byte big-endian length (which
+            // includes the two length bytes). Skip the whole segment.
+            _ => {
+                if i + 1 >= data.len() {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+                if seg_len < 2 {
+                    return None;
+                }
+                i = match i.checked_add(seg_len) {
+                    Some(n) if n <= data.len() => n,
+                    _ => return None,
+                };
+            }
+        }
+    }
+}
+
+/// Decode a single compressed frame, selecting the codec by transfer syntax.
+///
+/// An unknown or unsupported transfer syntax always yields
+/// [`DicosError::UnsupportedTransferSyntax`](crate::error::DicosError::UnsupportedTransferSyntax)
+/// -- there is no signature-sniffing fallback. Use [`decode_frame_sniffed`]
+/// when the transfer syntax is unavailable and content detection is desired.
+///
 /// Returns the decoded pixel data as a `Vec<u16>`.
 pub fn decode_frame(
     data: &[u8],
@@ -285,15 +328,35 @@ pub fn decode_frame(
     height: u32,
     transfer_syntax_uid: &str,
 ) -> Result<Vec<u16>, crate::error::DicosError> {
-    let codec = codec_for_transfer_syntax(transfer_syntax_uid)
-        .or_else(|| sniff_codec(data))
-        .ok_or_else(|| {
-            crate::error::DicosError::UnsupportedTransferSyntax(transfer_syntax_uid.to_string())
-        })?;
+    let codec = codec_for_transfer_syntax(transfer_syntax_uid).ok_or_else(|| {
+        crate::error::DicosError::UnsupportedTransferSyntax(transfer_syntax_uid.to_string())
+    })?;
     let img = codec
         .decode(data, width, height)
         .map_err(crate::error::DicosError::Codec)?;
-    Ok(img.data)
+    Ok(img.into_data())
+}
+
+/// Decode a single compressed frame, selecting the codec by sniffing the data.
+///
+/// Uses [`sniff_codec`] to identify the codec from the leading bytes. Returns
+/// [`DicosError::UnsupportedTransferSyntax`](crate::error::DicosError::UnsupportedTransferSyntax)
+/// if the content cannot be identified. Prefer [`decode_frame`] whenever the
+/// transfer syntax is known.
+pub fn decode_frame_sniffed(
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u16>, crate::error::DicosError> {
+    let codec = sniff_codec(data).ok_or_else(|| {
+        crate::error::DicosError::UnsupportedTransferSyntax(
+            "unable to identify codec from data signature".to_string(),
+        )
+    })?;
+    let img = codec
+        .decode(data, width, height)
+        .map_err(crate::error::DicosError::Codec)?;
+    Ok(img.into_data())
 }
 
 #[cfg(test)]
@@ -328,6 +391,80 @@ mod tests {
     #[test]
     fn sniff_random_data_returns_none() {
         assert!(sniff_codec(&[0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn decode_frame_unknown_ts_is_unsupported_even_for_rle_shaped_data() {
+        // Leading u32 LE = 1 looks like an RLE segment count, but with the RLE
+        // sniff guess removed an unknown transfer syntax must never fall back.
+        let rle_shaped = vec![0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        let err = decode_frame(&rle_shaped, 2, 2, "1.2.3.4.5.unknown").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::DicosError::UnsupportedTransferSyntax(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Honest DimensionMismatch: exercise the macro-generated decode arm with a
+    // mock backend that returns fewer pixels than its declared dimensions.
+    // -----------------------------------------------------------------------
+
+    mod mock_backend {
+        use std::fmt;
+
+        #[derive(Debug)]
+        pub struct MockError;
+
+        impl fmt::Display for MockError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("mock backend error")
+            }
+        }
+
+        impl std::error::Error for MockError {}
+
+        pub const TRANSFER_SYNTAX_UID: &str = "1.2.3.mock";
+
+        pub fn encode(
+            _pixels: &[u16],
+            _width: u32,
+            _height: u32,
+            _w: &mut dyn std::io::Write,
+        ) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        /// Declares a 4x4 (16-pixel) frame but returns only 9 pixels.
+        pub fn decode(
+            _data: &[u8],
+            _width: u32,
+            _height: u32,
+        ) -> Result<(Vec<u16>, u32, u32), MockError> {
+            Ok((vec![0u16; 9], 4, 4))
+        }
+    }
+
+    codec_adapter! {
+        struct MockAdapter;
+        display = "MOCK";
+        transfer_syntax = mock_backend::TRANSFER_SYNTAX_UID;
+        encode = |pixels, width, height, writer| mock_backend::encode(pixels, width, height, writer);
+        decode = mock_backend::decode;
+    }
+
+    #[test]
+    fn dimension_mismatch_reports_real_decoded_length() {
+        use crate::codec::Codec;
+
+        let err = MockAdapter.decode(&[0u8; 4], 4, 4).unwrap_err();
+        match err {
+            crate::error::CodecError::DimensionMismatch { expected, actual } => {
+                assert_eq!(expected, 16, "4x4 declares 16 pixels");
+                assert_eq!(actual, 9, "actual must be the real decoded length");
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
     }
 
     // Feature-gated tests: only run when the codec feature is enabled.
@@ -367,6 +504,33 @@ mod tests {
             let c = codec_for_transfer_syntax(transfer::JPEG_LS_LOSSLESS)
                 .expect("JPEG-LS transfer syntax should resolve");
             assert_eq!(c.transfer_syntax_uid(), transfer::JPEG_LS_LOSSLESS);
+        }
+
+        #[test]
+        fn sniff_walks_past_appn_segment_to_find_sof55() {
+            // SOI, APP0 (length 4 covering two data bytes), then SOF55.
+            let data = [
+                0xFF, 0xD8, // SOI
+                0xFF, 0xE0, // APP0
+                0x00, 0x04, // length = 4 (2 length bytes + 2 data bytes)
+                0xAA, 0xBB, // APP0 payload
+                0xFF, 0xF7, // SOF55
+                0x00, 0x0B, // SOF55 length (unused by sniffing)
+            ];
+            let c = sniff_codec(&data).expect("should sniff JPEG-LS past APP0");
+            assert_eq!(c.name(), "JPEG-LS");
+        }
+
+        #[test]
+        fn decode_frame_sniffed_decodes_jpegls_frame() {
+            // Round-trip a small frame through the real JPEG-LS backend, then
+            // decode it via signature sniffing (no transfer syntax provided).
+            let pixels: Vec<u16> = vec![10, 20, 30, 40, 50, 60];
+            let mut encoded = Vec::new();
+            jpegls::encode(&pixels, 3, 2, &mut encoded).expect("jpegls encode");
+
+            let decoded = decode_frame_sniffed(&encoded, 3, 2).expect("sniffed decode");
+            assert_eq!(decoded, pixels);
         }
     }
 

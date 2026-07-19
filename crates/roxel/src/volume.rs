@@ -755,12 +755,29 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
 
 /// Extract a volume from a parsed DICOS dataset.
 pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
-    let cols = ds.columns() as usize;
-    let rows = ds.rows() as usize;
+    // Rows/Columns have no DICOM-defined default: an absent tag is a genuine
+    // MissingAttribute, distinct from a present-but-zero value.
+    let cols = ds.columns().ok_or(DicosError::MissingAttribute {
+        group: tag::COLUMNS.group,
+        element: tag::COLUMNS.element,
+    })? as usize;
+    let rows = ds.rows().ok_or(DicosError::MissingAttribute {
+        group: tag::ROWS.group,
+        element: tag::ROWS.element,
+    })? as usize;
     let num_frames = ds.number_of_frames() as usize;
 
     if cols == 0 || rows == 0 {
-        return Err(DicosError::InvalidFile("Rows or Columns is zero".into()));
+        let (group, element) = if rows == 0 {
+            (tag::ROWS.group, tag::ROWS.element)
+        } else {
+            (tag::COLUMNS.group, tag::COLUMNS.element)
+        };
+        return Err(DicosError::InvalidValue {
+            group,
+            element,
+            reason: "Rows and Columns must be non-zero".into(),
+        });
     }
 
     let expected_pixels = cols
@@ -1182,8 +1199,12 @@ mod tests {
         ds.put_u16(tag::COLUMNS, Vr::US, 4);
         let result = volume_from_dataset(&ds);
         assert!(
-            matches!(result, Err(dicos::error::DicosError::InvalidFile(_))),
-            "expected InvalidFile, got {result:?}"
+            matches!(
+                result,
+                Err(dicos::error::DicosError::InvalidValue { group, element, .. })
+                    if group == tag::ROWS.group && element == tag::ROWS.element
+            ),
+            "expected InvalidValue for Rows, got {result:?}"
         );
     }
 
@@ -1194,8 +1215,43 @@ mod tests {
         ds.put_u16(tag::COLUMNS, Vr::US, 0);
         let result = volume_from_dataset(&ds);
         assert!(
-            matches!(result, Err(dicos::error::DicosError::InvalidFile(_))),
-            "expected InvalidFile, got {result:?}"
+            matches!(
+                result,
+                Err(dicos::error::DicosError::InvalidValue { group, element, .. })
+                    if group == tag::COLUMNS.group && element == tag::COLUMNS.element
+            ),
+            "expected InvalidValue for Columns, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn volume_from_dataset_missing_rows_errors() {
+        let mut ds = Dataset::new();
+        // ROWS omitted entirely -> genuine MissingAttribute, not a zero value.
+        ds.put_u16(tag::COLUMNS, Vr::US, 4);
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(
+                result,
+                Err(dicos::error::DicosError::MissingAttribute { group, element })
+                    if group == tag::ROWS.group && element == tag::ROWS.element
+            ),
+            "expected MissingAttribute for Rows, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn volume_from_dataset_missing_columns_errors() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 4);
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(
+                result,
+                Err(dicos::error::DicosError::MissingAttribute { group, element })
+                    if group == tag::COLUMNS.group && element == tag::COLUMNS.element
+            ),
+            "expected MissingAttribute for Columns, got {result:?}"
         );
     }
 

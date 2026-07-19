@@ -136,6 +136,13 @@ impl Value {
 }
 
 /// A single DICOM/DICOS data element.
+///
+/// This is a plain record with public fields to support struct-literal
+/// construction. There is no enforced invariant between `vr` and `value`:
+/// keeping the Value Representation coherent with the stored [`Value`] (for
+/// example, `Vr::US` paired with `Value::U16`) is the caller's responsibility.
+/// The writer encodes `value` according to its own variant, not `vr`, so a
+/// mismatch produces bytes that may not match the declared VR.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Element {
     /// The tag identifying this element.
@@ -206,8 +213,16 @@ impl Dataset {
     }
 
     /// Returns an iterator over all elements in tag order.
-    pub fn iter(&self) -> impl Iterator<Item = (&Tag, &Element)> {
-        self.elements.iter()
+    ///
+    /// Each element carries its own [`Tag`] via [`Element::tag`]; use
+    /// [`Dataset::tags`] when only the tags are needed.
+    pub fn iter(&self) -> impl Iterator<Item = &Element> {
+        self.elements.values()
+    }
+
+    /// Returns an iterator over all tags in ascending order.
+    pub fn tags(&self) -> impl Iterator<Item = Tag> + '_ {
+        self.elements.keys().copied()
     }
 
     /// Returns a string value for the given tag, trimming trailing whitespace/nulls.
@@ -246,27 +261,43 @@ impl Dataset {
         })
     }
 
-    /// Returns the number of rows from (0028,0010), defaulting to 0.
-    pub fn rows(&self) -> u16 {
-        self.get_u16(tag::ROWS).unwrap_or(0)
+    /// Returns the number of rows from (0028,0010), or `None` if absent.
+    ///
+    /// Rows has no DICOM-defined default; callers must decide how to treat a
+    /// missing value (for example, `.unwrap_or(0)` to preserve legacy behavior,
+    /// or raise a `MissingAttribute` error).
+    pub fn rows(&self) -> Option<u16> {
+        self.get_u16(tag::ROWS)
     }
 
-    /// Returns the number of columns from (0028,0011), defaulting to 0.
-    pub fn columns(&self) -> u16 {
-        self.get_u16(tag::COLUMNS).unwrap_or(0)
+    /// Returns the number of columns from (0028,0011), or `None` if absent.
+    ///
+    /// Columns has no DICOM-defined default; see [`Dataset::rows`] for the
+    /// recommended handling of a missing value.
+    pub fn columns(&self) -> Option<u16> {
+        self.get_u16(tag::COLUMNS)
     }
 
-    /// Returns BitsAllocated from (0028,0100), defaulting to 16.
-    pub fn bits_allocated(&self) -> u16 {
-        self.get_u16(tag::BITS_ALLOCATED).unwrap_or(16)
+    /// Returns BitsAllocated from (0028,0100), or `None` if absent.
+    ///
+    /// The previous default of 16 was invented, not standard-backed; callers
+    /// should supply their own fallback via `.unwrap_or(...)`.
+    pub fn bits_allocated(&self) -> Option<u16> {
+        self.get_u16(tag::BITS_ALLOCATED)
     }
 
-    /// Returns PixelRepresentation from (0028,0103), defaulting to 0 (unsigned).
-    pub fn pixel_representation(&self) -> u16 {
-        self.get_u16(tag::PIXEL_REPRESENTATION).unwrap_or(0)
+    /// Returns PixelRepresentation from (0028,0103), or `None` if absent.
+    ///
+    /// The previous default of 0 (unsigned) was invented, not standard-backed;
+    /// callers should supply their own fallback via `.unwrap_or(...)`.
+    pub fn pixel_representation(&self) -> Option<u16> {
+        self.get_u16(tag::PIXEL_REPRESENTATION)
     }
 
     /// Returns NumberOfFrames from (0028,0008), defaulting to 1.
+    ///
+    /// Unlike the other pixel accessors, this default is DICOM-defined: an
+    /// absent NumberOfFrames means a single-frame image.
     pub fn number_of_frames(&self) -> u32 {
         self.get(tag::NUMBER_OF_FRAMES)
             .and_then(|e| {
@@ -327,8 +358,8 @@ impl Default for Dataset {
 impl fmt::Display for Dataset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Dataset ({} elements)", self.len())?;
-        for (tag, elem) in self.iter() {
-            writeln!(f, "  {tag} {}: {:?}", elem.vr, elem.value)?;
+        for elem in self.iter() {
+            writeln!(f, "  {} {}: {:?}", elem.tag, elem.vr, elem.value)?;
         }
         Ok(())
     }
@@ -489,7 +520,7 @@ mod tests {
         let name = ds.get_string(tag::PATIENT_NAME);
         assert_eq!(name, Some("DOE^JOHN"));
 
-        assert_eq!(ds.rows(), 512);
+        assert_eq!(ds.rows(), Some(512));
     }
 
     #[test]
@@ -507,10 +538,10 @@ mod tests {
     #[test]
     fn dataset_defaults() {
         let ds = Dataset::new();
-        assert_eq!(ds.rows(), 0);
-        assert_eq!(ds.columns(), 0);
-        assert_eq!(ds.bits_allocated(), 16);
-        assert_eq!(ds.pixel_representation(), 0);
+        assert_eq!(ds.rows(), None);
+        assert_eq!(ds.columns(), None);
+        assert_eq!(ds.bits_allocated(), None);
+        assert_eq!(ds.pixel_representation(), None);
         assert_eq!(ds.number_of_frames(), 1);
         assert_eq!(ds.modality(), "");
     }
@@ -538,7 +569,7 @@ mod tests {
         ds.put_string(tag::PATIENT_NAME, Vr::PN, "TEST");
         ds.put_u16(tag::COLUMNS, Vr::US, 256);
 
-        let tags: Vec<Tag> = ds.iter().map(|(t, _)| *t).collect();
+        let tags: Vec<Tag> = ds.tags().collect();
         // Should be sorted by group, then element
         for i in 1..tags.len() {
             assert!(tags[i - 1] < tags[i], "Tags should be in order");

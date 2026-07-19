@@ -899,8 +899,10 @@ fn parse_sequence_items(
 fn normalize_native_pixel_data(ds: &mut Dataset) -> Vec<ParseWarning> {
     let mut warnings = Vec::new();
 
-    let rows = ds.rows() as usize;
-    let cols = ds.columns() as usize;
+    // Rows/Columns are now Option; a missing dimension cannot describe a frame
+    // grid, so treat absent as 0 here (preserving the prior early-return path).
+    let rows = ds.rows().unwrap_or(0) as usize;
+    let cols = ds.columns().unwrap_or(0) as usize;
     let num_frames = ds.number_of_frames() as usize;
 
     if rows == 0 || cols == 0 {
@@ -1079,9 +1081,9 @@ mod tests {
         let ds = parse(io::Cursor::new(file_data)).expect("parse should succeed");
 
         assert_eq!(ds.get_string(tag::PATIENT_NAME), Some("DOE^JOHN"));
-        assert_eq!(ds.rows(), 512);
-        assert_eq!(ds.columns(), 256);
-        assert_eq!(ds.bits_allocated(), 16);
+        assert_eq!(ds.rows(), Some(512));
+        assert_eq!(ds.columns(), Some(256));
+        assert_eq!(ds.bits_allocated(), Some(16));
         assert_eq!(
             ds.transfer_syntax().uid(),
             transfer::EXPLICIT_VR_LITTLE_ENDIAN
@@ -1117,7 +1119,7 @@ mod tests {
         let file_data = build_minimal_explicit_vr_le(&elements);
         let ds = parse(io::Cursor::new(file_data)).expect("parse should succeed");
 
-        assert_eq!(ds.rows(), 1024);
+        assert_eq!(ds.rows(), Some(1024));
         let ri = ds
             .get(tag::RESCALE_INTERCEPT)
             .and_then(|e| e.value.as_f64());
@@ -1263,7 +1265,7 @@ mod tests {
         );
 
         // The dataset element should have been parsed correctly under implicit VR LE.
-        assert_eq!(ds.rows(), 64);
+        assert_eq!(ds.rows(), Some(64));
     }
 
     // -- Integration tests against real DICOS files --
@@ -1286,9 +1288,12 @@ mod tests {
         let reader = std::io::BufReader::new(file);
         let ds = parse(reader).expect("parse bag CT sample");
 
-        assert!(ds.rows() > 0, "rows should be non-zero");
-        assert!(ds.columns() > 0, "columns should be non-zero");
-        assert!(ds.bits_allocated() > 0);
+        assert!(ds.rows().is_some_and(|r| r > 0), "rows should be non-zero");
+        assert!(
+            ds.columns().is_some_and(|c| c > 0),
+            "columns should be non-zero"
+        );
+        assert!(ds.bits_allocated().is_some_and(|b| b > 0));
         assert!(ds.get(tag::PIXEL_DATA).is_some(), "should have PixelData");
         assert_eq!(ds.modality(), "CT");
         assert_eq!(
@@ -1320,8 +1325,8 @@ mod tests {
         let file_data = build_minimal_explicit_vr_le(&elements);
         let ds = parse(io::Cursor::new(file_data)).expect("parse should succeed");
 
-        assert_eq!(ds.rows(), 2);
-        assert_eq!(ds.columns(), 2);
+        assert_eq!(ds.rows(), Some(2));
+        assert_eq!(ds.columns(), Some(2));
 
         // Raw OW bytes are normalized to PixelData::Native after parsing
         let pd = ds.pixel_data().expect("pixel_data() should return Some");
@@ -1393,7 +1398,11 @@ mod tests {
         match &sq_elem.value {
             Value::Sequence(items) => {
                 assert_eq!(items.len(), 1, "expected exactly one item");
-                assert_eq!(items[0].rows(), 128, "inner element should decode rows=128");
+                assert_eq!(
+                    items[0].rows(),
+                    Some(128),
+                    "inner element should decode rows=128"
+                );
             }
             other => panic!("expected Value::Sequence, got {other:?}"),
         }

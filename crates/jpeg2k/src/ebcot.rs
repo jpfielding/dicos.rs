@@ -116,6 +116,17 @@ pub fn decode_code_block(
     }
 
     let nb = num_bitplanes;
+    // Defensive shift guard: the coding passes shift `1 << (nb - 1)` down to
+    // `1 << 0`. With `nb >= 32` the most-significant plane shift is `1 << 31`
+    // or worse (a debug panic / release corruption), and a magnitude with bit
+    // 31 set overflows the signed i32 reconstruction. Callers (the codestream
+    // QCD validator) already reject this, but re-check here so no path can
+    // reach the shift with an out-of-range plane count.
+    if nb >= 32 {
+        return Err(CodecError::InvalidData(format!(
+            "num_bitplanes {nb} >= 32 exceeds the i32 coefficient range"
+        )));
+    }
     let max_passes = 3 * nb - 2;
     if num_passes == 0 || num_passes > max_passes {
         return Err(CodecError::InvalidData(format!(

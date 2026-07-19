@@ -47,6 +47,7 @@ pub use codestream::{decode, decode_with_options, encode, DecodeOptions, LegacyP
 
 /// Options for JPEG 2000 encoding.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Jpeg2kOptions {
     /// Tile width (0 = single tile)
     pub tile_width: u32,

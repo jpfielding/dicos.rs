@@ -802,6 +802,24 @@ fn decode_standard(parsed: &Parsed, payload: &[u8]) -> Result<Vec<u16>, CodecErr
     }
 
     let guard = parsed.qcd.guard_bits;
+
+    // Robustness guard (adversarial QCD): the tier-1 decoder shifts `1 << p`
+    // for p in `0..num_bitplanes`, and `num_bitplanes <= Mb = εb + G − 1`. A
+    // crafted QCD can push εb to 31 and G to 7, giving Mb ≈ 37 and shifts of
+    // `1 << 36` — a debug panic / release corruption, and magnitudes past the
+    // i32 range. Reject any band whose Mb would permit `num_bitplanes >= 32`
+    // before it can reach the shift. Our conformant encoder uses εb=16+gain,
+    // G=2 → Mb ≈ 17-18, comfortably under the cap.
+    for &eps in exps.iter().take(3 * nl as usize + 1) {
+        let mb = mb_from_epsilon(eps as u8, guard);
+        if mb >= 32 {
+            return Err(CodecError::Unsupported(format!(
+                "QCD band Mb {mb} (εb={eps}, G={guard}) allows num_bitplanes >= 32; \
+                 magnitude would exceed the i32 coefficient range"
+            )));
+        }
+    }
+
     let mb_for = |kind: BandKind, level: u8| -> u32 {
         let idx = qcd_band_index(kind, level, nl);
         mb_from_epsilon(exps[idx] as u8, guard)
@@ -1189,6 +1207,54 @@ mod tests {
         out.extend_from_slice(&[0xFF, 0x53, 0x00, 0x03, 0x00]); // COC, Lcoc=3, 1 byte
         out.extend_from_slice(&buf[sot..]);
         assert_unsupported(&out, "COC marker");
+    }
+
+    #[test]
+    fn reject_qcd_mb_overflow_shift() {
+        // Adversarial QCD: εb = 31 (SPqcd byte 0xF8) and guard bits = 7 (Sqcd
+        // byte 0xE0) drive a band's Mb to ~37. Unguarded, the tier-1 decoder
+        // would shift `1 << p` for p up to 36 — a debug panic / release
+        // corruption, and magnitudes past the i32 range. Must be a clean Err
+        // (this test runs in debug, where the bad shift would panic).
+        let mut buf = valid_stream();
+        let qcd = marker_off(&buf, MARKER_QCD);
+        buf[qcd + 4] = 0xE0; // Sqcd: guard bits 7, no-quantization style 0
+        buf[qcd + 5] = 0xF8; // first SPqcd (LL): εb = 31
+        match decode(&buf, 16, 16) {
+            Err(CodecError::Unsupported(_)) | Err(CodecError::InvalidData(_)) => {}
+            other => panic!("expected clean Err for over-range QCD Mb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_multi_precinct() {
+        // 32769 > 2^15 (the default PPx=15 precinct span) → resolution NL spans
+        // two precincts horizontally. The single-packet-per-resolution pipeline
+        // must reject rather than silently mispack.
+        let w = 32769u32;
+        let h = 1u32;
+        let pixels = vec![0u16; (w * h) as usize];
+        let mut buf = Vec::new();
+        assert!(matches!(
+            encode(&pixels, w, h, &Jpeg2kOptions::default(), &mut buf),
+            Err(CodecError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_multi_precinct() {
+        // Enlarge Xsiz and XTsiz to 32769 so the parsed geometry crosses the
+        // default precinct span; decode must reject with Unsupported.
+        let mut buf = valid_stream();
+        let siz = marker_off(&buf, MARKER_SIZ);
+        let big = 32769u32.to_be_bytes();
+        buf[siz + 6..siz + 10].copy_from_slice(&big); // Xsiz
+        buf[siz + 22..siz + 26].copy_from_slice(&big); // XTsiz
+                                                       // Trust SIZ (0,0) so we reach the geometry check, not a dim mismatch.
+        assert!(matches!(
+            decode(&buf, 0, 0),
+            Err(CodecError::Unsupported(_))
+        ));
     }
 
     #[test]

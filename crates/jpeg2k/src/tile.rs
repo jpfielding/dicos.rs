@@ -19,7 +19,7 @@
 use crate::dwt;
 use crate::ebcot::{decode_code_block, encode_code_block, CodedBlock};
 use crate::error::CodecError;
-use crate::geometry::{build_geometry, Band, BandKind, CodeBlockGeom};
+use crate::geometry::{build_geometry, Band, BandKind, CodeBlockGeom, TileGeometry};
 use crate::packet::{read_packet, write_packet, PrecinctState};
 
 /// Maximum tile area (samples) we will allocate for, guarding against hostile
@@ -51,6 +51,25 @@ fn checked_area(w: u32, h: u32) -> Result<usize, CodecError> {
         )));
     }
     Ok(n)
+}
+
+/// Reject geometries that span more than one precinct per resolution.
+///
+/// The tier-2 pipeline emits exactly one packet per resolution and holds one
+/// [`PrecinctState`] per band, so it only handles the single-precinct case
+/// (every realistic tile with the default PPx=PPy=15 precinct exponent). A
+/// dimension large enough to cross the 2^15 precinct span (e.g. > 32768 in a
+/// resolution) would be silently mispacked; reject it loudly instead, matching
+/// the crate's "legal-but-unsupported is rejected" contract.
+fn ensure_single_precinct(geom: &TileGeometry) -> Result<(), CodecError> {
+    for res in &geom.resolutions {
+        if res.num_precincts_w as u64 * res.num_precincts_h as u64 > 1 {
+            return Err(CodecError::Unsupported(
+                "multi-precinct images not supported".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Gather a code-block's coefficients out of the packed Mallat tile buffer.
@@ -106,11 +125,13 @@ pub fn encode_tile(
     }
     let stride = w as usize;
 
+    let geom = build_geometry(w, h, num_levels, xcb, ycb);
+    ensure_single_precinct(&geom)?;
+
     // Forward DWT into a packed Mallat buffer.
     let mut buf = component.to_vec();
     dwt::forward_multi_level_conformant(&mut buf, stride, h as usize, num_levels as usize);
 
-    let geom = build_geometry(w, h, num_levels, xcb, ycb);
     let mut out = Vec::new();
 
     for res in &geom.resolutions {
@@ -172,6 +193,7 @@ pub fn decode_tile(
     let stride = w as usize;
 
     let geom = build_geometry(w, h, num_levels, xcb, ycb);
+    ensure_single_precinct(&geom)?;
     let mut buf = vec![0i32; n];
     let mut pos = 0usize;
 

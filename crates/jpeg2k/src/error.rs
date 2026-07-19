@@ -1,5 +1,6 @@
 /// Errors from JPEG 2000 codec encode/decode operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CodecError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -1,0 +1,32 @@
+{
+  "threats": [
+    {
+      "label": "Knife",
+      "category": "METAL",
+      "flag": "HIGH_THREAT",
+      "probability": 0.95,
+      "blender_objects": [
+        "CT_Knife_Blade",
+        "CT_Knife_Guard",
+        "CT_Knife_Handle",
+        "CT_Knife_Rivet_0",
+        "CT_Knife_Rivet_1",
+        "CT_Knife_Rivet_2",
+        "CT_Knife_Tang",
+        "CT_Knife_Tip"
+      ],
+      "bbox_mm": {
+        "min": [
+          120.85800617933273,
+          -39.15613144636154,
+          57.49999359250069
+        ],
+        "max": [
+          294.4040298461914,
+          89.66800570487976,
+          82.49999582767487
+        ]
+      }
+    }
+  ]
+}

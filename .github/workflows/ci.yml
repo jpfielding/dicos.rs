@@ -35,12 +35,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
-      # testdata/ is no longer checked in (2.0 forward-only cleanup). Generate a
-      # small synthetic fixture from the example so the generator stays exercised
-      # on every run. The integration tests that read testdata/ files skip
-      # gracefully when their specific curated fixtures are absent, so this does
-      # not gate the suite; it validates the example builds and produces a valid
-      # DICOS file end to end.
+      # Curated samples under testdata/ are tracked, so the integration tests
+      # that read them run in CI. This step additionally exercises the example
+      # generator end to end (it writes the gitignored testdata/synthetic/
+      # fixture), validating that it still builds and produces a valid DICOS file.
       - name: Generate synthetic fixture
         run: |
           mkdir -p testdata/synthetic

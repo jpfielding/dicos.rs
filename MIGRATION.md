@@ -75,4 +75,4 @@ Files written by 1.0.0 remain decodable (see the jpeg2k / jpegls rows below).
 | --- | --- | --- | --- |
 | Versions | all crates `1.0.0` | all crates `2.0.0` (`dicos`, `pure_jpegrle`, `pure_jpegls`, `pure_jpegli`, `pure_jpeg2k`) | Bump your dependency pins to `2.0`. |
 | Fixture generator | shipped as a binary (`dicos-gen-luggage-fishtank`, run with `--bin`) | moved to an **example**: `crates/dicos/examples/gen-luggage-fishtank.rs` | Run with `cargo run -p dicos --example gen-luggage-fishtank -- --size 64,64,48 --out <path>` instead of `--bin dicos-gen-luggage-fishtank`. |
-| Test data | `testdata/` was checked in (~37 MB) | `testdata/` is **gitignored and generated on demand**; tests that read it skip gracefully when absent | Generate fixtures locally with the example above (see README "Test data"). CI generates a small fixture before the test job. |
+| Test data | `testdata/` was checked in (~48 MB) | curated samples under `testdata/` remain tracked (tests depend on `bag_ct.dcs`); only the generated `testdata/synthetic/` is gitignored | No action. Regenerate the synthetic fixture with the example above if desired; CI generates it before the test job. |

@@ -94,7 +94,7 @@ Requires a GPU with Vulkan, Metal, or DX12 support.
 ```
 dicos.rs/
   Cargo.toml              # Workspace root
-  testdata/               # Generated fixtures (gitignored; see "Test data")
+  testdata/               # Curated DICOS samples (tracked); synthetic/ is generated
   crates/
     dicos/                # Core DICOS library + dicosctl binary
     jpegrle/              # RLE PackBits codec (standalone)
@@ -135,10 +135,11 @@ cargo build -p roxel --release
 
 ## Test data
 
-As of 2.0.0 the `testdata/` directory is **generated on demand and gitignored**
-(the 1.x tree checked in ~37 MB of fixtures). Integration tests that read
-`testdata/` files skip gracefully when a fixture is absent, so a fresh checkout
-tests green with no fixtures present.
+`testdata/` holds curated, public-safe DICOS samples that the reader and
+luggage integration tests depend on (notably `testdata/bag_ct.dcs`); these are
+tracked. Only `testdata/synthetic/` — the fixture the example generator
+produces — is gitignored. Integration tests that read `testdata/` files still
+skip gracefully when a fixture is absent, so a partial checkout stays green.
 
 To produce a synthetic public-safe CT volume via the example generator:
 

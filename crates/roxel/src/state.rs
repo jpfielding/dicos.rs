@@ -39,6 +39,13 @@ pub(crate) struct UiState {
     pub(crate) slice_texture: Option<egui::TextureHandle>,
     /// True when the 2D image needs re-rendering (volume/slice/orientation changed).
     pub(crate) slice_dirty: bool,
+
+    /// Filename currently being loaded in the background, or `None` when idle.
+    /// Refreshed each frame from the [`VolumeLoader`](crate::loader::VolumeLoader)
+    /// so the sidebar can show a spinner and disable the Open buttons.
+    pub(crate) loading_file: Option<String>,
+    /// Last load error message, shown in the sidebar until the next load.
+    pub(crate) load_error: Option<String>,
 }
 
 impl UiState {
@@ -53,6 +60,8 @@ impl UiState {
             slice_view: SliceView::default(),
             slice_texture: None,
             slice_dirty: false,
+            loading_file: None,
+            load_error: None,
         }
     }
 }

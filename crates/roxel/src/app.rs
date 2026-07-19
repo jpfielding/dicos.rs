@@ -18,6 +18,7 @@
 //! ```
 
 use crate::camera::Camera;
+use crate::loader::{LoadOutcome, LoadedLayer, VolumeLoader};
 use crate::renderer::{RenderParams, VolumeRenderer};
 use crate::state::UiState;
 use crate::transfer::{TransferFunction, TransferPreset};
@@ -47,6 +48,9 @@ pub struct App {
 
     renderer: VolumeRenderer,
     ui: UiState,
+
+    /// Background volume loader (CPU pipeline runs off the render thread).
+    loader: VolumeLoader,
 
     // Mouse drag state.
     dragging: bool,
@@ -90,6 +94,7 @@ impl App {
             egui_renderer,
             renderer,
             ui: UiState::new(camera),
+            loader: VolumeLoader::new(),
             dragging: false,
             last_mouse_pos: None,
             shift_down: false,
@@ -156,6 +161,26 @@ impl App {
         width: u32,
         height: u32,
     ) -> bool {
+        // Install any completed background load before drawing this frame.
+        if let Some(outcome) = self.loader.poll() {
+            match outcome {
+                LoadOutcome::Loaded { path, layers } => self.install_loaded(path, layers),
+                LoadOutcome::Failed { path, error } => {
+                    let msg = format!("Failed to load {}: {error}", path.display());
+                    log::error!("{msg}");
+                    self.ui.load_error = Some(msg);
+                }
+            }
+        }
+
+        // Reflect current loading state into the UI (spinner + disabled Open
+        // buttons) so the sidebar closure can render it without touching `App`.
+        self.ui.loading_file = self
+            .loader
+            .loading()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string());
+
         // Clear action flags.
         self.ui.actions.file_to_load = None;
         self.ui.actions.preset_changed = false;
@@ -171,7 +196,7 @@ impl App {
 
         // Process UI actions.
         if let Some(path) = self.ui.actions.file_to_load.take() {
-            self.load_path_inner(&path);
+            self.request_load(path);
         }
 
         if let Some(idx) = self.ui.actions.upload_3d_index {
@@ -307,157 +332,68 @@ impl App {
             self.egui_renderer.free_texture(id);
         }
 
+        // Keep the frame loop pumping while a background load is in flight so
+        // we continue polling (and animating the spinner) without user input.
+        if self.loader.loading().is_some() {
+            self.egui_ctx.request_repaint();
+        }
+
         self.egui_ctx.has_requested_repaint()
     }
 
-    /// Load a file or directory from a path. Called from main for CLI args.
-    pub fn load_path(&mut self, path: &std::path::Path) {
-        self.load_path_inner(path);
-    }
-
-    fn load_path_inner(&mut self, path: &std::path::Path) {
-        if path.is_dir() {
-            self.load_directory(path);
-        } else {
-            self.load_single_file(path);
-        }
-    }
-
-    /// Load a single DICOS file as one volume layer.
-    fn load_single_file(&mut self, path: &std::path::Path) {
-        match volume::load_dicos_path(path) {
-            Ok(mut vol) => {
-                if let Some(dir) = path.parent() {
-                    let sidecars = volume::load_threat_sidecars_from_dir(
-                        dir,
-                        [vol.dim_x, vol.dim_y, vol.dim_z],
-                    );
-                    let added = merge_unique_threats(&mut vol.threats, sidecars);
-                    if added > 0 {
-                        log::info!("Loaded {added} threat box(es) from sidecar files");
-                    }
-                }
-
-                let name = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                self.ui.library.volumes.clear();
-                self.ui
-                    .library
-                    .volumes
-                    .push(VolumeLayer { name, volume: vol });
-                self.ui.library.loaded_path = Some(path.to_path_buf());
-                self.activate_volumes();
-                self.log_threat_status();
-                log::info!("Loaded 1 volume from {}", path.display());
-            }
-            Err(e) => {
-                log::error!("Failed to load {}: {e}", path.display());
-            }
-        }
-    }
-
-    /// Load a directory of DICOS files as separate volume layers.
+    /// Request a background load of a file or directory. Called from main for
+    /// CLI args and from the sidebar Open buttons.
     ///
-    /// Each .dcs/.dcm file becomes its own named layer, matching the Go
-    /// viewer's approach where volumes are kept separate rather than stacked.
-    fn load_directory(&mut self, dir: &std::path::Path) {
-        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
-            Ok(entries) => entries
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let path = entry.path();
-                    if path.is_file() {
-                        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-                        if ext == "dcs" || ext == "dcm" {
-                            return Some(path);
-                        }
-                    }
-                    None
-                })
-                .collect(),
-            Err(e) => {
-                log::error!("Failed to read directory {}: {e}", dir.display());
-                return;
-            }
-        };
+    /// The heavy CPU pipeline (parse, decode, threat merge, GPU packing,
+    /// center-of-mass) runs on a worker thread; [`App::render`] installs the
+    /// result when it completes. See [`crate::loader`].
+    pub fn load_path(&mut self, path: &std::path::Path) {
+        self.request_load(path.to_path_buf());
+    }
 
-        files.sort();
+    /// Kick off a background load, clearing any stale error message.
+    fn request_load(&mut self, path: PathBuf) {
+        self.ui.load_error = None;
+        self.loader.request(path);
+    }
 
-        if files.is_empty() {
-            log::error!("No .dcs or .dcm files found in {}", dir.display());
-            return;
-        }
-
-        log::info!("Loading {} DICOS files from {}", files.len(), dir.display());
-
+    /// Install the layers produced by a completed background load, replacing
+    /// the current volume library and re-activating the view.
+    fn install_loaded(&mut self, path: PathBuf, layers: Vec<LoadedLayer>) {
+        self.ui.load_error = None;
         self.ui.library.volumes.clear();
-        for file in &files {
-            match volume::load_dicos_path(file) {
-                Ok(vol) => {
-                    let name = file
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    log::info!(
-                        "  {} -> {}x{}x{} ({})",
-                        name,
-                        vol.dim_x,
-                        vol.dim_y,
-                        vol.dim_z,
-                        vol.modality
-                    );
-                    self.ui
-                        .library
-                        .volumes
-                        .push(VolumeLayer { name, volume: vol });
-                }
-                Err(e) => {
-                    log::warn!("Skipping {}: {e}", file.display());
-                }
+
+        // Keep the first layer's precomputed GPU buffer + center of mass so the
+        // render thread uploads it without re-packing (Codex finding 19).
+        let mut first_pack: Option<(Vec<u16>, [f32; 3])> = None;
+        for (i, layer) in layers.into_iter().enumerate() {
+            let LoadedLayer {
+                name,
+                volume,
+                packed,
+                center_of_mass,
+            } = layer;
+            if i == 0 {
+                first_pack = Some((packed, center_of_mass));
             }
+            self.ui.library.volumes.push(VolumeLayer { name, volume });
         }
 
         if self.ui.library.volumes.is_empty() {
-            log::error!("No volumes loaded from {}", dir.display());
             return;
         }
 
-        if let Some((dim_x, dim_y, dim_z)) = self
-            .ui
-            .library
-            .volumes
-            .iter()
-            .map(|layer| {
-                let vol = &layer.volume;
-                (vol.dim_x, vol.dim_y, vol.dim_z)
-            })
-            .max_by_key(|(x, y, z)| x.saturating_mul(*y).saturating_mul(*z))
-        {
-            let sidecars = volume::load_threat_sidecars_from_dir(dir, [dim_x, dim_y, dim_z]);
-            for layer in &mut self.ui.library.volumes {
-                let vol = &mut layer.volume;
-                if (vol.dim_x, vol.dim_y, vol.dim_z) == (dim_x, dim_y, dim_z) {
-                    merge_unique_threats(&mut vol.threats, sidecars.clone());
-                }
-            }
-        }
-
-        self.ui.library.loaded_path = Some(dir.to_path_buf());
-        self.activate_volumes();
+        self.ui.library.loaded_path = Some(path);
+        self.activate_volumes(first_pack);
         self.log_threat_status();
-        log::info!(
-            "Loaded {} volume layers from {}",
-            self.ui.library.volumes.len(),
-            dir.display()
-        );
     }
 
     /// After loading volumes, set up 3D renderer and 2D slice view.
-    fn activate_volumes(&mut self) {
+    ///
+    /// `first_pack` carries the precomputed packed buffer + center of mass for
+    /// layer 0 (from the background loader). When absent, layer 0 is packed on
+    /// the render thread via [`Self::upload_volume_to_gpu`].
+    fn activate_volumes(&mut self, first_pack: Option<(Vec<u16>, [f32; 3])>) {
         if self.ui.library.volumes.is_empty() {
             return;
         }
@@ -466,7 +402,10 @@ impl App {
         self.ui.camera.set_coronal();
 
         // Upload first volume to 3D renderer.
-        self.upload_volume_to_gpu(0);
+        match first_pack {
+            Some((packed, com)) => self.upload_volume_to_gpu_precomputed(0, &packed, com),
+            None => self.upload_volume_to_gpu(0),
+        }
 
         // Point 2D slice view at first volume.
         self.ui.slice_view.volume_index = 0;
@@ -495,7 +434,9 @@ impl App {
         self.ui.slice_dirty = true;
     }
 
-    /// Upload a volume at the given index to the 3D GPU renderer.
+    /// Upload a volume at the given index to the 3D GPU renderer, packing on
+    /// the render thread. Used for layer switches, where no precomputed buffer
+    /// is available.
     fn upload_volume_to_gpu(&mut self, idx: usize) {
         if let Some(layer) = self.ui.library.volumes.get(idx) {
             let vol = &layer.volume;
@@ -503,6 +444,25 @@ impl App {
             self.ui.camera.target = glam::Vec3::from(com);
 
             self.renderer.upload_volume(&self.device, &self.queue, vol);
+
+            let tf = TransferFunction::from_preset(self.ui.transfer.preset);
+            self.renderer
+                .upload_transfer_function(&self.device, &self.queue, &tf);
+
+            self.ui.library.active_3d_index = Some(idx);
+        }
+    }
+
+    /// Upload a volume at the given index using a precomputed packed buffer and
+    /// center of mass produced by the background loader — no CPU packing on the
+    /// render thread.
+    fn upload_volume_to_gpu_precomputed(&mut self, idx: usize, packed: &[u16], com: [f32; 3]) {
+        if let Some(layer) = self.ui.library.volumes.get(idx) {
+            let vol = &layer.volume;
+            self.ui.camera.target = glam::Vec3::from(com);
+
+            self.renderer
+                .upload_volume_packed(&self.device, &self.queue, vol, packed);
 
             let tf = TransferFunction::from_preset(self.ui.transfer.preset);
             self.renderer

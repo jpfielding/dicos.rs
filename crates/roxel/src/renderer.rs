@@ -415,8 +415,30 @@ impl VolumeRenderer {
         vertices
     }
 
-    /// Upload volume data to a 3D GPU texture.
+    /// Upload volume data to a 3D GPU texture, packing on the calling thread.
+    ///
+    /// This is the fallback path used by callers that do not already hold a
+    /// precomputed GPU buffer (e.g. switching the active layer via the
+    /// sidebar). The background loader path uses [`Self::upload_volume_packed`]
+    /// with a buffer produced off the render thread.
     pub fn upload_volume(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, volume: &Volume) {
+        let packed = volume.pack_for_gpu();
+        self.upload_volume_packed(device, queue, volume, &packed);
+    }
+
+    /// Upload volume data to a 3D GPU texture using a precomputed packed
+    /// buffer (see [`Volume::pack_for_gpu`]).
+    ///
+    /// The `packed` slice must correspond to `volume`'s dimensions. Keeping
+    /// packing off this method lets the background loader do the expensive CPU
+    /// work, leaving only wgpu resource operations on the render thread.
+    pub fn upload_volume_packed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: &Volume,
+        packed: &[u16],
+    ) {
         let new_dim_x = volume.dim_x as u32;
         let new_dim_y = volume.dim_y as u32;
         let new_dim_z = volume.dim_z as u32;
@@ -432,8 +454,6 @@ impl VolumeRenderer {
 
         self.rescale_intercept = volume.rescale_intercept as f32;
         self.voxel_spacing = volume.voxel_spacing;
-
-        let packed = volume.pack_for_gpu();
 
         let size = wgpu::Extent3d {
             width: self.dim_x,
@@ -453,7 +473,7 @@ impl VolumeRenderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                bytemuck::cast_slice(&packed),
+                bytemuck::cast_slice(packed),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.dim_x * 4 * 2), // 4 u16 channels
@@ -482,7 +502,7 @@ impl VolumeRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&packed),
+            bytemuck::cast_slice(packed),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(self.dim_x * 4 * 2), // 4 u16 channels

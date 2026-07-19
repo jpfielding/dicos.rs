@@ -11,19 +11,34 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                 panel.heading("roxel");
                 panel.separator();
 
-                // File section.
-                if panel.button("Open file...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("DICOS", &["dcs", "dcm"])
-                        .pick_file()
-                    {
-                        state.actions.file_to_load = Some(path);
+                // File section. Open buttons are disabled while a background
+                // load is in flight (only one load may run at a time).
+                let is_loading = state.loading_file.is_some();
+                panel.add_enabled_ui(!is_loading, |panel| {
+                    if panel.button("Open file...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("DICOS", &["dcs", "dcm"])
+                            .pick_file()
+                        {
+                            state.actions.file_to_load = Some(path);
+                        }
                     }
+                    if panel.button("Open folder...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            state.actions.file_to_load = Some(path);
+                        }
+                    }
+                });
+
+                if let Some(name) = &state.loading_file {
+                    panel.horizontal(|h| {
+                        h.add(egui::Spinner::new());
+                        h.label(format!("Loading {name}…"));
+                    });
                 }
-                if panel.button("Open folder...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        state.actions.file_to_load = Some(path);
-                    }
+
+                if let Some(err) = &state.load_error {
+                    panel.colored_label(egui::Color32::RED, err);
                 }
 
                 if let Some(path) = &state.library.loaded_path {

@@ -64,10 +64,13 @@ fn encode_current(pixels: &[u16], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// One-time generator. Run manually; never in CI.
-#[test]
-#[ignore]
-fn regenerate() {
+// The LegacyGo fixtures are frozen permanently (they pin the 1.0.0 / Go
+// bitstream). There is deliberately no live regenerator: recreating them from
+// the current encoder is what a byte-drift bug would do silently. If they ever
+// must be rebuilt, recover them from git history at tag v2.0.0.
+
+#[allow(dead_code)]
+fn _regenerate_reference_only() {
     let dir = fixture_dir();
     std::fs::create_dir_all(&dir).unwrap();
     for (name, w, h, pixels) in test_images() {

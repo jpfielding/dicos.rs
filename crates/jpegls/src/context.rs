@@ -152,7 +152,7 @@ impl ContextModel {
     }
 
     /// Compute the default T1/T2/T3 thresholds (T.87 A.2.1).
-    fn default_thresholds(max_val: i32, near: i32) -> (i32, i32, i32) {
+    pub(crate) fn default_thresholds(max_val: i32, near: i32) -> (i32, i32, i32) {
         if max_val >= 128 {
             let factor = (max_val.min(4095) + 128) / 256;
             let t1 = clamp_threshold(factor * (BASIC_T1 - 2) + 2 + 3 * near, near + 1, max_val);

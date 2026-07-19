@@ -27,6 +27,15 @@ const MARKER_DRI: u16 = 0xFFDD;
 /// Default statistics reset threshold (T.87 A.2.1 RESET).
 const DEFAULT_RESET: i32 = 64;
 
+/// Hard cap on decoded image size (pixels), guarding the row-major
+/// `vec![0u16; width*height]` against untrusted SOF55 dimensions. Matches the
+/// `jpegli` / `jpegrle` decoders (`1 << 28` = 268 435 456 pixels ~= 512 MiB).
+const MAX_PIXELS: usize = 1 << 28;
+
+/// Minimum permitted LSE RESET value (T.87 C.2.4.1.1). A RESET below this
+/// would suppress statistics halving and risk i32 overflow on long scans.
+const MIN_RESET: i32 = 3;
+
 // ---------------------------------------------------------------------------
 // Frame / scan headers + LSE presets
 // ---------------------------------------------------------------------------
@@ -159,6 +168,27 @@ impl<'a> Decoder<'a> {
         }
         let height = self.read_u16be()? as usize;
         let width = self.read_u16be()? as usize;
+
+        // Reject degenerate / oversized frames before any large allocation.
+        // T.87 permits 1..=65535 per axis; also cap the pixel product so a
+        // crafted 65535x65535 header cannot request an ~8 GiB buffer.
+        if width == 0 || height == 0 {
+            return Err(CodecError::InvalidData(
+                "SOF55 dimensions must be non-zero".into(),
+            ));
+        }
+        if width
+            .checked_mul(height)
+            .filter(|&n| n <= MAX_PIXELS)
+            .is_none()
+        {
+            return Err(CodecError::InvalidParameter {
+                name: "width*height",
+                value: (width as i64).saturating_mul(height as i64),
+                allowed: "product <= 268435456 pixels (1<<28)",
+            });
+        }
+
         let nf = self.read_byte()?;
         if nf != 1 {
             return Err(CodecError::Unsupported(
@@ -193,12 +223,22 @@ impl<'a> Decoder<'a> {
                 let t2 = self.read_u16be()? as i32;
                 let t3 = self.read_u16be()? as i32;
                 let reset = self.read_u16be()? as i32;
-                // A field of 0 means "use the default".
+                // A field of 0 means "use the default" for MAXVAL/T1/T2/T3.
                 presets.maxval = (maxval > 0).then_some(maxval);
                 presets.t1 = (t1 > 0).then_some(t1);
                 presets.t2 = (t2 > 0).then_some(t2);
                 presets.t3 = (t3 > 0).then_some(t3);
-                presets.reset = (reset > 0).then_some(reset);
+                // RESET must be an explicit, valid halving threshold
+                // (T.87 C.2.4.1.1: RESET >= 3). A crafted RESET of 0/1/2 could
+                // suppress statistics halving and overflow the A/B accumulators
+                // on a long scan, so reject it outright rather than treating 0
+                // as a "use default" sentinel.
+                if reset < MIN_RESET {
+                    return Err(CodecError::InvalidData(format!(
+                        "LSE RESET={reset} invalid (must be >= {MIN_RESET})"
+                    )));
+                }
+                presets.reset = Some(reset);
                 // Skip any trailing bytes in an over-long segment.
                 self.skip(payload_len - 11)?;
                 Ok(())
@@ -293,6 +333,16 @@ impl<'a> Decoder<'a> {
         let sof_max_val = (1i32 << frame.precision) - 1;
         let max_val = presets.maxval.unwrap_or(sof_max_val);
 
+        // Effective MAXVAL must be positive and fit the SOF precision range
+        // (T.87 C.2.4.1.1). A preset MAXVAL exceeding (1<<precision)-1 would
+        // desync context arithmetic from the sample range.
+        if max_val <= 0 || max_val > sof_max_val {
+            return Err(CodecError::InvalidData(format!(
+                "LSE MAXVAL={max_val} outside 1..={sof_max_val} for precision {}",
+                frame.precision
+            )));
+        }
+
         // NEAR validity depends on the effective MAXVAL (T.87 C.2.4.1.1).
         let near_max = (max_val / 2).min(255);
         if scan.near < 0 || scan.near > near_max {
@@ -301,6 +351,22 @@ impl<'a> Decoder<'a> {
                 value: i64::from(scan.near),
                 allowed: "0..=min(255, MAXVAL/2)",
             });
+        }
+
+        // Effective quantization thresholds must satisfy the T.87 C.2.4.1.1
+        // ordering NEAR < T1 <= T2 <= T3 <= MAXVAL. Preset fields left at 0
+        // fall back to the spec defaults (already valid); an explicit preset
+        // that violates the ordering feeds a nonconformant quantizer.
+        let (dt1, dt2, dt3) = ContextModel::default_thresholds(max_val, scan.near);
+        let t1 = presets.t1.unwrap_or(dt1);
+        let t2 = presets.t2.unwrap_or(dt2);
+        let t3 = presets.t3.unwrap_or(dt3);
+        if !(scan.near < t1 && t1 <= t2 && t2 <= t3 && t3 <= max_val) {
+            return Err(CodecError::InvalidData(format!(
+                "LSE thresholds violate NEAR<T1<=T2<=T3<=MAXVAL \
+                 (NEAR={}, T1={t1}, T2={t2}, T3={t3}, MAXVAL={max_val})",
+                scan.near
+            )));
         }
 
         let w = exp_width as usize;
@@ -499,6 +565,113 @@ mod tests {
 
         let (decoded, _, _) = decode(&out, w as u32, h as u32).expect("LSE decode");
         assert_eq!(decoded, pixels);
+    }
+
+    /// Build SOI + SOF55 + LSE(ID=1) + SOS carrying the given preset fields.
+    /// Validation fires before scan decode, so no scan/EOI bytes are needed.
+    #[allow(clippy::too_many_arguments)]
+    fn lse_preset_stream(
+        precision: u8,
+        w: u16,
+        h: u16,
+        maxval: u16,
+        t1: u16,
+        t2: u16,
+        t3: u16,
+        reset: u16,
+        near: u8,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
+        out.extend_from_slice(&[0xFF, 0xF7]); // SOF55
+        out.extend_from_slice(&11u16.to_be_bytes());
+        out.push(precision);
+        out.extend_from_slice(&h.to_be_bytes());
+        out.extend_from_slice(&w.to_be_bytes());
+        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+        out.extend_from_slice(&[0xFF, 0xF8]); // LSE ID=1
+        out.extend_from_slice(&13u16.to_be_bytes());
+        out.push(1);
+        for v in [maxval, t1, t2, t3, reset] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out.extend_from_slice(&[0xFF, 0xDA]); // SOS
+        out.extend_from_slice(&8u16.to_be_bytes());
+        out.extend_from_slice(&[1, 1, 0x00, near, 0, 0]);
+        out
+    }
+
+    #[test]
+    fn sof_zero_dimension_rejected() {
+        // height = 0, width = 4 -> reject before allocation.
+        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
+        out.extend_from_slice(&11u16.to_be_bytes());
+        out.push(8);
+        out.extend_from_slice(&0u16.to_be_bytes()); // height
+        out.extend_from_slice(&4u16.to_be_bytes()); // width
+        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+        assert!(matches!(
+            decode(&out, 4, 0),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn sof_huge_dimensions_rejected_not_aborted() {
+        // 65535 x 65535 would demand ~8 GiB; the pixel cap must reject it as a
+        // clean Err rather than abort or OOM.
+        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
+        out.extend_from_slice(&11u16.to_be_bytes());
+        out.push(8);
+        out.extend_from_slice(&65535u16.to_be_bytes()); // height
+        out.extend_from_slice(&65535u16.to_be_bytes()); // width
+        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+        assert!(matches!(
+            decode(&out, 65535, 65535),
+            Err(CodecError::InvalidParameter {
+                name: "width*height",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lse_maxval_exceeds_precision_rejected() {
+        // precision 8 -> MAXVAL must be <= 255; a preset MAXVAL of 65535 fails.
+        let out = lse_preset_stream(8, 4, 4, 65535, 0, 0, 0, 64, 0);
+        assert!(matches!(
+            decode(&out, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn lse_threshold_ordering_rejected() {
+        // T1 > T2 violates NEAR < T1 <= T2 <= T3 <= MAXVAL.
+        let out = lse_preset_stream(8, 4, 4, 0, 100, 50, 200, 64, 0);
+        assert!(matches!(
+            decode(&out, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn lse_t3_exceeds_maxval_rejected() {
+        // Explicit MAXVAL 200, but T3 = 250 > MAXVAL.
+        let out = lse_preset_stream(8, 4, 4, 200, 5, 12, 250, 64, 0);
+        assert!(matches!(
+            decode(&out, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn lse_reset_zero_rejected() {
+        // RESET below the T.87 minimum (3) is rejected in read_lse.
+        let out = lse_preset_stream(8, 4, 4, 0, 0, 0, 0, 0, 0);
+        assert!(matches!(
+            decode(&out, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
     }
 
     #[test]

@@ -7,9 +7,7 @@ use std::io::Write;
 
 use crate::error::CodecError;
 
-use crate::bitstream::BitWriter;
-use crate::context::ContextModel;
-use crate::predictor::{clamp, predict_med};
+use crate::legacy;
 
 // ---------------------------------------------------------------------------
 // JPEG-LS markers
@@ -56,39 +54,22 @@ pub fn encode(
     let precision = effective_precision(max_pixel);
     let max_val: i32 = (1i32 << precision) - 1;
 
-    let mut bw = BitWriter::new(w);
-
     // SOI
-    write_marker(&mut bw, MARKER_SOI)?;
+    write_marker(w, MARKER_SOI)?;
 
     // SOF55
-    write_sof(&mut bw, precision as u8, height as u16, width as u16, 1)?;
+    write_sof(w, precision as u8, height as u16, width as u16, 1)?;
 
     // SOS (Near=0, ILV=0)
-    write_sos(&mut bw, 1, 0)?;
+    write_sos(w, 1, 0)?;
 
-    // Context model
-    let mut ctx = ContextModel::new(max_val, 0, 64);
+    // Entropy-coded scan (frozen 1.0.0 / Go-compatible path).
+    legacy::encode_scan(w, pixels, width_usize, height_usize, max_val, 0)?;
 
-    // Scan encoding
-    encode_scan(
-        &mut bw,
-        &mut ctx,
-        pixels,
-        width_usize,
-        height_usize,
-        max_val,
-    )?;
+    // EOI
+    write_marker(w, MARKER_EOI)?;
 
-    // Flush remaining bits
-    bw.flush()?;
-
-    // EOI -- write through the inner writer since we just flushed.
-    bw.write_byte((MARKER_EOI >> 8) as u8)?;
-    bw.write_byte((MARKER_EOI & 0xFF) as u8)?;
-
-    // Final flush
-    bw.inner_mut().flush()?;
+    w.flush()?;
 
     Ok(())
 }
@@ -97,161 +78,55 @@ pub fn encode(
 // Marker writers
 // ---------------------------------------------------------------------------
 
-fn write_marker<W: Write>(bw: &mut BitWriter<W>, marker: u16) -> Result<(), CodecError> {
-    bw.write_byte((marker >> 8) as u8)?;
-    bw.write_byte((marker & 0xFF) as u8)?;
+fn write_marker(w: &mut dyn Write, marker: u16) -> Result<(), CodecError> {
+    w.write_all(&marker.to_be_bytes())?;
     Ok(())
 }
 
-fn write_sof<W: Write>(
-    bw: &mut BitWriter<W>,
+fn write_sof(
+    w: &mut dyn Write,
     precision: u8,
     height: u16,
     width: u16,
     components: u8,
 ) -> Result<(), CodecError> {
-    write_marker(bw, MARKER_SOF55)?;
+    write_marker(w, MARKER_SOF55)?;
 
     // Length: 2 + 1(P) + 2(Y) + 2(X) + 1(Nf) + Nf*3
     let length: u16 = 8 + u16::from(components) * 3;
-    bw.write_u16be(length)?;
+    w.write_all(&length.to_be_bytes())?;
 
-    bw.write_byte(precision)?;
-    bw.write_u16be(height)?;
-    bw.write_u16be(width)?;
-    bw.write_byte(components)?;
+    w.write_all(&[precision])?;
+    w.write_all(&height.to_be_bytes())?;
+    w.write_all(&width.to_be_bytes())?;
+    w.write_all(&[components])?;
 
     for i in 0..components {
-        bw.write_byte(i + 1)?; // Component ID
-        bw.write_byte(0x11)?; // H=1, V=1
-        bw.write_byte(0x00)?; // Tq=0
+        w.write_all(&[i + 1])?; // Component ID
+        w.write_all(&[0x11])?; // H=1, V=1
+        w.write_all(&[0x00])?; // Tq=0
     }
     Ok(())
 }
 
-fn write_sos<W: Write>(bw: &mut BitWriter<W>, components: u8, near: u8) -> Result<(), CodecError> {
-    write_marker(bw, MARKER_SOS)?;
+fn write_sos(w: &mut dyn Write, components: u8, near: u8) -> Result<(), CodecError> {
+    write_marker(w, MARKER_SOS)?;
 
     // Length: 2 + 1(Ns) + Ns*2 + 3
     let length: u16 = 6 + u16::from(components) * 2;
-    bw.write_u16be(length)?;
+    w.write_all(&length.to_be_bytes())?;
 
-    bw.write_byte(components)?;
+    w.write_all(&[components])?;
 
     for i in 0..components {
-        bw.write_byte(i + 1)?; // Component ID
-        bw.write_byte(0x00)?; // Mapping table selector
+        w.write_all(&[i + 1])?; // Component ID
+        w.write_all(&[0x00])?; // Mapping table selector
     }
 
-    bw.write_byte(near)?; // Near
-    bw.write_byte(0x00)?; // ILV = 0
-    bw.write_byte(0x00)?; // Al=0, Ah=0
+    w.write_all(&[near])?; // Near
+    w.write_all(&[0x00])?; // ILV = 0
+    w.write_all(&[0x00])?; // Al=0, Ah=0
 
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Scan encoder
-// ---------------------------------------------------------------------------
-
-fn encode_scan<W: Write>(
-    bw: &mut BitWriter<W>,
-    ctx: &mut ContextModel,
-    pixels: &[u16],
-    w: usize,
-    h: usize,
-    max_val: i32,
-) -> Result<(), CodecError> {
-    let mut curr_line = vec![0i32; w];
-    let mut prev_line = vec![0i32; w];
-
-    let range_val = max_val + 1;
-
-    for y in 0..h {
-        ctx.run_index = 0;
-
-        // Read current line into curr_line.
-        for x in 0..w {
-            curr_line[x] = i32::from(pixels[y * w + x]);
-        }
-
-        let mut x = 0usize;
-        while x < w {
-            // Compute neighbours.
-            let ra = if x > 0 {
-                curr_line[x - 1]
-            } else if y > 0 {
-                prev_line[0]
-            } else {
-                0
-            };
-
-            let rb = if y > 0 { prev_line[x] } else { 0 };
-
-            let rc = if y > 0 {
-                if x > 0 {
-                    prev_line[x - 1]
-                } else {
-                    prev_line[0]
-                }
-            } else {
-                0
-            };
-
-            let rd = if y > 0 {
-                if x < w - 1 {
-                    prev_line[x + 1]
-                } else {
-                    rb
-                }
-            } else {
-                0
-            };
-
-            // Gradients
-            let d1 = rd - rb;
-            let d2 = rb - rc;
-            let d3 = rc - ra;
-
-            // Run mode is intentionally disabled for compatibility with
-            // existing DICOS files produced by the Go codec.
-            // Regular mode:
-            let (q, sign) = ctx.get_context_index(d1, d2, d3);
-
-            let mut px = predict_med(ra, rb, rc);
-            px += sign * ctx.c[q];
-            px = clamp(px, 0, max_val);
-
-            let ix = curr_line[x];
-            let mut err_val = ix - px;
-            if sign == -1 {
-                err_val = -err_val;
-            }
-
-            // Modulo reduction.
-            if err_val < -range_val / 2 {
-                err_val += range_val;
-            }
-            if err_val > range_val / 2 {
-                err_val -= range_val;
-            }
-
-            // Map error to non-negative.
-            let mapped = if err_val >= 0 {
-                (2 * err_val) as u32
-            } else {
-                (-2 * err_val - 1) as u32
-            };
-
-            let k = ctx.compute_k(q);
-            bw.write_golomb(k, mapped)?;
-
-            ctx.update_stats(q, err_val);
-            x += 1;
-        }
-
-        prev_line.copy_from_slice(&curr_line);
-    }
     Ok(())
 }
 

@@ -5,9 +5,11 @@
 //!
 //! Reference: ISO/IEC 14495-1, Section A.7.
 
-use crate::bitstream::{BitReader, BitWriter};
-use crate::context::ContextModel;
+// TODO(t87): run mode is rewritten and wired into the scan loops in L4. Until
+// then this module builds on the frozen legacy primitives so its behavior and
+// tests stay stable while bitstream.rs / context.rs diverge toward T.87.
 use crate::error::CodecError;
+use crate::legacy::{BitReader, BitWriter, ContextModel};
 use std::io::Write;
 
 // ---------------------------------------------------------------------------
@@ -238,8 +240,7 @@ fn run_interruption_prediction(ra: i32, rb: i32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitstream::{BitReader, BitWriter};
-    use crate::context::ContextModel;
+    use crate::legacy::{BitReader, BitWriter, ContextModel};
 
     /// Encode then decode a run and verify the output matches.
     fn roundtrip_run(curr_line: &[i32], ra: i32, rb: i32) -> Vec<i32> {

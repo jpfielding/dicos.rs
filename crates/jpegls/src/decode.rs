@@ -5,9 +5,7 @@
 
 use crate::error::CodecError;
 
-use crate::bitstream::BitReader;
-use crate::context::ContextModel;
-use crate::predictor::{clamp, predict_med};
+use crate::legacy;
 
 // ---------------------------------------------------------------------------
 // JPEG-LS markers
@@ -209,143 +207,19 @@ impl<'a> Decoder<'a> {
         }
 
         let max_val = (1i32 << frame.precision) - 1;
-        let mut ctx = ContextModel::new(max_val, scan.near, 64);
 
         // The rest of the data (from current `pos`) is the entropy-coded scan.
         let scan_data = &self.data[self.pos..];
-        let mut br = BitReader::new(scan_data);
 
         let w = exp_width as usize;
         let h = exp_height as usize;
         let mut pixels = vec![0u16; w * h];
-        decode_scan(&mut br, &mut ctx, &mut pixels, w, h, max_val)?;
+
+        // Entropy-coded scan (frozen 1.0.0 / Go-compatible path).
+        legacy::decode_scan(scan_data, &mut pixels, w, h, max_val, scan.near)?;
 
         Ok((pixels, exp_width, exp_height))
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scan decoder
-// ---------------------------------------------------------------------------
-
-fn decode_scan(
-    br: &mut BitReader<'_>,
-    ctx: &mut ContextModel,
-    pixels: &mut [u16],
-    w: usize,
-    h: usize,
-    max_val: i32,
-) -> Result<(), CodecError> {
-    let mut curr_line = vec![0i32; w];
-    let mut prev_line = vec![0i32; w];
-
-    let max_val_plus1 = max_val + 1;
-
-    for y in 0..h {
-        ctx.run_index = 0;
-
-        let mut x = 0usize;
-        while x < w {
-            // Neighbours.
-            let ra = if x > 0 {
-                curr_line[x - 1]
-            } else if y > 0 {
-                prev_line[0]
-            } else {
-                0
-            };
-
-            let rb = if y > 0 { prev_line[x] } else { 0 };
-
-            let rc = if y > 0 {
-                if x > 0 {
-                    prev_line[x - 1]
-                } else {
-                    prev_line[0]
-                }
-            } else {
-                0
-            };
-
-            let rd = if y > 0 {
-                if x < w - 1 {
-                    prev_line[x + 1]
-                } else {
-                    rb
-                }
-            } else {
-                0
-            };
-
-            // Gradients.
-            let d1 = rd - rb;
-            let d2 = rb - rc;
-            let d3 = rc - ra;
-
-            // Run mode is intentionally disabled for compatibility with
-            // existing DICOS files produced by the Go codec. Regular mode:
-            let (q, sign) = ctx.get_context_index(d1, d2, d3);
-
-            let mut px = predict_med(ra, rb, rc);
-            px += sign * ctx.c[q];
-            px = clamp(px, 0, max_val);
-
-            let k = ctx.compute_k(q);
-            let mapped_err = match br.read_golomb(k) {
-                Ok(v) => v,
-                Err(e) => {
-                    // A marker-encountered error during the last pixels of
-                    // the image is normal (EOI marker).
-                    if e.to_string().contains("marker encountered") {
-                        return Ok(());
-                    }
-                    return Err(e);
-                }
-            };
-
-            // Inverse-map the error (using wrapping to handle large values).
-            let em = mapped_err as i32;
-            let stats_err = if em & 1 == 0 {
-                em >> 1
-            } else {
-                em.wrapping_add(1).wrapping_neg() >> 1
-            };
-
-            let mut err_val = stats_err;
-            if sign == -1 {
-                err_val = -err_val;
-            }
-
-            ctx.update_stats(q, stats_err);
-
-            // Use wrapping arithmetic -- the intermediate value can exceed
-            // i32 range for 16-bit images. Modulo reduction brings it back.
-            let mut rx = (px as i64 + err_val as i64) as i32;
-
-            // Modulo reduction to [0, max_val].
-            if rx < 0 {
-                rx += max_val_plus1;
-            }
-            if rx > max_val {
-                rx -= max_val_plus1;
-            }
-            rx = rx.clamp(0, max_val);
-
-            curr_line[x] = rx;
-            pixels[y * w + x] = rx as u16;
-
-            x += 1;
-        }
-
-        // Copy to pixel buffer (the curr_line was written pixel-by-pixel in
-        // run_mode but regular mode only stored into curr_line).
-        for xi in 0..w {
-            pixels[y * w + xi] = curr_line[xi] as u16;
-        }
-
-        prev_line.copy_from_slice(&curr_line);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

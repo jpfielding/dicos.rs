@@ -271,3 +271,38 @@ pub(crate) fn wrap_undefined_length_sq(inner: &[u8]) -> Vec<u8> {
     sq.extend_from_slice(&0u32.to_le_bytes());
     sq
 }
+
+/// Emits the (7FE0,0010) OB element header with undefined length, the on-disk
+/// marker for encapsulated pixel data.
+pub(crate) fn push_encapsulated_pixeldata_header(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+    buf.extend_from_slice(&0x0010u16.to_le_bytes());
+    buf.extend_from_slice(b"OB");
+    buf.extend_from_slice(&[0u8, 0u8]); // reserved (long VR)
+    buf.extend_from_slice(&UNDEFINED_LENGTH.to_le_bytes());
+}
+
+/// Emits a Basic Offset Table item: FFFE,E000 | (offsets.len()*4) | offsets.
+pub(crate) fn push_basic_offset_table(buf: &mut Vec<u8>, offsets: &[u32]) {
+    buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+    buf.extend_from_slice(&0xE000u16.to_le_bytes());
+    buf.extend_from_slice(&((offsets.len() * 4) as u32).to_le_bytes());
+    for &o in offsets {
+        buf.extend_from_slice(&o.to_le_bytes());
+    }
+}
+
+/// Emits an encapsulated fragment item: FFFE,E000 | data.len() | data.
+pub(crate) fn push_pixel_fragment(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+    buf.extend_from_slice(&0xE000u16.to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// Emits the Sequence Delimitation Item that terminates encapsulated pixel data.
+pub(crate) fn push_sequence_delimitation(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+    buf.extend_from_slice(&0xE0DDu16.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+}

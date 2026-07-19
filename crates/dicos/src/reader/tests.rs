@@ -423,6 +423,7 @@ fn parse_without_warnings_still_succeeds_on_clean_file() {
     let elements = vec![
         Element::new(tag::ROWS, Vr::US, Value::U16(2)),
         Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+        Element::new(tag::BITS_ALLOCATED, Vr::US, Value::U16(16)),
         Element::new(
             tag::PIXEL_DATA,
             Vr::OW,
@@ -435,4 +436,140 @@ fn parse_without_warnings_still_succeeds_on_clean_file() {
     assert!(warnings.is_empty(), "clean file should have no warnings");
     let pd = ds.pixel_data().expect("pixel data present");
     assert_eq!(pd.native_frames().unwrap()[0], vec![1u16, 2, 3, 4]);
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial-review robustness / correctness regression tests
+// ---------------------------------------------------------------------------
+
+/// A Basic Offset Table declaring a gigantic length must not trigger a giant
+/// upfront allocation; it should fail fast on the first missing entry.
+#[test]
+fn encapsulated_bot_length_bomb_is_rejected_without_huge_alloc() {
+    // Geometry so the reader reaches the encapsulated pixel data element.
+    let elements = vec![
+        Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+        Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+    ];
+    let mut data = build_minimal_explicit_vr_le(&elements);
+
+    // (7FE0,0010) OB undefined-length, then a BOT item whose declared length is
+    // ~4 GB but with no body — a classic allocation-bomb shape.
+    push_encapsulated_pixeldata_header(&mut data);
+    data.extend_from_slice(&0xFFFEu16.to_le_bytes()); // Item tag
+    data.extend_from_slice(&0xE000u16.to_le_bytes());
+    data.extend_from_slice(&0xFFFF_FFFCu32.to_le_bytes()); // bot_len ~= 4 GB
+                                                           // No further bytes: the first BOT entry read must truncate.
+
+    let result = parse(io::Cursor::new(data));
+    assert!(
+        matches!(result, Err(DicosError::Truncated { .. })),
+        "expected Truncated, got: {result:?}"
+    );
+}
+
+/// With a Basic Offset Table present, a single frame may span multiple
+/// fragments. Frame 0 = fragments 0+1 concatenated; frame 1 = fragment 2.
+#[test]
+fn encapsulated_multi_fragment_frame_uses_offset_table() {
+    let elements = vec![
+        Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+        Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+    ];
+    let mut data = build_minimal_explicit_vr_le(&elements);
+
+    let frag0: &[u8] = &[0xAA, 0xBB];
+    let frag1: &[u8] = &[0xCC, 0xDD, 0xEE, 0xFF];
+    let frag2: &[u8] = &[0x11, 0x22];
+
+    // BOT offsets are relative to the first fragment's Item Tag. Each fragment
+    // occupies an 8-byte item header plus its body.
+    let frame1_offset = (8 + frag0.len() as u32) + (8 + frag1.len() as u32);
+
+    push_encapsulated_pixeldata_header(&mut data);
+    push_basic_offset_table(&mut data, &[0, frame1_offset]);
+    push_pixel_fragment(&mut data, frag0);
+    push_pixel_fragment(&mut data, frag1);
+    push_pixel_fragment(&mut data, frag2);
+    push_sequence_delimitation(&mut data);
+
+    let ds = parse(io::Cursor::new(data)).expect("parse should succeed");
+    let pd = ds.pixel_data().expect("pixel data present");
+
+    assert_eq!(pd.num_frames(), 2, "BOT declares two frames");
+    // Frame 0 is the concatenation of fragments 0 and 1.
+    let mut frame0 = frag0.to_vec();
+    frame0.extend_from_slice(frag1);
+    assert_eq!(pd.encapsulated_frame(0), Some(frame0.as_slice()));
+    // Frame 1 is fragment 2 alone.
+    assert_eq!(pd.encapsulated_frame(1), Some(frag2));
+    // The BOT offsets are preserved on the PixelData.
+    assert_eq!(pd.offsets(), &[0, frame1_offset]);
+}
+
+/// With an empty BOT, the reader falls back to one fragment per frame.
+#[test]
+fn encapsulated_empty_bot_is_one_fragment_per_frame() {
+    let elements = vec![
+        Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+        Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+    ];
+    let mut data = build_minimal_explicit_vr_le(&elements);
+
+    push_encapsulated_pixeldata_header(&mut data);
+    push_basic_offset_table(&mut data, &[]); // empty BOT
+    push_pixel_fragment(&mut data, &[0x01, 0x02]);
+    push_pixel_fragment(&mut data, &[0x03, 0x04]);
+    push_sequence_delimitation(&mut data);
+
+    let ds = parse(io::Cursor::new(data)).expect("parse should succeed");
+    let pd = ds.pixel_data().expect("pixel data present");
+    assert_eq!(pd.num_frames(), 2);
+    assert_eq!(pd.encapsulated_frame(0), Some([0x01, 0x02].as_slice()));
+    assert_eq!(pd.encapsulated_frame(1), Some([0x03, 0x04].as_slice()));
+}
+
+/// 8-bit native pixel data (BitsAllocated=8) yields one sample per byte, not
+/// one 16-bit sample per byte pair.
+#[test]
+fn native_8bit_pixel_data_is_one_sample_per_byte() {
+    let elements = vec![
+        Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+        Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+        Element::new(tag::BITS_ALLOCATED, Vr::US, Value::U16(8)),
+        Element::new(tag::PIXEL_DATA, Vr::OB, Value::Bytes(vec![10, 20, 30, 40])),
+    ];
+    let data = build_minimal_explicit_vr_le(&elements);
+
+    let (ds, warnings) = parse_with_warnings(io::Cursor::new(data)).expect("parse should succeed");
+    assert!(
+        warnings.is_empty(),
+        "8-bit decode should be clean: {warnings:?}"
+    );
+    let pd = ds.pixel_data().expect("pixel data present");
+    // Four bytes -> four samples (not two 16-bit samples).
+    assert_eq!(pd.native_frame(0), Some([10u16, 20, 30, 40].as_slice()));
+}
+
+/// Absent BitsAllocated keeps the 16-bit pairing behavior but warns.
+#[test]
+fn native_missing_bits_allocated_warns() {
+    let elements = vec![
+        Element::new(tag::ROWS, Vr::US, Value::U16(2)),
+        Element::new(tag::COLUMNS, Vr::US, Value::U16(2)),
+        Element::new(
+            tag::PIXEL_DATA,
+            Vr::OW,
+            Value::Bytes(vec![1, 0, 2, 0, 3, 0, 4, 0]),
+        ),
+    ];
+    let data = build_minimal_explicit_vr_le(&elements);
+
+    let (ds, warnings) = parse_with_warnings(io::Cursor::new(data)).expect("parse should succeed");
+    assert!(
+        warnings.contains(&ParseWarning::BitsAllocatedMissing),
+        "expected BitsAllocatedMissing warning, got: {warnings:?}"
+    );
+    let pd = ds.pixel_data().expect("pixel data present");
+    assert_eq!(pd.native_frame(0), Some([1u16, 2, 3, 4].as_slice()));
 }

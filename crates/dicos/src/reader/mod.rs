@@ -41,6 +41,9 @@ pub enum ParseWarning {
         /// The number of pixels expected from the image geometry.
         expected: usize,
     },
+    /// BitsAllocated (0028,0100) was absent, so the sample width is unknown;
+    /// native pixel data was decoded assuming 16-bit little-endian samples.
+    BitsAllocatedMissing,
 }
 
 impl fmt::Display for ParseWarning {
@@ -54,6 +57,11 @@ impl fmt::Display for ParseWarning {
                 f,
                 "native pixel data size ({actual} pixels) does not match rows*cols*frames \
                  ({expected}); storing as a single frame"
+            ),
+            ParseWarning::BitsAllocatedMissing => write!(
+                f,
+                "BitsAllocated (0028,0100) is absent; native pixel data decoded as 16-bit \
+                 little-endian samples"
             ),
         }
     }
@@ -74,6 +82,13 @@ const DEFAULT_MAX_ELEMENT_LENGTH: usize = 1024 * 1024 * 1024;
 /// deeply nested sequences cannot overflow the stack. Legitimate DICOS/DICOM
 /// files nest only a handful of levels.
 const MAX_NESTING_DEPTH: usize = 64;
+
+/// Upper bound on the number of Basic Offset Table entries we will speculatively
+/// reserve capacity for. The declared BOT length is attacker-controlled, so we
+/// never reserve based on it directly; entries beyond this cap grow the vector
+/// on demand as they are actually read (and a bogus count fails fast on the
+/// first truncated read).
+const BOT_RESERVE_CAP: u32 = 4096;
 
 /// Allocate a buffer of `len` bytes, rejecting sizes above `limit`.
 fn checked_alloc(len: u32, limit: usize) -> Result<Vec<u8>, DicosError> {
@@ -517,7 +532,6 @@ impl<R: Read> DicosReader<R> {
     /// Reads encapsulated pixel data (Basic Offset Table + compressed frames).
     fn read_encapsulated_pixel_data(&mut self) -> Result<PixelData, DicosError> {
         let mut offsets = Vec::new();
-        let mut frames = Vec::new();
 
         // Read Basic Offset Table item
         let bot_tag = self.read_tag_required("basic offset table")?;
@@ -532,13 +546,23 @@ impl<R: Read> DicosReader<R> {
         let bot_len = self.read_u32_ctx("basic offset table length")?;
         if bot_len > 0 {
             let num_offsets = bot_len / 4;
-            offsets.reserve(num_offsets as usize);
+            // Never reserve based on the attacker-controlled BOT length: a value
+            // like 0xFFFFFFFC would request ~1 billion entries before a single
+            // byte is validated. Cap the speculative reservation; each entry is
+            // read via read_u32_ctx, so a bogus count fails fast (Truncated) on
+            // the first missing entry with no giant upfront allocation.
+            offsets.reserve(num_offsets.min(BOT_RESERVE_CAP) as usize);
             for _ in 0..num_offsets {
                 offsets.push(self.read_u32_ctx("basic offset table entry")?);
             }
         }
 
-        // Read frames until Sequence Delimitation Item
+        // Read fragment items until the Sequence Delimitation Item. Track each
+        // fragment's byte offset relative to the first fragment's Item Tag,
+        // which is what BOT entries reference (DICOM PS3.5 A.4).
+        let mut fragments: Vec<Vec<u8>> = Vec::new();
+        let mut fragment_offsets: Vec<u32> = Vec::new();
+        let mut running_offset: u32 = 0;
         loop {
             let item_tag = self.read_tag_required("encapsulated pixel data")?;
 
@@ -560,8 +584,14 @@ impl<R: Read> DicosReader<R> {
             let mut frame_data = checked_alloc(item_len, self.max_element_bytes)?;
             self.read_exact_ctx(&mut frame_data, "encapsulated frame")?;
 
-            frames.push(frame_data);
+            fragment_offsets.push(running_offset);
+            fragments.push(frame_data);
+            // Each fragment on the wire is an 8-byte item header (tag + length)
+            // plus its body. saturating_add keeps a hostile stream from wrapping.
+            running_offset = running_offset.saturating_add(8).saturating_add(item_len);
         }
+
+        let frames = assemble_encapsulated_frames(fragments, &fragment_offsets, &offsets);
 
         Ok(PixelData::encapsulated(frames, offsets))
     }
@@ -892,6 +922,42 @@ fn parse_sequence_items(
     Ok(items)
 }
 
+/// Groups encapsulated fragments into frames using the Basic Offset Table.
+///
+/// Per DICOM PS3.5 A.4 a single frame may be split across multiple fragments,
+/// and each BOT entry gives the byte offset (relative to the first fragment's
+/// Item Tag) of the first fragment of a frame. When the BOT is present and
+/// non-empty, fragments whose offset falls in a frame's `[start, next_start)`
+/// window are concatenated into that frame.
+///
+/// When the BOT is empty (a permitted encoding, and the common case), we fall
+/// back to the single-fragment-per-frame assumption: each fragment becomes its
+/// own frame. This cannot recover multi-fragment frames without a BOT, but it
+/// is correct for the overwhelmingly common one-fragment-per-frame encoding.
+fn assemble_encapsulated_frames(
+    fragments: Vec<Vec<u8>>,
+    fragment_offsets: &[u32],
+    bot: &[u32],
+) -> Vec<Vec<u8>> {
+    if bot.is_empty() {
+        // Empty BOT: assume one fragment per frame (documented fallback).
+        return fragments;
+    }
+
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(bot.len());
+    for (i, &start) in bot.iter().enumerate() {
+        let end = bot.get(i + 1).copied().unwrap_or(u32::MAX);
+        let mut frame = Vec::new();
+        for (frag, &foff) in fragments.iter().zip(fragment_offsets) {
+            if foff >= start && foff < end {
+                frame.extend_from_slice(frag);
+            }
+        }
+        frames.push(frame);
+    }
+    frames
+}
+
 /// Normalizes raw OW/OB pixel data bytes to PixelData::Native after parsing.
 ///
 /// The reader stores fixed-length (7FE0,0010) as Value::Bytes. This converts
@@ -904,6 +970,7 @@ fn normalize_native_pixel_data(ds: &mut Dataset) -> Vec<ParseWarning> {
     let rows = ds.rows().unwrap_or(0) as usize;
     let cols = ds.columns().unwrap_or(0) as usize;
     let num_frames = ds.number_of_frames() as usize;
+    let bits_allocated = ds.bits_allocated();
 
     if rows == 0 || cols == 0 {
         return warnings;
@@ -929,17 +996,29 @@ fn normalize_native_pixel_data(ds: &mut Dataset) -> Vec<ParseWarning> {
         None => return warnings,
     };
 
-    // Decode as little-endian u16 pixels. A trailing odd byte cannot belong to
-    // a 16-bit pixel, so flag it rather than dropping it silently.
-    if raw_bytes.len() % 2 != 0 {
-        warnings.push(ParseWarning::OddPixelDataLength {
-            length: raw_bytes.len(),
-        });
-    }
-    let all_pixels: Vec<u16> = raw_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    // Decode raw bytes into u16 samples according to BitsAllocated (0028,0100).
+    // 8-bit images store one sample per byte; anything else (and the default)
+    // uses 16-bit little-endian pairing. When BitsAllocated is absent we cannot
+    // be sure of the width, so we keep 16-bit pairing but warn.
+    let all_pixels: Vec<u16> = if bits_allocated == Some(8) {
+        // 8-bit samples: each byte is one pixel, widened into the u16 buffer.
+        raw_bytes.iter().map(|&b| u16::from(b)).collect()
+    } else {
+        if bits_allocated.is_none() {
+            warnings.push(ParseWarning::BitsAllocatedMissing);
+        }
+        // A trailing odd byte cannot belong to a 16-bit pixel, so flag it rather
+        // than dropping it silently.
+        if raw_bytes.len() % 2 != 0 {
+            warnings.push(ParseWarning::OddPixelDataLength {
+                length: raw_bytes.len(),
+            });
+        }
+        raw_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
 
     let expected = frame_pixels.saturating_mul(num_frames.max(1));
     let frames: Vec<Vec<u16>> = if num_frames > 1 && all_pixels.len() == frame_pixels * num_frames {

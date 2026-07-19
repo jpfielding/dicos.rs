@@ -22,6 +22,12 @@ const MARKER_DHT: u16 = 0xFFC4;
 const MARKER_SOS: u16 = 0xFFDA;
 const MARKER_DRI: u16 = 0xFFDD;
 
+/// Hard cap on the number of pixels a single decode will allocate for.
+/// Guards against attacker-controlled (or corrupted) SOF3 dimensions forcing
+/// an unbounded allocation in `scan::decode_scan`; matches jpegrle's /
+/// jpeg2k's image-area cap.
+const MAX_PIXELS: usize = 1 << 28;
+
 // ---------------------------------------------------------------------------
 // Decoder state
 // ---------------------------------------------------------------------------
@@ -134,6 +140,18 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         });
     }
 
+    // Guard against dimensions that would force an unbounded allocation in
+    // `scan::decode_scan` (`vec![0u16; width*height]`), before any such
+    // allocation happens.
+    let num_pixels = (jpeg_w as usize)
+        .checked_mul(jpeg_h as usize)
+        .filter(|&n| n <= MAX_PIXELS)
+        .ok_or(CodecError::InvalidParameter {
+            name: "width*height",
+            value: (jpeg_w as i64).saturating_mul(jpeg_h as i64),
+            allowed: "product <= 268435456 pixels (1<<28)",
+        })?;
+
     // Get Huffman table
     let table_idx = if !dec.comp_info.is_empty() {
         dec.comp_info[0].table_index as usize
@@ -170,7 +188,7 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
     .map_err(|e| CodecError::InvalidData(format!("scan decode error: {e}")))?;
 
     let pixel_count = pixels.len();
-    let expected = (jpeg_w as usize) * (jpeg_h as usize);
+    let expected = num_pixels;
     if pixel_count != expected {
         return Err(CodecError::DimensionMismatch {
             expected,
@@ -241,10 +259,11 @@ fn parse_sof3<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
     // out-of-range values here prevents the `1 << (precision - 1)` underflow
     // (P == 0/1) and out-of-bounds shifts (P > 16) in the DPCM loop.
     if !(2..=16).contains(&dec.precision) {
-        return Err(CodecError::InvalidData(format!(
-            "invalid SOF3 sample precision: {} (must be 2..=16)",
-            dec.precision
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "precision",
+            value: i64::from(dec.precision),
+            allowed: "2..=16",
+        });
     }
 
     // This codec supports single-component (grayscale) frames only.
@@ -390,35 +409,41 @@ fn parse_sos<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
     dec.predictor = data[offset];
     offset += 1;
     if !(1..=7).contains(&dec.predictor) {
-        return Err(CodecError::InvalidData(format!(
-            "invalid SOS predictor selector Ss={} (must be 1..=7)",
-            dec.predictor
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "predictor",
+            value: i64::from(dec.predictor),
+            allowed: "1..=7",
+        });
     }
 
     // Se must be 0 for lossless.
     let se = data[offset];
     offset += 1;
     if se != 0 {
-        return Err(CodecError::InvalidData(format!(
-            "invalid SOS Se={se} (must be 0 for lossless)"
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "Se",
+            value: i64::from(se),
+            allowed: "0 (lossless)",
+        });
     }
 
     // Ah (high nibble) must be 0; Al (low nibble) = Pt = point transform.
     let ah = data[offset] >> 4;
     let al = data[offset] & 0x0F;
     if ah != 0 {
-        return Err(CodecError::InvalidData(format!(
-            "invalid SOS Ah={ah} (must be 0 for lossless)"
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "Ah",
+            value: i64::from(ah),
+            allowed: "0 (lossless)",
+        });
     }
     // Pt must be strictly less than the sample precision (T.81 Table B.3).
     if al >= dec.precision {
-        return Err(CodecError::InvalidData(format!(
-            "invalid SOS point transform Al={al} (must be < precision {})",
-            dec.precision
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "point_transform",
+            value: i64::from(al),
+            allowed: "< sample precision",
+        });
     }
     dec.point_transform = al;
 
@@ -521,7 +546,10 @@ mod tests {
     fn reject_precision_zero() {
         assert!(matches!(
             decode(&sof3_stream(0, 1), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "precision",
+                ..
+            })
         ));
     }
 
@@ -529,7 +557,10 @@ mod tests {
     fn reject_precision_one() {
         assert!(matches!(
             decode(&sof3_stream(1, 1), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "precision",
+                ..
+            })
         ));
     }
 
@@ -537,7 +568,10 @@ mod tests {
     fn reject_precision_seventeen() {
         assert!(matches!(
             decode(&sof3_stream(17, 1), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "precision",
+                ..
+            })
         ));
     }
 
@@ -555,7 +589,10 @@ mod tests {
         // Ss = 0 (hierarchical-only) is illegal for lossless.
         assert!(matches!(
             decode(&sos_stream(0, 0, 0), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
         ));
     }
 
@@ -563,7 +600,10 @@ mod tests {
     fn reject_predictor_eight() {
         assert!(matches!(
             decode(&sos_stream(8, 0, 0), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
         ));
     }
 
@@ -571,7 +611,7 @@ mod tests {
     fn reject_nonzero_se() {
         assert!(matches!(
             decode(&sos_stream(1, 5, 0), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter { name: "Se", .. })
         ));
     }
 
@@ -580,7 +620,7 @@ mod tests {
         // Ah = high nibble = 1.
         assert!(matches!(
             decode(&sos_stream(1, 0, 0x10), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter { name: "Ah", .. })
         ));
     }
 
@@ -589,7 +629,41 @@ mod tests {
         // precision = 8, Al = 8 must be rejected.
         assert!(matches!(
             decode(&sos_stream(1, 0, 0x08), 1, 1),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "point_transform",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_huge_dims_rejected_not_abort() {
+        // SOF3 width/height are 16-bit stream fields, so the largest
+        // representable (and thus the largest that can pass the
+        // DimensionMismatch check against caller-supplied dims) is 65535 x
+        // 65535 -- ~4.29 billion pixels, which would otherwise force an
+        // 8+ GiB `Vec<u16>` allocation in `scan::decode_scan`. Must return an
+        // error, not abort. A minimal valid SOS is included so parsing
+        // reaches the post-header dimension/cap checks.
+        let mut v = vec![0xFF, 0xD8]; // SOI
+        let sof_payload = vec![8u8, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0x11, 0x00]; // P, H, W, Nf, comp
+        let sof_len = (sof_payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC3]);
+        v.extend_from_slice(&sof_len.to_be_bytes());
+        v.extend_from_slice(&sof_payload);
+        let sos_payload = vec![1u8, 1, 0x00, 1, 0, 0]; // Nf, (id,table), Ss, Se, Ah|Al
+        let sos_len = (sos_payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&sos_len.to_be_bytes());
+        v.extend_from_slice(&sos_payload);
+
+        let result = decode(&v, 0xFFFF, 0xFFFF);
+        assert!(matches!(
+            result,
+            Err(CodecError::InvalidParameter {
+                name: "width*height",
+                ..
+            })
         ));
     }
 

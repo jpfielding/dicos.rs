@@ -7,9 +7,6 @@ use crate::packbits::encode_packbits;
 /// 4 bytes for segment count + 15 * 4 bytes for offsets = 64 bytes.
 const HEADER_SIZE: u32 = 64;
 
-/// Maximum number of segments in a DICOM RLE frame.
-const MAX_SEGMENTS: usize = 15;
-
 /// Encode a 16-bit grayscale image into DICOM RLE format.
 ///
 /// `pixels` is a row-major pixel buffer of length `width * height`.
@@ -48,13 +45,6 @@ pub fn encode(
 
     // PackBits-compress each byte plane
     let mut segments = vec![encode_packbits(&high_bytes), encode_packbits(&low_bytes)];
-
-    if segments.len() > MAX_SEGMENTS {
-        return Err(CodecError::InvalidData(format!(
-            "too many RLE segments: {}",
-            segments.len()
-        )));
-    }
 
     // Pad each segment to even length (DICOM RLE requirement)
     for seg in &mut segments {

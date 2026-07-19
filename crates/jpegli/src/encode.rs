@@ -114,33 +114,36 @@ pub fn encode_with_options(
 
     // --- Option validation (T.81 Table B.3 / B.2.2) --------------------------
     if !(2..=16).contains(&opts.precision) {
-        return Err(CodecError::InvalidData(format!(
-            "invalid precision {} (must be 2..=16)",
-            opts.precision
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "precision",
+            value: i64::from(opts.precision),
+            allowed: "2..=16",
+        });
     }
     if !(1..=7).contains(&opts.predictor) {
-        return Err(CodecError::InvalidData(format!(
-            "invalid predictor {} (must be 1..=7)",
-            opts.predictor
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "predictor",
+            value: i64::from(opts.predictor),
+            allowed: "1..=7",
+        });
     }
     if opts.point_transform >= opts.precision {
-        return Err(CodecError::InvalidData(format!(
-            "invalid point transform {} (must be < precision {})",
-            opts.point_transform, opts.precision
-        )));
+        return Err(CodecError::InvalidParameter {
+            name: "point_transform",
+            value: i64::from(opts.point_transform),
+            allowed: "< precision",
+        });
     }
 
     // Every sample must fit in `precision` bits.
     let sample_limit: u32 = 1u32 << opts.precision;
     if let Some(&max) = pixels.iter().max() {
         if (max as u32) >= sample_limit {
-            return Err(CodecError::InvalidData(format!(
-                "sample value {max} exceeds precision {} (max {})",
-                opts.precision,
-                sample_limit - 1
-            )));
+            return Err(CodecError::InvalidParameter {
+                name: "sample_value",
+                value: i64::from(max),
+                allowed: "< 2^precision",
+            });
         }
     }
 
@@ -452,12 +455,18 @@ mod tests {
         let mut buf = Vec::new();
         assert!(matches!(
             encode_with_options(&pixels, 2, 2, &opts(0, 0, 16), &mut buf),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
         ));
         buf.clear();
         assert!(matches!(
             encode_with_options(&pixels, 2, 2, &opts(8, 0, 16), &mut buf),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
         ));
     }
 
@@ -469,7 +478,10 @@ mod tests {
             assert!(
                 matches!(
                     encode_with_options(&pixels, 2, 2, &opts(1, 0, p), &mut buf),
-                    Err(CodecError::InvalidData(_))
+                    Err(CodecError::InvalidParameter {
+                        name: "precision",
+                        ..
+                    })
                 ),
                 "precision {p} should be rejected"
             );
@@ -482,7 +494,10 @@ mod tests {
         let mut buf = Vec::new();
         assert!(matches!(
             encode_with_options(&pixels, 2, 2, &opts(1, 8, 8), &mut buf),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "point_transform",
+                ..
+            })
         ));
     }
 
@@ -493,7 +508,10 @@ mod tests {
         let mut buf = Vec::new();
         assert!(matches!(
             encode_with_options(&pixels, 2, 2, &opts(1, 0, 8), &mut buf),
-            Err(CodecError::InvalidData(_))
+            Err(CodecError::InvalidParameter {
+                name: "sample_value",
+                ..
+            })
         ));
     }
 

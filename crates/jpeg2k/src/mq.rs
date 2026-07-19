@@ -386,23 +386,36 @@ impl MqEncoder {
     }
 
     /// Encode a single bit using the given context.
+    ///
+    /// Normative T.800 Annex C convention (identical to OpenJPEG's
+    /// `opj_mqc_codemps`/`opj_mqc_codelps`): the LPS sub-interval sits at the
+    /// **base** of `[C, C+A)`, so coding an MPS advances `C` by `Qe`. This makes
+    /// the emitted codeword bit-for-bit interoperable with any conformant
+    /// encoder (the old `C += A` variant placed the MPS at the base and produced
+    /// a non-interoperable — bit-complemented — bytestream).
     pub fn encode(&mut self, bit: u8, ctx: &mut MqState) {
         let entry = &MQ_TABLE[ctx.index];
         let qe = entry.qe as u32;
         self.a = self.a.wrapping_sub(qe);
 
         if bit == ctx.mps {
-            if self.a < 0x8000 {
+            // CODEMPS.
+            if self.a & 0x8000 == 0 {
                 if self.a < qe {
-                    self.c = self.c.wrapping_add(self.a);
                     self.a = qe;
+                } else {
+                    self.c = self.c.wrapping_add(qe);
                 }
                 ctx.index = entry.nmps;
                 self.renorm_encode();
+            } else {
+                self.c = self.c.wrapping_add(qe);
             }
         } else {
-            if self.a >= qe {
-                self.c = self.c.wrapping_add(self.a);
+            // CODELPS.
+            if self.a < qe {
+                self.c = self.c.wrapping_add(qe);
+            } else {
                 self.a = qe;
             }
             if entry.swi {
@@ -606,20 +619,27 @@ impl<'a> MqDecoder<'a> {
     }
 
     /// Decode a single bit using the given context.
+    ///
+    /// Normative T.800 Annex C convention (identical to OpenJPEG's
+    /// `opj_mqc_decode`): the LPS sub-interval sits at the **base**, so the
+    /// comparison is `Chigh < Qe` and the MPS branch subtracts `Qe << 16` from
+    /// `C`. This mirrors the encoder's normative split, making the decoder
+    /// interoperable with any conformant stream (the old `Chigh < A` /
+    /// `C -= A << 16` variant only decoded our own non-interoperable output).
     pub fn decode(&mut self, ctx: &mut MqState) -> u8 {
         let entry = &MQ_TABLE[ctx.index];
         let qe = entry.qe as u32;
         self.a = self.a.wrapping_sub(qe);
 
-        let chigh = self.c >> 16;
-        if chigh < self.a {
-            if self.a < 0x8000 {
+        if (self.c >> 16) < qe {
+            self.lps_exchange(ctx, entry, qe)
+        } else {
+            self.c = self.c.wrapping_sub(qe << 16);
+            if self.a & 0x8000 == 0 {
                 self.mps_exchange(ctx, entry, qe)
             } else {
                 ctx.mps
             }
-        } else {
-            self.lps_exchange(ctx, entry, qe)
         }
     }
 
@@ -640,7 +660,6 @@ impl<'a> MqDecoder<'a> {
     }
 
     fn lps_exchange(&mut self, ctx: &mut MqState, entry: &MqEntry, qe: u32) -> u8 {
-        self.c = self.c.wrapping_sub(self.a << 16);
         let bit;
         if self.a < qe {
             bit = ctx.mps;

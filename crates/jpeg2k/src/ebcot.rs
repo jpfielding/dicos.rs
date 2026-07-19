@@ -610,16 +610,46 @@ mod tests {
 
     const BANDS: [BandKind; 4] = [BandKind::LL, BandKind::HL, BandKind::LH, BandKind::HH];
 
-    // Self-golden constants (see `golden_8x8_bitstream`). Replaced by an
-    // OpenJPEG cross-check in Workstream 1 step 10.
-    const GOLDEN_LEN: usize = 47;
+    // Self-golden constants (see `golden_8x8_bitstream`). Updated after the MQ
+    // interval-convention fix (encoder switched to the normative T.800 Annex C /
+    // OpenJPEG codeword convention), which changes the exact codeword bytes; the
+    // block still round-trips and the `openjpeg_codeblock_interop_c4` test now
+    // cross-checks the codeword against real OpenJPEG output.
+    const GOLDEN_LEN: usize = 48;
     const GOLDEN_DATA: [u8; GOLDEN_LEN] = [
-        238, 133, 42, 55, 211, 207, 236, 200, 103, 252, 141, 52, 127, 161, 27, 19, 232, 205, 218,
-        188, 104, 219, 98, 37, 135, 76, 213, 153, 25, 112, 172, 67, 207, 232, 6, 241, 200, 75, 252,
-        74, 25, 115, 222, 184, 28, 212, 15,
+        17, 122, 213, 200, 44, 48, 19, 55, 152, 3, 114, 203, 128, 94, 228, 236, 23, 50, 37, 67,
+        151, 36, 157, 218, 120, 179, 42, 102, 230, 143, 83, 188, 48, 23, 249, 14, 55, 180, 3, 181,
+        230, 140, 33, 71, 227, 43, 255, 127,
     ];
     const GOLDEN_BITPLANES: u32 = 7;
     const GOLDEN_PASSES: u32 = 19;
+
+    /// Cross-check against a real OpenJPEG `opj_compress -n 1` code-block: a 4x4
+    /// constant-1000 image is a single LL block whose only coefficient value is
+    /// `1000 - 2^15 = -31768`. The MQ codeword OpenJPEG 2.5.4 emits for it is the
+    /// 19-byte sequence below; our conformant tier-1/MQ coder must both produce
+    /// that exact codeword and decode it back to the constant block.
+    #[test]
+    fn openjpeg_codeblock_interop_c4() {
+        let coeffs = vec![-31768i32; 16];
+        let cb = encode_code_block(&coeffs, 4, 4, BandKind::LL);
+        const OPJ: [u8; 19] = [
+            0x11, 0x50, 0x54, 0xa0, 0xe2, 0xa0, 0x00, 0x03, 0x09, 0x09, 0x48, 0x13, 0x00, 0x61,
+            0x1e, 0x62, 0x9c, 0x48, 0x3f,
+        ];
+        assert_eq!(cb.num_bitplanes, 15);
+        assert_eq!(cb.num_passes, 43);
+        assert_eq!(
+            cb.data.as_slice(),
+            &OPJ,
+            "MQ codeword not byte-identical to OpenJPEG"
+        );
+        let dec = decode_code_block(&OPJ, 4, 4, BandKind::LL, 15, 43).unwrap();
+        assert_eq!(
+            dec, coeffs,
+            "decode of OpenJPEG codeword must reconstruct the block"
+        );
+    }
 
     fn roundtrip(coeffs: &[i32], w: usize, h: usize, band: BandKind) {
         let cb = encode_code_block(coeffs, w, h, band);

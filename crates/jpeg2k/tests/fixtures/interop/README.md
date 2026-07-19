@@ -3,22 +3,26 @@
 Third-party JPEG 2000 codestreams (ITU-T T.800 Part 1, lossless) produced by
 **OpenJPEG `opj_compress`** and consumed by `../interop.rs`.
 
-## ⚠️ Blocked on a real conformance bug — tests are `#[ignore]`d
+## OpenJPEG-conformant (both directions pass)
 
-Our decoder parses these fixtures structurally (returns `Ok`) but produces
-wrong pixels: every sample decodes to ≈2^15 (all entropy coefficients ≈ 0). The
-same failure occurs in reverse — `opj_decompress` on our encoder's output also
-yields ≈2^15. Our own encode→decode round-trip is perfect, so our encoder and
-decoder share a **non-conformant** EBCOT tier-1 / MQ convention.
+These fixtures round-trip against OpenJPEG in both directions: we decode
+`opj_compress` streams to the exact source pixels, and `opj_decompress` exactly
+reproduces our encoder's output. Reaching this required fixing two
+self-consistent conformance defects (our own round-trip masked both):
+
+1. **MQ arithmetic coder** — was using the `C += A` interval convention (MPS
+   sub-interval at the base) rather than the normative T.800 Annex C / OpenJPEG
+   `C += Qe` convention (LPS at the base). Non-interoperable codewords; symptom
+   was every coefficient decoding to 0 (samples ≈ 2^15).
+2. **Forward 2-D 5/3 DWT** — transformed rows before columns; the reference
+   transforms columns before rows, and the floor-rounded lifting makes the pass
+   order visible in the integer coefficients (off-by-one).
 
 Byte-diffing our 0-level (`num_decomp_levels = 0`) encoding against
-`opj_compress -n 1` of the same image shows the SIZ/COD/QCD markers and the
-packet-header prefix are **byte-identical**; only the MQ-coded coefficient bytes
-diverge. The defect is isolated to tier-1/MQ coefficient coding.
-
-These fixtures are the regression proof. Once the tier-1/MQ coder is fixed,
-delete the `#[ignore]` on both tests in `../interop.rs`; both directions must
-then pass.
+`opj_compress -n 1` isolated defect 1 (SIZ/COD/QCD markers and packet-header
+prefix were already byte-identical; only the MQ coefficient bytes diverged);
+defect 2 surfaced once the entropy layer was conformant and any DWT level was
+present.
 
 ## Tool versions
 

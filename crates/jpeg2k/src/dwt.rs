@@ -456,16 +456,11 @@ fn forward_ll_region_conformant(
     row_scratch: &mut [i32],
     col_scratch: &mut [i32],
 ) {
-    // Rows (transformed along `width` when width >= 2).
-    for y in 0..height {
-        let off = y * stride;
-        let row = &mut row_scratch[..width];
-        row.copy_from_slice(&data[off..off + width]);
-        forward_1d(row);
-        data[off..off + width].copy_from_slice(row);
-    }
-
-    // Columns (transformed along `height` when height >= 2).
+    // Columns first, then rows. The reversible 5/3 lifting uses floor rounding,
+    // so the 2-D pass order is observable in the integer coefficients; T.800 /
+    // OpenJPEG transform columns (vertical) before rows (horizontal) on the
+    // forward transform (the inverse undoes them in the opposite order). Coding
+    // rows first here produced off-by-one coefficients versus OpenJPEG.
     let col = &mut col_scratch[..height];
     for x in 0..width {
         for (y, slot) in col.iter_mut().enumerate() {
@@ -475,6 +470,14 @@ fn forward_ll_region_conformant(
         for (y, &v) in col.iter().enumerate() {
             data[y * stride + x] = v;
         }
+    }
+
+    for y in 0..height {
+        let off = y * stride;
+        let row = &mut row_scratch[..width];
+        row.copy_from_slice(&data[off..off + width]);
+        forward_1d(row);
+        data[off..off + width].copy_from_slice(row);
     }
 }
 
@@ -488,7 +491,17 @@ fn inverse_ll_region_conformant(
     row_scratch: &mut [i32],
     col_scratch: &mut [i32],
 ) {
-    // Columns first (inverse mirrors forward order).
+    // Rows first, then columns -- the exact reverse of the forward pass order
+    // (columns-then-rows), so this is its true inverse and matches OpenJPEG's
+    // inverse transform.
+    for y in 0..height {
+        let off = y * stride;
+        let row = &mut row_scratch[..width];
+        row.copy_from_slice(&data[off..off + width]);
+        inverse_1d(row);
+        data[off..off + width].copy_from_slice(row);
+    }
+
     let col = &mut col_scratch[..height];
     for x in 0..width {
         for (y, slot) in col.iter_mut().enumerate() {
@@ -498,15 +511,6 @@ fn inverse_ll_region_conformant(
         for (y, &v) in col.iter().enumerate() {
             data[y * stride + x] = v;
         }
-    }
-
-    // Rows.
-    for y in 0..height {
-        let off = y * stride;
-        let row = &mut row_scratch[..width];
-        row.copy_from_slice(&data[off..off + width]);
-        inverse_1d(row);
-        data[off..off + width].copy_from_slice(row);
     }
 }
 

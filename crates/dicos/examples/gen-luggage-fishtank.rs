@@ -8,12 +8,14 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use dicos::tag;
+use dicos::transfer::EXPLICIT_VR_LITTLE_ENDIAN;
 use dicos::types::{Dataset, Element, Value};
+use dicos::uid::DICOS_CT_IMAGE_STORAGE;
 use dicos::vr::Vr;
 use dicos::writer;
 
-const DICOS_CT_SOP_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.501.1";
-const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
+/// This generator's own implementation-class UID (example-local, not a
+/// registered standard identifier).
 const IMPL_CLASS_UID: &str = "1.2.826.0.1.3680043.8.498.999.1";
 
 #[derive(Debug, Clone)]
@@ -353,19 +355,19 @@ fn build_dataset(
     ds.put_string(
         tag::MEDIA_STORAGE_SOP_CLASS_UID,
         Vr::UI,
-        DICOS_CT_SOP_CLASS_UID,
+        DICOS_CT_IMAGE_STORAGE,
     );
     ds.put_string(
         tag::MEDIA_STORAGE_SOP_INSTANCE_UID,
         Vr::UI,
         sop_instance_uid,
     );
-    ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, EXPLICIT_VR_LE);
+    ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, EXPLICIT_VR_LITTLE_ENDIAN);
     ds.put_string(tag::IMPLEMENTATION_CLASS_UID, Vr::UI, IMPL_CLASS_UID);
     ds.put_string(tag::IMPLEMENTATION_VERSION_NAME, Vr::SH, "DICOSRS_2026A");
 
     // SOP + study + series.
-    ds.put_string(tag::SOP_CLASS_UID, Vr::UI, DICOS_CT_SOP_CLASS_UID);
+    ds.put_string(tag::SOP_CLASS_UID, Vr::UI, DICOS_CT_IMAGE_STORAGE);
     ds.put_string(tag::SOP_INSTANCE_UID, Vr::UI, sop_instance_uid);
     ds.put_string(tag::MODALITY, Vr::CS, "CT");
     ds.insert(Element::new(

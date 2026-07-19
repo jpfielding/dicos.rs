@@ -9,6 +9,7 @@
 //! - [`tag`] -- Tag constants for standard DICOM/DICOS data elements
 //! - [`vr`] -- Value Representation type definitions
 //! - [`transfer`] -- Transfer Syntax UID constants and properties
+//! - [`uid`] -- Standard SOP Class UID constants
 //! - [`types`] -- Core types: Dataset, Element, Value, PixelData
 //! - [`reader`] -- DICOS file parser
 //! - [`writer`] -- DICOS file writer
@@ -35,6 +36,7 @@ pub mod reader;
 pub mod tag;
 pub mod transfer;
 pub mod types;
+pub mod uid;
 pub mod vr;
 pub mod writer;
 

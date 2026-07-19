@@ -42,6 +42,13 @@ use crate::transfer;
 // `DimensionMismatch` reports the real length.
 // ---------------------------------------------------------------------------
 
+#[cfg(any(
+    feature = "rle",
+    feature = "jpegls",
+    feature = "jpegli",
+    feature = "jpeg2k",
+    test
+))]
 macro_rules! codec_adapter {
     (
         struct $adapter:ident;

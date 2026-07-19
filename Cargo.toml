@@ -8,6 +8,9 @@ members = [
     "crates/jpeg2k",
     "crates/roxel",
 ]
+# The cargo-fuzz subcrate is nightly-only and builds against libFuzzer; keep it
+# out of the normal workspace build.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "1.0.0"
@@ -52,6 +55,3 @@ glam = "0.29"
 pollster = "0.4"
 rfd = "0.15"
 bytemuck = { version = "1", features = ["derive"] }
-
-# Benchmarks
-criterion = { version = "0.5", features = ["html_reports"] }

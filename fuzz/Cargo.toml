@@ -1,0 +1,27 @@
+[package]
+name = "dicos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.75"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dicos = { path = "../crates/dicos" }
+
+# Prevent this fuzzing crate from being merged into the root workspace; it is
+# nightly/cargo-fuzz-only and is listed in the root `[workspace] exclude`.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_dataset"
+path = "fuzz_targets/parse_dataset.rs"
+test = false
+doc = false
+bench = false

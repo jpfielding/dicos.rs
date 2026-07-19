@@ -94,6 +94,22 @@ pub(crate) struct ContextModel {
 impl ContextModel {
     /// Create a new context model for the given `max_val`, `near`, and `reset`.
     pub fn new(max_val: i32, near: i32, reset: i32) -> Self {
+        Self::with_presets(max_val, near, reset, None, None, None)
+    }
+
+    /// Create a context model, optionally overriding the T1/T2/T3 quantization
+    /// thresholds (as carried by an LSE ID=1 preset segment, T.87 C.2.4.1.1).
+    ///
+    /// A `None` (or, in the marker, a zero) override selects the default
+    /// threshold computed from `max_val`/`near` per T.87 A.2.1.
+    pub fn with_presets(
+        max_val: i32,
+        near: i32,
+        reset: i32,
+        t1_override: Option<i32>,
+        t2_override: Option<i32>,
+        t3_override: Option<i32>,
+    ) -> Self {
         // Derived parameters (T.87 A.2 / A.3.1 / A.5.3).
         let bpp = ceil_log2(max_val + 1).max(2);
         let limit = 2 * (bpp + bpp.max(8));
@@ -104,7 +120,10 @@ impl ContextModel {
         };
         let qbpp = ceil_log2(range);
 
-        let (t1, t2, t3) = Self::default_thresholds(max_val, near);
+        let (dt1, dt2, dt3) = Self::default_thresholds(max_val, near);
+        let t1 = t1_override.unwrap_or(dt1);
+        let t2 = t2_override.unwrap_or(dt2);
+        let t3 = t3_override.unwrap_or(dt3);
 
         // A[Q] initialization (T.87 A.2.1 / A.8): max(2, floor((RANGE+32)/64))
         // for ALL contexts (regular AND run).
@@ -249,6 +268,22 @@ impl ContextModel {
             if self.b[q] > 0 {
                 self.b[q] = 0;
             }
+        }
+    }
+
+    /// Advance `RUNindex` after coding a full run segment (T.87 A.7.1.2),
+    /// saturating at 31.
+    pub fn increment_run_index(&mut self) {
+        if self.run_index < 31 {
+            self.run_index += 1;
+        }
+    }
+
+    /// Decrement `RUNindex` after coding a run-interruption sample (T.87
+    /// A.7.2), saturating at 0.
+    pub fn decrement_run_index(&mut self) {
+        if self.run_index > 0 {
+            self.run_index -= 1;
         }
     }
 

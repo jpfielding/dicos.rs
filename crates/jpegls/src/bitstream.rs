@@ -59,6 +59,29 @@ impl<'a> BitReader<'a> {
         self.pending_marker
     }
 
+    /// Byte offset of the first unconsumed input byte.
+    ///
+    /// After a scan is fully decoded, any residual bits in the accumulator are
+    /// the flush padding of the last consumed byte (always `< 8`), so this
+    /// points at the byte following the entropy-coded data — i.e. the trailing
+    /// marker (EOI).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Byte offset of the marker terminating the scan.
+    ///
+    /// If the final consumed data byte was `0xFF`, its mandatory stuff byte
+    /// (T.87 A.1) may not have been pulled into the accumulator yet; it sits at
+    /// [`Self::pos`] and the marker begins immediately after it.
+    pub fn marker_pos(&self) -> usize {
+        if self.last_ff {
+            self.pos + 1
+        } else {
+            self.pos
+        }
+    }
+
     /// Fill the accumulator so it contains at least `n` bits.
     fn fill(&mut self, n: i32) -> Result<(), CodecError> {
         while self.n_bits < n {
@@ -274,6 +297,13 @@ impl<W: Write> BitWriter<W> {
             self.bits = 0;
             self.n_bits = 0;
             self.last_ff = b == 0xFF;
+        }
+        // A `0xFF` emitted as the final data byte (by `drain`) still needs its
+        // mandatory stuff byte (T.87 A.1); otherwise the following marker's
+        // `0xFF` would be misread as this byte's continuation / a marker prefix.
+        if self.last_ff {
+            self.inner.write_all(&[0x00])?;
+            self.last_ff = false;
         }
         self.inner.flush()?;
         Ok(())

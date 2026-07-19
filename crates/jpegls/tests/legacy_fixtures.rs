@@ -51,9 +51,16 @@ fn test_images() -> Vec<(&'static str, u32, u32, Vec<u16>)> {
     ]
 }
 
+fn legacy_encode_opts() -> jpegls::EncodeOptions {
+    let mut opts = jpegls::EncodeOptions::default();
+    opts.profile = jpegls::Profile::LegacyGo;
+    opts
+}
+
 fn encode_current(pixels: &[u16], w: u32, h: u32) -> Vec<u8> {
     let mut out = Vec::new();
-    jpegls::encode(pixels, w, h, &mut out).expect("legacy encode");
+    jpegls::encode_with_options(pixels, w, h, &legacy_encode_opts(), &mut out)
+        .expect("legacy encode");
     out
 }
 
@@ -81,7 +88,9 @@ fn legacy_fixtures_decode() {
                 path.display()
             )
         });
-        let (decoded, dw, dh) = jpegls::decode(&bytes, w, h)
+        let mut opts = jpegls::DecodeOptions::default();
+        opts.profile = jpegls::Profile::LegacyGo;
+        let (decoded, dw, dh) = jpegls::decode_with_options(&bytes, w, h, &opts)
             .unwrap_or_else(|e| panic!("{name}: legacy decode failed: {e}"));
         assert_eq!((dw, dh), (w, h), "{name}: dimensions");
         assert_eq!(decoded, pixels, "{name}: pixel mismatch");

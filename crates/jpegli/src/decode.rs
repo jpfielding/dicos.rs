@@ -22,6 +22,12 @@ const MARKER_DHT: u16 = 0xFFC4;
 const MARKER_SOS: u16 = 0xFFDA;
 const MARKER_DRI: u16 = 0xFFDD;
 
+/// Hard cap on the number of pixels a single decode will allocate for.
+/// Guards against attacker-controlled (or corrupted) SOF3 dimensions forcing
+/// an unbounded allocation in `scan::decode_scan`; matches jpegrle's /
+/// jpeg2k's image-area cap.
+const MAX_PIXELS: usize = 1 << 28;
+
 // ---------------------------------------------------------------------------
 // Decoder state
 // ---------------------------------------------------------------------------
@@ -36,7 +42,6 @@ struct Decoder {
     dc_tables: [Option<HuffmanTable>; 4],
     predictor: u8,
     point_transform: u8,
-    #[allow(dead_code)]
     restart_interval: u16,
 }
 
@@ -135,15 +140,42 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         });
     }
 
+    // Guard against dimensions that would force an unbounded allocation in
+    // `scan::decode_scan` (`vec![0u16; width*height]`), before any such
+    // allocation happens.
+    let num_pixels = (jpeg_w as usize)
+        .checked_mul(jpeg_h as usize)
+        .filter(|&n| n <= MAX_PIXELS)
+        .ok_or(CodecError::InvalidParameter {
+            name: "width*height",
+            value: (jpeg_w as i64).saturating_mul(jpeg_h as i64),
+            allowed: "product <= 268435456 pixels (1<<28)",
+        })?;
+
     // Get Huffman table
     let table_idx = if !dec.comp_info.is_empty() {
         dec.comp_info[0].table_index as usize
     } else {
         0
     };
-    let ht = dec.dc_tables[table_idx]
-        .as_ref()
+    // `.get` (not direct indexing) keeps an out-of-range `table_idx` -- e.g. a
+    // SOF3 component whose Tq nibble is >= 4 -- from panicking.
+    let ht = dec
+        .dc_tables
+        .get(table_idx)
+        .and_then(|t| t.as_ref())
         .ok_or_else(|| CodecError::InvalidData("missing Huffman table".into()))?;
+
+    // Restart interval (DRI) validation.  T.81 H.1.1: for a non-interleaved
+    // single-component lossless scan 1 MCU = 1 sample, and Ri must be an
+    // integer multiple of the samples-per-row (== width), so restarts fall on
+    // row boundaries only.
+    let restart_interval = dec.restart_interval as usize;
+    if restart_interval != 0 && restart_interval % (jpeg_w as usize) != 0 {
+        return Err(CodecError::InvalidData(format!(
+            "restart interval {restart_interval} is not a multiple of width {jpeg_w} (H.1.1)"
+        )));
+    }
 
     // Decode the scan data (remaining bytes after SOS header)
     let remaining = &data[cursor.position() as usize..];
@@ -155,11 +187,24 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         dec.precision,
         dec.predictor,
         dec.point_transform,
+        restart_interval,
     )
-    .map_err(|e| CodecError::InvalidData(format!("scan decode error: {e}")))?;
+    .map_err(|e| {
+        // A prematurely exhausted entropy stream surfaces as UnexpectedEof; map
+        // it to the dedicated Truncated variant so callers can distinguish
+        // truncation from other malformed-scan errors.
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            CodecError::Truncated {
+                offset: cursor.position() as usize,
+                context: "entropy scan",
+            }
+        } else {
+            CodecError::InvalidData(format!("scan decode error: {e}"))
+        }
+    })?;
 
     let pixel_count = pixels.len();
-    let expected = (jpeg_w as usize) * (jpeg_h as usize);
+    let expected = num_pixels;
     if pixel_count != expected {
         return Err(CodecError::DimensionMismatch {
             expected,
@@ -225,6 +270,36 @@ fn parse_sof3<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
     dec.height = u16::from_be_bytes([data[1], data[2]]);
     dec.width = u16::from_be_bytes([data[3], data[4]]);
     dec.components = data[5];
+
+    // T.81 B.2.2: Y (lines) and X (samples/line) must be > 0. A zero dimension
+    // yields an empty image and, with a DRI present, a division by zero in the
+    // restart-interval validation (`restart_interval % width`).
+    if dec.width == 0 || dec.height == 0 {
+        return Err(CodecError::InvalidParameter {
+            name: "dimensions",
+            value: 0,
+            allowed: "width > 0 && height > 0",
+        });
+    }
+
+    // T.81 B.2.2: sample precision P for lossless is 2..=16.  Rejecting the
+    // out-of-range values here prevents the `1 << (precision - 1)` underflow
+    // (P == 0/1) and out-of-bounds shifts (P > 16) in the DPCM loop.
+    if !(2..=16).contains(&dec.precision) {
+        return Err(CodecError::InvalidParameter {
+            name: "precision",
+            value: i64::from(dec.precision),
+            allowed: "2..=16",
+        });
+    }
+
+    // This codec supports single-component (grayscale) frames only.
+    if dec.components != 1 {
+        return Err(CodecError::Unsupported(format!(
+            "SOF3 with {} components; only single-component frames are supported",
+            dec.components
+        )));
+    }
 
     dec.comp_info.clear();
     for i in 0..dec.components as usize {
@@ -305,6 +380,15 @@ fn parse_dht<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
         let values = data[offset..offset + total_codes].to_vec();
         offset += total_codes;
 
+        // Reject an oversubscribed (invalid) code assignment before building the
+        // table: canonical code generation on such counts overflows the 8-bit
+        // fast-lookup index (T.81 Annex C / Kraft inequality).
+        if !crate::huffman::bits_valid(&bits) {
+            return Err(CodecError::InvalidData(
+                "oversubscribed Huffman table (T.81 Annex C)".into(),
+            ));
+        }
+
         dec.dc_tables[table_id] = Some(HuffmanTable::from_bits_values(bits, values));
     }
 
@@ -340,6 +424,18 @@ fn parse_sos<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
         let table_mapping = data[offset + 1];
         offset += 2;
 
+        // Td (high nibble) selects the DC Huffman table; it indexes the 4-entry
+        // `dc_tables` array, so a value >= 4 is out of range and would panic on
+        // lookup (T.81 B.2.3: Td in 0..=3).
+        let dc_selector = (table_mapping >> 4) as usize;
+        if dc_selector >= dec.dc_tables.len() {
+            return Err(CodecError::InvalidParameter {
+                name: "dc_table_selector",
+                value: dc_selector as i64,
+                allowed: "< 4",
+            });
+        }
+
         // Update table index for the matching component
         for ci in &mut dec.comp_info {
             if ci.id == selector {
@@ -349,23 +445,55 @@ fn parse_sos<R: Read>(r: &mut R, dec: &mut Decoder) -> Result<(), CodecError> {
         }
     }
 
-    if offset >= data.len() {
+    // Need three more bytes: Ss, Se, Ah|Al (T.81 B.2.3).
+    if offset + 2 >= data.len() {
         return Err(CodecError::InvalidData(
             "SOS payload too short for spectral selection".into(),
         ));
     }
 
-    // Ss = predictor selection
+    // Ss = predictor selection.  Table B.3 restricts lossless Ss to 1..=7:
+    // 0 selects the hierarchical-only "no prediction" mode and > 7 is undefined.
     dec.predictor = data[offset];
     offset += 1;
-
-    // Se = always 0 for lossless
-    offset += 1;
-
-    // Ah (high nibble) | Al (low nibble) = point transform
-    if offset < data.len() {
-        dec.point_transform = data[offset] & 0x0F;
+    if !(1..=7).contains(&dec.predictor) {
+        return Err(CodecError::InvalidParameter {
+            name: "predictor",
+            value: i64::from(dec.predictor),
+            allowed: "1..=7",
+        });
     }
+
+    // Se must be 0 for lossless.
+    let se = data[offset];
+    offset += 1;
+    if se != 0 {
+        return Err(CodecError::InvalidParameter {
+            name: "Se",
+            value: i64::from(se),
+            allowed: "0 (lossless)",
+        });
+    }
+
+    // Ah (high nibble) must be 0; Al (low nibble) = Pt = point transform.
+    let ah = data[offset] >> 4;
+    let al = data[offset] & 0x0F;
+    if ah != 0 {
+        return Err(CodecError::InvalidParameter {
+            name: "Ah",
+            value: i64::from(ah),
+            allowed: "0 (lossless)",
+        });
+    }
+    // Pt must be strictly less than the sample precision (T.81 Table B.3).
+    if al >= dec.precision {
+        return Err(CodecError::InvalidParameter {
+            name: "point_transform",
+            value: i64::from(al),
+            allowed: "< sample precision",
+        });
+    }
+    dec.point_transform = al;
 
     Ok(())
 }
@@ -429,6 +557,281 @@ mod tests {
         let data = [0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x02];
         let result = decode(&data, 1, 1);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation (J1): SOF3 / SOS contract per T.81 Table B.3.
+    // -----------------------------------------------------------------------
+
+    /// Build a SOI + SOF3 (only) stream with the given precision / component count.
+    fn sof3_stream(precision: u8, ncomp: u8) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8]; // SOI
+                                      // payload: P, H(2), W(2), Nf, then Nf * (Ci, Hi|Vi, Tqi)
+        let mut payload = vec![precision, 0x00, 0x01, 0x00, 0x01, ncomp];
+        for i in 0..ncomp {
+            payload.extend_from_slice(&[i + 1, 0x11, 0x00]);
+        }
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC3]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    /// Build a SOI + valid-SOF3 (P=8, 1 comp) + SOS stream with the given
+    /// Ss / Se / (Ah|Al) bytes so SOS validation can be exercised in isolation.
+    fn sos_stream(ss: u8, se: u8, ah_al: u8) -> Vec<u8> {
+        let mut v = sof3_stream(8, 1);
+        let payload = vec![1u8, 1, 0x00, ss, se, ah_al];
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn reject_precision_zero() {
+        assert!(matches!(
+            decode(&sof3_stream(0, 1), 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "precision",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_precision_one() {
+        assert!(matches!(
+            decode(&sof3_stream(1, 1), 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "precision",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_precision_seventeen() {
+        assert!(matches!(
+            decode(&sof3_stream(17, 1), 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "precision",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_multi_component() {
+        // Nf = 3 must be rejected as Unsupported (single-component only).
+        assert!(matches!(
+            decode(&sof3_stream(8, 3), 1, 1),
+            Err(CodecError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn reject_predictor_zero() {
+        // Ss = 0 (hierarchical-only) is illegal for lossless.
+        assert!(matches!(
+            decode(&sos_stream(0, 0, 0), 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_predictor_eight() {
+        assert!(matches!(
+            decode(&sos_stream(8, 0, 0), 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_nonzero_se() {
+        assert!(matches!(
+            decode(&sos_stream(1, 5, 0), 1, 1),
+            Err(CodecError::InvalidParameter { name: "Se", .. })
+        ));
+    }
+
+    #[test]
+    fn reject_nonzero_ah() {
+        // Ah = high nibble = 1.
+        assert!(matches!(
+            decode(&sos_stream(1, 0, 0x10), 1, 1),
+            Err(CodecError::InvalidParameter { name: "Ah", .. })
+        ));
+    }
+
+    #[test]
+    fn reject_point_transform_ge_precision() {
+        // precision = 8, Al = 8 must be rejected.
+        assert!(matches!(
+            decode(&sos_stream(1, 0, 0x08), 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "point_transform",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_huge_dims_rejected_not_abort() {
+        // SOF3 width/height are 16-bit stream fields, so the largest
+        // representable (and thus the largest that can pass the
+        // DimensionMismatch check against caller-supplied dims) is 65535 x
+        // 65535 -- ~4.29 billion pixels, which would otherwise force an
+        // 8+ GiB `Vec<u16>` allocation in `scan::decode_scan`. Must return an
+        // error, not abort. A minimal valid SOS is included so parsing
+        // reaches the post-header dimension/cap checks.
+        let mut v = vec![0xFF, 0xD8]; // SOI
+        let sof_payload = vec![8u8, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0x11, 0x00]; // P, H, W, Nf, comp
+        let sof_len = (sof_payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC3]);
+        v.extend_from_slice(&sof_len.to_be_bytes());
+        v.extend_from_slice(&sof_payload);
+        let sos_payload = vec![1u8, 1, 0x00, 1, 0, 0]; // Nf, (id,table), Ss, Se, Ah|Al
+        let sos_len = (sos_payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&sos_len.to_be_bytes());
+        v.extend_from_slice(&sos_payload);
+
+        let result = decode(&v, 0xFFFF, 0xFFFF);
+        assert!(matches!(
+            result,
+            Err(CodecError::InvalidParameter {
+                name: "width*height",
+                ..
+            })
+        ));
+    }
+
+    /// An oversubscribed DHT (three length-1 codes -- length-consistent but far
+    /// beyond the 2-code length-1 space) must be rejected, not panic while
+    /// building the fast-lookup index.
+    #[test]
+    fn reject_oversubscribed_dht() {
+        let mut v = vec![0xFF, 0xD8]; // SOI
+                                      // DHT payload: Tc|Th = 0 (DC, id 0), BITS[1..=16], HUFFVAL.
+        let mut bits = [0u8; 16];
+        bits[0] = 3; // three 1-bit codes -> oversubscribed (max is 2)
+        let mut payload = vec![0x00u8];
+        payload.extend_from_slice(&bits);
+        payload.extend_from_slice(&[0u8, 1, 2]); // 3 HUFFVAL entries
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC4]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+
+        assert!(matches!(decode(&v, 1, 1), Err(CodecError::InvalidData(_))));
+    }
+
+    /// A SOS DC table selector (Td, high nibble) of 4 indexes past the 4-entry
+    /// table array; it must be rejected rather than panicking on lookup.
+    #[test]
+    fn reject_dc_selector_out_of_range() {
+        let mut v = sof3_stream(8, 1);
+        // SOS payload: Ns=1, (Cs=1, Td|Ta=0x40 -> Td=4), Ss=1, Se=0, Ah|Al=0.
+        let payload = vec![1u8, 1, 0x40, 1, 0, 0];
+        let len = (payload.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&payload);
+
+        assert!(matches!(
+            decode(&v, 1, 1),
+            Err(CodecError::InvalidParameter {
+                name: "dc_table_selector",
+                ..
+            })
+        ));
+    }
+
+    /// Zero width or height in SOF3 must be rejected (T.81 B.2.2). A DRI in the
+    /// same stream must not trigger a division by zero in restart validation.
+    #[test]
+    fn reject_zero_dimensions() {
+        // Build SOI + SOF3 with explicit width/height.
+        let sof3 = |w: u16, h: u16| {
+            let mut v = vec![0xFF, 0xD8];
+            let mut payload = vec![8u8];
+            payload.extend_from_slice(&h.to_be_bytes());
+            payload.extend_from_slice(&w.to_be_bytes());
+            payload.extend_from_slice(&[1u8, 1, 0x11, 0x00]); // Nf=1, comp spec
+            let len = (payload.len() + 2) as u16;
+            v.extend_from_slice(&[0xFF, 0xC3]);
+            v.extend_from_slice(&len.to_be_bytes());
+            v.extend_from_slice(&payload);
+            v
+        };
+
+        for (w, h) in [(0u16, 4u16), (4, 0)] {
+            assert!(
+                matches!(
+                    decode(&sof3(w, h), w as u32, h as u32),
+                    Err(CodecError::InvalidParameter {
+                        name: "dimensions",
+                        ..
+                    })
+                ),
+                "expected zero-dimension rejection for {w}x{h}"
+            );
+        }
+
+        // DRI + zero-width SOF3: must error (no div-by-zero), not panic.
+        let mut with_dri = vec![0xFF, 0xD8];
+        with_dri.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04, 0x00, 0x04]); // DRI, Ri=4
+        with_dri.extend_from_slice(&sof3(0, 4)[2..]); // append SOF3 (skip its SOI)
+        assert!(decode(&with_dri, 0, 4).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-pipeline round-trips: predictor x point-transform x precision.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_matrix_predictor_pt_precision() {
+        use crate::encode::{encode_with_options, EncodeOptions};
+        let (w, h) = (5usize, 4usize);
+        for &precision in &[2u8, 8, 12, 16] {
+            let modulus: u64 = 1u64 << precision;
+            // Deterministic image whose samples all fit in `precision` bits.
+            let pixels: Vec<u16> = (0..(w * h))
+                .map(|i| ((i as u64 * 2_654_435_761) % modulus) as u16)
+                .collect();
+            for predictor in 1..=7u8 {
+                for &pt in &[0u8, 2u8] {
+                    if pt >= precision {
+                        continue;
+                    }
+                    let opts = EncodeOptions {
+                        predictor,
+                        point_transform: pt,
+                        restart_interval_rows: 0,
+                        precision,
+                    };
+
+                    let mut buf = Vec::new();
+                    encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+                    let (decoded, dw, dh) = decode(&buf, w as u32, h as u32).unwrap();
+                    assert_eq!((dw, dh), (w as u32, h as u32));
+                    let expected: Vec<u16> = pixels.iter().map(|&p| (p >> pt) << pt).collect();
+                    assert_eq!(
+                        decoded, expected,
+                        "roundtrip mismatch predictor={predictor} pt={pt} precision={precision}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -510,5 +913,239 @@ mod tests {
 
         let (decoded, _, _) = decode(&encoded, 1, 128).unwrap();
         assert_eq!(decoded, pixels);
+    }
+
+    // -----------------------------------------------------------------------
+    // Restart intervals (J4): T.81 Annex H.1.1 row-aligned restarts.
+    // -----------------------------------------------------------------------
+
+    use crate::encode::{encode_with_options, EncodeOptions};
+
+    /// Deterministic image whose samples all fit in `precision` bits.
+    fn det_image(w: usize, h: usize, precision: u8) -> Vec<u16> {
+        let modulus: u64 = 1u64 << precision;
+        (0..(w * h))
+            .map(|i| ((i as u64 * 2_654_435_761 + 12345) % modulus) as u16)
+            .collect()
+    }
+
+    fn restart_opts(predictor: u8, pt: u8, precision: u8, rows: u16) -> EncodeOptions {
+        EncodeOptions {
+            predictor,
+            point_transform: pt,
+            restart_interval_rows: rows,
+            precision,
+        }
+    }
+
+    /// Collect the restart-marker indices (RST0..RST7 -> 0..7) appearing in the
+    /// stream, in order.  Any `0xFF Dn` with n in 0xD0..=0xD7 is unambiguously a
+    /// restart marker: entropy `0xFF` bytes are always stuffed as `0xFF 0x00`.
+    fn restart_markers(buf: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < buf.len() {
+            if buf[i] == 0xFF && (0xD0..=0xD7).contains(&buf[i + 1]) {
+                out.push(buf[i + 1] - 0xD0);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn restart_roundtrip_matrix() {
+        // rows x predictor x pt x precision on several deterministic images.
+        for &(w, h) in &[(8usize, 6usize), (5, 5), (1, 4)] {
+            for &precision in &[8u8, 16u8] {
+                let pixels = det_image(w, h, precision);
+                for &rows in &[1u16, 2, 3, h as u16] {
+                    for &predictor in &[1u8, 4, 7] {
+                        for &pt in &[0u8, 2u8] {
+                            if pt >= precision {
+                                continue;
+                            }
+                            let opts = restart_opts(predictor, pt, precision, rows);
+                            let mut buf = Vec::new();
+                            encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf)
+                                .unwrap();
+                            let (decoded, dw, dh) = decode(&buf, w as u32, h as u32).unwrap();
+                            assert_eq!((dw, dh), (w as u32, h as u32));
+                            let expected: Vec<u16> =
+                                pixels.iter().map(|&p| (p >> pt) << pt).collect();
+                            assert_eq!(
+                                decoded, expected,
+                                "restart roundtrip mismatch w={w} h={h} rows={rows} \
+                                 predictor={predictor} pt={pt} precision={precision}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restart_markers_cycle_mod_8() {
+        // A tall 1-wide image with rows=1 forces one restart per row after the
+        // first: 10 rows -> 9 restarts, indices cycling 0..7 then wrapping to 0.
+        let (w, h) = (1usize, 10usize);
+        let pixels = det_image(w, h, 8);
+        let opts = restart_opts(1, 0, 8, 1);
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+
+        assert_eq!(
+            restart_markers(&buf),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 0],
+            "restart indices must cycle mod 8"
+        );
+
+        // And it still round-trips exactly.
+        let (decoded, _, _) = decode(&buf, w as u32, h as u32).unwrap();
+        assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn restart_dri_value_is_rows_times_width() {
+        let (w, h) = (6usize, 4usize);
+        let pixels = det_image(w, h, 8);
+        let opts = restart_opts(1, 0, 8, 2); // 2 rows x 6 width = 12
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+
+        let dri = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDD)
+            .expect("DRI present");
+        assert_eq!(&buf[dri + 2..dri + 4], &[0x00, 0x04]);
+        assert_eq!(
+            u16::from_be_bytes([buf[dri + 4], buf[dri + 5]]),
+            12,
+            "Ri must equal rows * width"
+        );
+    }
+
+    /// Restart resets prediction (H.1.2.1): the segment after a restart is coded
+    /// independently of the rows before it, so two images that share row 1 but
+    /// differ in row 0 must produce byte-identical entropy after the RST0 marker.
+    /// A decoder that failed to reset would make row 1 depend on row 0.
+    #[test]
+    fn restart_resets_predictor_row_independence() {
+        let (w, h) = (3usize, 2usize);
+        let row1 = [100u16, 110, 120];
+        let img_a: Vec<u16> = [10, 20, 30].into_iter().chain(row1).collect();
+        let img_b: Vec<u16> = [200, 150, 90].into_iter().chain(row1).collect();
+        let opts = restart_opts(4, 0, 8, 1); // restart after every row
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        encode_with_options(&img_a, w as u32, h as u32, &opts, &mut a).unwrap();
+        encode_with_options(&img_b, w as u32, h as u32, &opts, &mut b).unwrap();
+
+        // Slice from the RST0 marker (0xFF 0xD0) to just before EOI (0xFF 0xD9).
+        let tail = |buf: &[u8]| -> Vec<u8> {
+            let start = buf
+                .windows(2)
+                .position(|x| x[0] == 0xFF && x[1] == 0xD0)
+                .expect("RST0 present");
+            let end = buf.len() - 2; // strip trailing EOI
+            buf[start..end].to_vec()
+        };
+        assert_eq!(
+            tail(&a),
+            tail(&b),
+            "row-1 entropy must be independent of row 0 across a restart"
+        );
+
+        // Both must also decode exactly.
+        assert_eq!(decode(&a, w as u32, h as u32).unwrap().0, img_a);
+        assert_eq!(decode(&b, w as u32, h as u32).unwrap().0, img_b);
+    }
+
+    // --- Error cases -------------------------------------------------------
+
+    /// Build a valid restart-bearing stream for corruption tests.
+    fn restart_stream(w: usize, h: usize, rows: u16) -> Vec<u8> {
+        let pixels = det_image(w, h, 8);
+        let opts = restart_opts(1, 0, 8, rows);
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w as u32, h as u32, &opts, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn reject_ri_not_multiple_of_width() {
+        // width 4, valid Ri = 4; corrupt the DRI value to 3 (not a multiple).
+        let mut buf = restart_stream(4, 4, 1);
+        let dri = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDD)
+            .unwrap();
+        buf[dri + 4] = 0x00;
+        buf[dri + 5] = 0x03;
+        assert!(matches!(
+            decode(&buf, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_restart_out_of_order() {
+        // Corrupt the first RST0 (0xD0) into RST3 (0xD3): expected index mismatch.
+        let mut buf = restart_stream(4, 4, 1);
+        let rst = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xD0)
+            .unwrap();
+        buf[rst + 1] = 0xD3;
+        assert!(matches!(
+            decode(&buf, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_restart_without_dri() {
+        // Remove the DRI segment (6 bytes: marker + len + Ri) but keep the RSTn
+        // markers in the entropy: an unexpected restart must be rejected.
+        let mut buf = restart_stream(4, 4, 1);
+        let dri = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDD)
+            .unwrap();
+        buf.drain(dri..dri + 6);
+        assert!(matches!(
+            decode(&buf, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn reject_missing_restart_marker() {
+        // Splice out the first RST marker bytes so the expected restart is gone.
+        let mut buf = restart_stream(4, 6, 1);
+        let rst = buf
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xD0)
+            .unwrap();
+        buf.drain(rst..rst + 2);
+        assert!(decode(&buf, 4, 6).is_err());
+    }
+
+    #[test]
+    fn truncation_inside_restart_interval_errors_not_panics() {
+        // Truncating mid-scan (before later restarts / EOI) must error, not panic.
+        let full = restart_stream(4, 8, 1);
+        let sos = full
+            .windows(2)
+            .position(|x| x[0] == 0xFF && x[1] == 0xDA)
+            .unwrap();
+        // Keep the SOS header (8 bytes) plus a few entropy bytes, drop the rest.
+        let cut = sos + 8 + 3;
+        let truncated = &full[..cut.min(full.len())];
+        assert!(decode(truncated, 4, 8).is_err());
     }
 }

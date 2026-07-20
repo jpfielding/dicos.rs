@@ -44,8 +44,8 @@ pub fn write_part10<W: Write>(writer: &mut W, ds: &Dataset) -> Result<u64, Dicos
     // 3. Build normalized group-0002 metadata.
     let mut meta_elements: Vec<Element> = ds
         .iter()
-        .filter_map(|(tag, elem)| {
-            if tag.group == 0x0002 && *tag != tag::FILE_META_INFORMATION_GROUP_LENGTH {
+        .filter_map(|elem| {
+            if elem.tag.group == 0x0002 && elem.tag != tag::FILE_META_INFORMATION_GROUP_LENGTH {
                 Some(elem.clone())
             } else {
                 None
@@ -85,8 +85,8 @@ pub fn write_part10<W: Write>(writer: &mut W, ds: &Dataset) -> Result<u64, Dicos
     cw.write_all(&meta_buf)?;
 
     // 4. Write all non-group-0002 elements in tag order.
-    for (tag, elem) in ds.iter() {
-        if tag.group != 0x0002 {
+    for elem in ds.iter() {
+        if elem.tag.group != 0x0002 {
             write_element(&mut cw, elem)?;
         }
     }
@@ -126,7 +126,7 @@ fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> 
         w.write_u32::<LittleEndian>(length)?;
     } else {
         if is_undefined_length {
-            return Err(DicosError::InvalidFile(format!(
+            return Err(DicosError::Validation(format!(
                 "undefined length not supported for short VR {}",
                 elem.vr
             )));
@@ -240,7 +240,7 @@ fn encode_sequence(datasets: &[Dataset]) -> Result<Vec<u8>, DicosError> {
 
         // Encode item body
         let mut item_buf = Vec::new();
-        for (_tag, elem) in ds.iter() {
+        for elem in ds.iter() {
             write_element(&mut item_buf, elem)?;
         }
 
@@ -434,11 +434,11 @@ mod tests {
 
         let rt = roundtrip(&ds);
 
-        assert_eq!(rt.rows(), 512);
-        assert_eq!(rt.columns(), 256);
-        assert_eq!(rt.bits_allocated(), 16);
+        assert_eq!(rt.rows(), Some(512));
+        assert_eq!(rt.columns(), Some(256));
+        assert_eq!(rt.bits_allocated(), Some(16));
         assert_eq!(rt.get_u16(tag::BITS_STORED), Some(12));
-        assert_eq!(rt.pixel_representation(), 0);
+        assert_eq!(rt.pixel_representation(), Some(0));
     }
 
     #[test]
@@ -467,8 +467,8 @@ mod tests {
 
         let rt = roundtrip(&ds);
 
-        assert_eq!(rt.rows(), 2);
-        assert_eq!(rt.columns(), 2);
+        assert_eq!(rt.rows(), Some(2));
+        assert_eq!(rt.columns(), Some(2));
         // After roundtrip the reader normalizes raw OW bytes to PixelData::Native
         let pd = rt.pixel_data().expect("pixel_data() should return Some");
         let frames = pd.native_frames().expect("should be native pixel data");

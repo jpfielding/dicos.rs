@@ -20,29 +20,74 @@ const MARKER_SOF3: u16 = 0xFFC3;
 const MARKER_DHT: u16 = 0xFFC4;
 const MARKER_SOS: u16 = 0xFFDA;
 const MARKER_APP0: u16 = 0xFFE0;
+const MARKER_DRI: u16 = 0xFFDD;
 
-/// Default predictor selection (predictor 1 = Ra, previous pixel in row).
-const DEFAULT_PREDICTOR: u8 = 1;
+// ---------------------------------------------------------------------------
+// Encode options
+// ---------------------------------------------------------------------------
 
-/// Default point transform (0 = no shift, full precision).
-const DEFAULT_POINT_TRANSFORM: u8 = 0;
+/// Options controlling JPEG Lossless (T.81 Annex H) encoding.
+///
+/// Construct via [`EncodeOptions::default`] and override fields as needed; the
+/// struct is `#[non_exhaustive]` so new fields can be added without a breaking
+/// change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EncodeOptions {
+    /// DPCM predictor selector (SOS `Ss`), 1..=7. Default 1 (Ra, left neighbor).
+    pub predictor: u8,
+    /// Point transform (SOS `Al` / `Pt`), 0..=precision-1. Default 0.
+    ///
+    /// The codec operates in the reduced domain P' = precision - point_transform:
+    /// every input sample is shifted right by `point_transform` before coding.
+    pub point_transform: u8,
+    /// Restart every N MCU rows; 0 disables restart intervals. The emitted DRI
+    /// value is `restart_interval_rows * width` (validated to fit in a `u16`).
+    /// Default 0.
+    pub restart_interval_rows: u16,
+    /// Sample precision P (SOF3), 2..=16. Default 16.
+    pub precision: u8,
+}
 
-/// Precision for 16-bit images.
-const PRECISION_16: u8 = 16;
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            predictor: 1,
+            point_transform: 0,
+            restart_interval_rows: 0,
+            precision: 16,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Encode a 16-bit grayscale image into JPEG Lossless format.
+/// Encode a 16-bit grayscale image into JPEG Lossless format using default
+/// options (predictor 1, no point transform, 16-bit precision, no restarts).
 ///
 /// `pixels` is a row-major pixel buffer of length `width * height`.
 /// Writes a complete JPEG bitstream (SOI through EOI) to `w`.
-/// Uses predictor 1 (left neighbor) and no point transform.
 pub fn encode(
     pixels: &[u16],
     width: u32,
     height: u32,
+    w: &mut dyn Write,
+) -> Result<(), CodecError> {
+    encode_with_options(pixels, width, height, &EncodeOptions::default(), w)
+}
+
+/// Encode a 16-bit grayscale image into JPEG Lossless format with explicit
+/// [`EncodeOptions`].
+///
+/// `pixels` is a row-major pixel buffer of length `width * height`. Writes a
+/// complete JPEG bitstream (SOI through EOI) to `w`.
+pub fn encode_with_options(
+    pixels: &[u16],
+    width: u32,
+    height: u32,
+    opts: &EncodeOptions,
     w: &mut dyn Write,
 ) -> Result<(), CodecError> {
     let width_usize = width as usize;
@@ -67,20 +112,75 @@ pub fn encode(
         ));
     }
 
+    // --- Option validation (T.81 Table B.3 / B.2.2) --------------------------
+    if !(2..=16).contains(&opts.precision) {
+        return Err(CodecError::InvalidParameter {
+            name: "precision",
+            value: i64::from(opts.precision),
+            allowed: "2..=16",
+        });
+    }
+    if !(1..=7).contains(&opts.predictor) {
+        return Err(CodecError::InvalidParameter {
+            name: "predictor",
+            value: i64::from(opts.predictor),
+            allowed: "1..=7",
+        });
+    }
+    if opts.point_transform >= opts.precision {
+        return Err(CodecError::InvalidParameter {
+            name: "point_transform",
+            value: i64::from(opts.point_transform),
+            allowed: "< precision",
+        });
+    }
+
+    // Every sample must fit in `precision` bits.
+    let sample_limit: u32 = 1u32 << opts.precision;
+    if let Some(&max) = pixels.iter().max() {
+        if (max as u32) >= sample_limit {
+            return Err(CodecError::InvalidParameter {
+                name: "sample_value",
+                value: i64::from(max),
+                allowed: "< 2^precision",
+            });
+        }
+    }
+
+    // Restart-interval math must fit in the 16-bit DRI field (T.81 H.1.1: the
+    // DRI value is `restart_interval_rows * width` MCUs, one MCU per sample).
+    let restart_interval: u16 = if opts.restart_interval_rows > 0 {
+        let dri = (opts.restart_interval_rows as u32) * (width_usize as u32);
+        if dri == 0 || dri > 65535 {
+            return Err(CodecError::InvalidData(format!(
+                "restart interval {} rows x {} width = {} does not fit in the 16-bit DRI field",
+                opts.restart_interval_rows, width_usize, dri
+            )));
+        }
+        dri as u16
+    } else {
+        0
+    };
+
     let ht = build_default_table();
 
     write_marker(w, MARKER_SOI)?;
     write_app0(w)?;
-    write_sof3(w, width_usize, height_usize, PRECISION_16)?;
+    write_sof3(w, width_usize, height_usize, opts.precision)?;
     write_dht(w, &ht)?;
+    if restart_interval > 0 {
+        write_dri(w, restart_interval)?;
+    }
     write_sos_and_scan(
         w,
         &ht,
         pixels,
         width_usize,
         height_usize,
-        PRECISION_16,
-        DEFAULT_PREDICTOR,
+        opts.precision,
+        opts.predictor,
+        opts.point_transform,
+        opts.restart_interval_rows as usize,
     )?;
     write_marker(w, MARKER_EOI)?;
 
@@ -151,7 +251,19 @@ fn write_dht(w: &mut dyn Write, ht: &HuffmanTable) -> Result<(), CodecError> {
     Ok(())
 }
 
+/// Write DRI (Define Restart Interval) marker segment (T.81 B.2.4).
+fn write_dri(w: &mut dyn Write, restart_interval: u16) -> Result<(), CodecError> {
+    write_marker(w, MARKER_DRI)?;
+    // Length = 4 (2 length bytes + 2 interval bytes), then Ri.
+    let mut data = [0u8; 4];
+    data[0..2].copy_from_slice(&4u16.to_be_bytes());
+    data[2..4].copy_from_slice(&restart_interval.to_be_bytes());
+    w.write_all(&data)?;
+    Ok(())
+}
+
 /// Write SOS header and entropy-coded scan data.
+#[allow(clippy::too_many_arguments)]
 fn write_sos_and_scan(
     w: &mut dyn Write,
     ht: &HuffmanTable,
@@ -160,6 +272,8 @@ fn write_sos_and_scan(
     height: usize,
     precision: u8,
     predictor: u8,
+    point_transform: u8,
+    restart_interval_rows: usize,
 ) -> Result<(), CodecError> {
     write_marker(w, MARKER_SOS)?;
     // Length = 2(len) + 1(ncomp) + 2(comp spec) + 3(Ss,Se,Ah|Al) = 8
@@ -167,17 +281,27 @@ fn write_sos_and_scan(
     let header: [u8; 8] = [
         (length >> 8) as u8,
         length as u8,
-        1,                       // 1 component
-        1,                       // Component ID = 1
-        0x00,                    // DC table 0, AC table 0
-        predictor,               // Ss = predictor selection
-        0,                       // Se = 0 (lossless)
-        DEFAULT_POINT_TRANSFORM, // Ah=0, Al=point transform
+        1,               // 1 component
+        1,               // Component ID = 1
+        0x00,            // DC table 0, AC table 0
+        predictor,       // Ss = predictor selection
+        0,               // Se = 0 (lossless)
+        point_transform, // Ah=0, Al=point transform (Pt)
     ];
     w.write_all(&header)?;
 
     // Write entropy-coded scan data
-    scan::encode_scan(w, ht, pixels, width, height, precision, predictor)?;
+    scan::encode_scan(
+        w,
+        ht,
+        pixels,
+        width,
+        height,
+        precision,
+        predictor,
+        point_transform,
+        restart_interval_rows,
+    )?;
 
     Ok(())
 }
@@ -268,5 +392,180 @@ mod tests {
         // Width = 320 = 0x0140 at [7..9]
         assert_eq!(buf[7], 0x01);
         assert_eq!(buf[8], 0x40);
+    }
+
+    // -----------------------------------------------------------------------
+    // EncodeOptions (J2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_options_values() {
+        let opts = EncodeOptions::default();
+        assert_eq!(opts.predictor, 1);
+        assert_eq!(opts.point_transform, 0);
+        assert_eq!(opts.restart_interval_rows, 0);
+        assert_eq!(opts.precision, 16);
+    }
+
+    fn opts(predictor: u8, point_transform: u8, precision: u8) -> EncodeOptions {
+        EncodeOptions {
+            predictor,
+            point_transform,
+            restart_interval_rows: 0,
+            precision,
+        }
+    }
+
+    #[test]
+    fn options_write_ss_and_al() {
+        // Encode with predictor 5 and point transform 2; confirm the SOS bytes.
+        let pixels = vec![0u16, 4, 8, 12];
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, 2, 2, &opts(5, 2, 12), &mut buf).unwrap();
+
+        // Find SOS marker (0xFFDA); the 8-byte header follows.
+        let pos = buf
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == 0xDA)
+            .expect("SOS present");
+        // header layout: FF DA, len(2)=0008, ncomp=1, id=1, table=00, Ss, Se, Ah|Al
+        assert_eq!(buf[pos + 7], 5, "Ss should equal predictor");
+        assert_eq!(buf[pos + 8], 0, "Se should be 0");
+        assert_eq!(
+            buf[pos + 9],
+            2,
+            "Ah|Al low nibble should equal point transform"
+        );
+
+        // SOF3 precision byte.
+        let sof = buf
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == 0xC3)
+            .expect("SOF3 present");
+        assert_eq!(
+            buf[sof + 4],
+            12,
+            "SOF3 precision should equal opts.precision"
+        );
+    }
+
+    #[test]
+    fn reject_predictor_out_of_range() {
+        let pixels = vec![0u16; 4];
+        let mut buf = Vec::new();
+        assert!(matches!(
+            encode_with_options(&pixels, 2, 2, &opts(0, 0, 16), &mut buf),
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
+        ));
+        buf.clear();
+        assert!(matches!(
+            encode_with_options(&pixels, 2, 2, &opts(8, 0, 16), &mut buf),
+            Err(CodecError::InvalidParameter {
+                name: "predictor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_precision_out_of_range() {
+        let pixels = vec![0u16; 4];
+        for p in [0u8, 1, 17] {
+            let mut buf = Vec::new();
+            assert!(
+                matches!(
+                    encode_with_options(&pixels, 2, 2, &opts(1, 0, p), &mut buf),
+                    Err(CodecError::InvalidParameter {
+                        name: "precision",
+                        ..
+                    })
+                ),
+                "precision {p} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_point_transform_ge_precision() {
+        let pixels = vec![0u16; 4];
+        let mut buf = Vec::new();
+        assert!(matches!(
+            encode_with_options(&pixels, 2, 2, &opts(1, 8, 8), &mut buf),
+            Err(CodecError::InvalidParameter {
+                name: "point_transform",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_sample_exceeding_precision() {
+        // precision 8 => samples must be < 256.
+        let pixels = vec![10u16, 20, 300, 40];
+        let mut buf = Vec::new();
+        assert!(matches!(
+            encode_with_options(&pixels, 2, 2, &opts(1, 0, 8), &mut buf),
+            Err(CodecError::InvalidParameter {
+                name: "sample_value",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restart_interval_emits_dri_marker() {
+        // Valid restart math (1 row x 4 width = 4 <= 65535); J4 emits DRI + RSTn.
+        let pixels = vec![0u16; 16];
+        let mut buf = Vec::new();
+        let o = EncodeOptions {
+            predictor: 1,
+            point_transform: 0,
+            restart_interval_rows: 1,
+            precision: 16,
+        };
+        encode_with_options(&pixels, 4, 4, &o, &mut buf).unwrap();
+
+        // DRI marker 0xFFDD carrying Ri = rows * width = 1 * 4 = 4, positioned
+        // before SOS.
+        let dri = buf
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == 0xDD)
+            .expect("DRI present");
+        let sos = buf
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == 0xDA)
+            .expect("SOS present");
+        assert!(dri < sos, "DRI must precede SOS");
+        // Layout: FF DD, len(2)=0004, Ri(2).
+        assert_eq!(
+            &buf[dri + 2..dri + 4],
+            &[0x00, 0x04],
+            "DRI length must be 4"
+        );
+        assert_eq!(
+            &buf[dri + 4..dri + 6],
+            &[0x00, 0x04],
+            "Ri must be rows*width"
+        );
+    }
+
+    #[test]
+    fn restart_interval_overflow_is_invalid() {
+        // 100 rows x 1000 width = 100_000 does not fit the 16-bit DRI field.
+        let pixels = vec![0u16; 1000];
+        let mut buf = Vec::new();
+        let o = EncodeOptions {
+            predictor: 1,
+            point_transform: 0,
+            restart_interval_rows: 100,
+            precision: 16,
+        };
+        assert!(matches!(
+            encode_with_options(&pixels, 1000, 1, &o, &mut buf),
+            Err(CodecError::InvalidData(_))
+        ));
     }
 }

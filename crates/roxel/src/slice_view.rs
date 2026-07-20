@@ -4,6 +4,8 @@
 //! into RGBA images for display via egui. No GPU required -- operates directly
 //! on the `Volume` struct's voxel data.
 
+use rayon::prelude::*;
+
 use crate::volume::{ThreatBox, Volume};
 
 /// Slice orientation through the volume.
@@ -145,6 +147,81 @@ impl SliceView {
         egui::ColorImage::new([w, h], pixels)
     }
 
+    /// Compute the composited color for a single output pixel `(u, v)`.
+    ///
+    /// Marches along the projection axis at `(u, v)`, alpha-blending transfer
+    /// function samples front-to-back over a white background (or taking a
+    /// grayscale max when no transfer function is set). This is the per-pixel
+    /// body of [`render_composite`](Self::render_composite), extracted so it
+    /// can be invoked independently for each output row -- the math only
+    /// reads `vol` and depends solely on its own `(u, v)`, so rows have no
+    /// shared mutable state and can be computed in any order or in parallel.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_pixel(
+        vol: &Volume,
+        orientation: Orientation,
+        u: usize,
+        v: usize,
+        depth: usize,
+        w_min: f32,
+        w_range: f32,
+        tf: Option<&[[f32; 4]]>,
+        alpha_scale: f32,
+    ) -> egui::Color32 {
+        let tf_len = tf.map_or(0, |t| t.len());
+
+        let mut acc_r: f32 = 0.0;
+        let mut acc_g: f32 = 0.0;
+        let mut acc_b: f32 = 0.0;
+        let mut acc_a: f32 = 0.0;
+
+        for s in 0..depth {
+            if acc_a >= 0.98 {
+                break;
+            }
+
+            let density = Self::sample(vol, orientation, u, v, s) as f32;
+
+            // Window/level normalization.
+            if density <= w_min {
+                continue;
+            }
+            let norm = ((density - w_min) / w_range).clamp(0.0, 1.0);
+
+            if let Some(tf) = tf {
+                // Transfer function lookup.
+                let idx = (norm * (tf_len - 1) as f32) as usize;
+                let [cr, cg, cb, ca] = tf[idx.min(tf_len - 1)];
+                // Adjust alpha: pow(alpha, 1.5) * alphaScale (matches Go)
+                let alpha = ca.powf(1.5) * alpha_scale;
+                if alpha > 0.0 {
+                    acc_r += (1.0 - acc_a) * cr * alpha;
+                    acc_g += (1.0 - acc_a) * cg * alpha;
+                    acc_b += (1.0 - acc_a) * cb * alpha;
+                    acc_a += (1.0 - acc_a) * alpha;
+                }
+            } else {
+                // Fallback: grayscale MIP (take max).
+                let gray = norm;
+                acc_r = acc_r.max(gray);
+                acc_g = acc_g.max(gray);
+                acc_b = acc_b.max(gray);
+                acc_a = 1.0;
+            }
+        }
+
+        // Blend over white background.
+        let final_r = acc_r + (1.0 - acc_a) * 1.0;
+        let final_g = acc_g + (1.0 - acc_a) * 1.0;
+        let final_b = acc_b + (1.0 - acc_a) * 1.0;
+
+        egui::Color32::from_rgb(
+            (final_r.clamp(0.0, 1.0) * 255.0) as u8,
+            (final_g.clamp(0.0, 1.0) * 255.0) as u8,
+            (final_b.clamp(0.0, 1.0) * 255.0) as u8,
+        )
+    }
+
     /// Render a front-to-back alpha-composited projection using the transfer
     /// function, matching the Go viewer's composite mode.
     ///
@@ -153,6 +230,12 @@ impl SliceView {
     /// composited over a white background.
     ///
     /// Falls back to grayscale MIP if no transfer function is set.
+    ///
+    /// Rows are independent (each only reads `vol` and writes its own output
+    /// pixels), so this is parallelized across output rows with rayon; the
+    /// per-pixel math lives in [`composite_pixel`](Self::composite_pixel) and
+    /// is identical to the sequential version, so output is pixel-for-pixel
+    /// the same regardless of thread count.
     pub fn render_composite(&self, vol: &Volume) -> egui::ColorImage {
         let (w, h) = Self::slice_dims(vol, self.orientation);
         let depth = Self::depth_for_orientation(vol, self.orientation);
@@ -165,64 +248,27 @@ impl SliceView {
         let w_range = self.window_width;
 
         let tf = self.transfer_func.as_deref();
-        let tf_len = tf.map_or(0, |t| t.len());
         let alpha_scale = self.alpha_scale;
+        let orientation = self.orientation;
 
-        let mut pixels = Vec::with_capacity(w * h);
-        for v in 0..h {
-            for u in 0..w {
-                let mut acc_r: f32 = 0.0;
-                let mut acc_g: f32 = 0.0;
-                let mut acc_b: f32 = 0.0;
-                let mut acc_a: f32 = 0.0;
-
-                for s in 0..depth {
-                    if acc_a >= 0.98 {
-                        break;
-                    }
-
-                    let density = Self::sample(vol, self.orientation, u, v, s) as f32;
-
-                    // Window/level normalization.
-                    if density <= w_min {
-                        continue;
-                    }
-                    let norm = ((density - w_min) / w_range).clamp(0.0, 1.0);
-
-                    if let Some(tf) = tf {
-                        // Transfer function lookup.
-                        let idx = (norm * (tf_len - 1) as f32) as usize;
-                        let [cr, cg, cb, ca] = tf[idx.min(tf_len - 1)];
-                        // Adjust alpha: pow(alpha, 1.5) * alphaScale (matches Go)
-                        let alpha = ca.powf(1.5) * alpha_scale;
-                        if alpha > 0.0 {
-                            acc_r += (1.0 - acc_a) * cr * alpha;
-                            acc_g += (1.0 - acc_a) * cg * alpha;
-                            acc_b += (1.0 - acc_a) * cb * alpha;
-                            acc_a += (1.0 - acc_a) * alpha;
-                        }
-                    } else {
-                        // Fallback: grayscale MIP (take max).
-                        let gray = norm;
-                        acc_r = acc_r.max(gray);
-                        acc_g = acc_g.max(gray);
-                        acc_b = acc_b.max(gray);
-                        acc_a = 1.0;
-                    }
-                }
-
-                // Blend over white background.
-                let final_r = acc_r + (1.0 - acc_a) * 1.0;
-                let final_g = acc_g + (1.0 - acc_a) * 1.0;
-                let final_b = acc_b + (1.0 - acc_a) * 1.0;
-
-                pixels.push(egui::Color32::from_rgb(
-                    (final_r.clamp(0.0, 1.0) * 255.0) as u8,
-                    (final_g.clamp(0.0, 1.0) * 255.0) as u8,
-                    (final_b.clamp(0.0, 1.0) * 255.0) as u8,
-                ));
-            }
-        }
+        let pixels: Vec<egui::Color32> = (0..h)
+            .into_par_iter()
+            .flat_map_iter(|v| {
+                (0..w).map(move |u| {
+                    Self::composite_pixel(
+                        vol,
+                        orientation,
+                        u,
+                        v,
+                        depth,
+                        w_min,
+                        w_range,
+                        tf,
+                        alpha_scale,
+                    )
+                })
+            })
+            .collect();
 
         egui::ColorImage::new([w, h], pixels)
     }
@@ -461,6 +507,102 @@ mod tests {
             "Expected non-white pixel from MIP, got {}",
             pixel.r()
         );
+    }
+
+    #[test]
+    fn render_composite_parallel_matches_sequential_reference() {
+        use crate::transfer::TransferFunction;
+
+        // Sequential reference implementation: identical per-pixel math to
+        // render_composite (via the shared composite_pixel helper), but
+        // driven by a plain nested loop with no rayon involved. Comparing
+        // this against `render_composite`'s row-parallel output verifies
+        // that parallelizing by row is pixel-identical to sequential
+        // execution (the math is row-independent, but this guards against
+        // e.g. accidental reordering in the parallel collect).
+        fn sequential_composite(sv: &SliceView, vol: &Volume) -> egui::ColorImage {
+            let (w, h) = SliceView::slice_dims(vol, sv.orientation);
+            let depth = SliceView::depth_for_orientation(vol, sv.orientation);
+            let half_width = sv.window_width * 0.5;
+            let w_min = sv.window_center - half_width;
+            let w_range = sv.window_width;
+            let tf = sv.transfer_func.as_deref();
+            let alpha_scale = sv.alpha_scale;
+
+            let mut pixels = Vec::with_capacity(w * h);
+            for v in 0..h {
+                for u in 0..w {
+                    pixels.push(SliceView::composite_pixel(
+                        vol,
+                        sv.orientation,
+                        u,
+                        v,
+                        depth,
+                        w_min,
+                        w_range,
+                        tf,
+                        alpha_scale,
+                    ));
+                }
+            }
+            egui::ColorImage::new([w, h], pixels)
+        }
+
+        // Larger synthetic volume than test_volume() so it spans many rayon
+        // work items (rows) and multiple depth samples per pixel.
+        let dim_x = 24;
+        let dim_y = 17;
+        let dim_z = 13;
+        let mut data = vec![0u16; dim_x * dim_y * dim_z];
+        for z in 0..dim_z {
+            for y in 0..dim_y {
+                for x in 0..dim_x {
+                    // Deterministic pseudo-varied pattern covering the full
+                    // u16 range so window/level and the transfer function
+                    // both get exercised across bands.
+                    let v = (x * 37 + y * 101 + z * 733) % 40000;
+                    data[z * dim_y * dim_x + y * dim_x + x] = v as u16;
+                }
+            }
+        }
+        let vol = Volume {
+            data,
+            dim_x,
+            dim_y,
+            dim_z,
+            window_center: 20000.0,
+            window_width: 40000.0,
+            rescale_intercept: 0.0,
+            modality: "CT".into(),
+            voxel_spacing: [1.0, 1.0, 1.0],
+            threats: Vec::new(),
+        };
+
+        let tf = TransferFunction::from_preset(crate::transfer::TransferPreset::Default);
+        for orientation in Orientation::ALL {
+            let sv = SliceView {
+                orientation,
+                slice_index: 0,
+                max_slices: 1,
+                window_center: 20000.0,
+                window_width: 40000.0,
+                composite: true,
+                volume_index: 0,
+                alpha_scale: 0.5,
+                transfer_func: Some(tf.data.clone()),
+                zoom: 100.0,
+            };
+
+            let parallel = sv.render_composite(&vol);
+            let sequential = sequential_composite(&sv, &vol);
+
+            assert_eq!(parallel.size, sequential.size);
+            assert_eq!(
+                parallel.pixels, sequential.pixels,
+                "parallel render_composite diverged from sequential reference for {:?}",
+                orientation
+            );
+        }
     }
 
     #[test]

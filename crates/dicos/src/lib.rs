@@ -9,6 +9,7 @@
 //! - [`tag`] -- Tag constants for standard DICOM/DICOS data elements
 //! - [`vr`] -- Value Representation type definitions
 //! - [`transfer`] -- Transfer Syntax UID constants and properties
+//! - [`uid`] -- Standard SOP Class UID constants
 //! - [`types`] -- Core types: Dataset, Element, Value, PixelData
 //! - [`reader`] -- DICOS file parser
 //! - [`writer`] -- DICOS file writer
@@ -35,10 +36,18 @@ pub mod reader;
 pub mod tag;
 pub mod transfer;
 pub mod types;
+pub mod uid;
 pub mod vr;
 pub mod writer;
 
 // Re-export commonly used types at crate root for convenience.
 pub use codec::Codec;
-pub use error::CodecError;
+pub use error::{CodecError, DicosError};
 pub use img::GrayImage;
+pub use reader::{
+    parse, parse_with_limit, parse_with_warnings, parse_with_warnings_and_limit, ParseWarning,
+};
+pub use tag::Tag;
+pub use types::{Dataset, Element, PixelData, Value};
+pub use vr::Vr;
+pub use writer::write;

@@ -1,8 +1,13 @@
 use crate::error::CodecError;
-use crate::packbits::decode_packbits;
+use crate::packbits::{decode_packbits, PackBitsError};
 
 /// DICOM RLE header size in bytes.
 const HEADER_SIZE: usize = 64;
+
+/// Hard cap on the number of pixels a single decode will allocate for.
+/// Guards against attacker-controlled width/height forcing an unbounded
+/// allocation before any data is read; matches jpeg2k's image-area cap.
+const MAX_PIXELS: usize = 1 << 28;
 
 /// Decode DICOM RLE compressed data into a 16-bit grayscale pixel buffer.
 ///
@@ -16,9 +21,10 @@ const HEADER_SIZE: usize = 64;
 /// Returns `(pixels, width, height)` where pixels is a row-major `Vec<u16>`.
 pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u32), CodecError> {
     if data.len() < HEADER_SIZE {
-        return Err(CodecError::InvalidData(
-            "RLE data too short for header".into(),
-        ));
+        return Err(CodecError::Truncated {
+            offset: data.len(),
+            context: "RLE header",
+        });
     }
 
     // Parse header
@@ -38,7 +44,14 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         *offset = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
     }
 
-    let num_pixels = (width as usize) * (height as usize);
+    let num_pixels = (width as usize)
+        .checked_mul(height as usize)
+        .filter(|&n| n <= MAX_PIXELS)
+        .ok_or(CodecError::InvalidParameter {
+            name: "width*height",
+            value: (width as i64).saturating_mul(height as i64),
+            allowed: "product <= 268435456 pixels (1<<28)",
+        })?;
 
     // Decode each segment
     let mut segments = Vec::with_capacity(num_segments as usize);
@@ -51,15 +64,22 @@ pub fn decode(data: &[u8], width: u32, height: u32) -> Result<(Vec<u16>, u32, u3
         };
 
         if start > data.len() || end > data.len() || start > end {
-            return Err(CodecError::InvalidData(format!(
-                "RLE: invalid segment {i} offsets (start={start}, end={end}, data_len={})",
-                data.len()
-            )));
+            return Err(CodecError::Truncated {
+                offset: start.min(data.len()),
+                context: "RLE segment offsets",
+            });
         }
 
         let seg_data = &data[start..end];
         let decoded = decode_packbits(seg_data, num_pixels).map_err(|e| {
-            CodecError::InvalidData(format!("RLE: failed to decode segment {i}: {e}"))
+            let rel_offset = match e {
+                PackBitsError::TruncatedLiteral { offset, .. } => offset,
+                PackBitsError::TruncatedRun { offset } => offset,
+            };
+            CodecError::Truncated {
+                offset: start + rel_offset,
+                context: "RLE PackBits segment",
+            }
         })?;
 
         if decoded.len() != num_pixels {
@@ -116,6 +136,22 @@ mod tests {
     fn decode_too_short() {
         let result = decode(&[0u8; 10], 1, 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_huge_dims_rejected_not_abort() {
+        // A well-formed 1-segment header, but width*height would otherwise
+        // force a multi-exabyte allocation. Must return an error, not abort.
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let result = decode(&data, 0xFFFF_FFFF, 0xFFFF_FFFF);
+        assert!(matches!(
+            result,
+            Err(CodecError::InvalidParameter {
+                name: "width*height",
+                ..
+            })
+        ));
     }
 
     #[test]

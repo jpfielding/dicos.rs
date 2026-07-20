@@ -2,7 +2,9 @@
 //! JPEG Lossless codec (ITU-T T.81 Annex H).
 //!
 //! Implements DICOM Process 14 Selection Value 1 with 7 DPCM predictors
-//! and Huffman entropy coding. Supports 16-bit grayscale images.
+//! and Huffman entropy coding for single-component grayscale (precision
+//! `2..=16`), with point transform and row-aligned restart intervals
+//! (H.1.1). Verified against libjpeg-turbo >= 3.0.
 //!
 //! # Overview
 //!
@@ -44,7 +46,7 @@ mod huffman;
 mod scan;
 
 pub use decode::decode;
-pub use encode::encode;
+pub use encode::{encode, encode_with_options, EncodeOptions};
 
 /// DICOM Transfer Syntax UID for JPEG Lossless, Non-Hierarchical (Process 14, SV1).
 pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.70";

@@ -1,134 +1,267 @@
-//! Tile encoder / decoder for JPEG 2000.
+//! Conformant T.800 tile-component pipeline (Workstream 1 step 8).
 //!
-//! Handles encoding and decoding of a single tile component: applies the
-//! multi-level DWT, then serialises (or deserialises) the wavelet
-//! coefficients as signed 32-bit big-endian integers -- a simple format
-//! that guarantees lossless round-trip for all bit depths.
-
-use crate::error::CodecError;
+//! Encodes/decodes a single tile-component through the full lossless pipeline:
+//! reversible 5/3 DWT ⇄ resolution/band/code-block geometry ⇄ EBCOT tier-1 ⇄
+//! LRCP tier-2 packets. For our profile (1 tile, 1 component, 1 layer, 1
+//! precinct per band, LRCP progression) the packet order is simply resolution
+//! `r` ascending, one packet per resolution covering that resolution's bands.
+//!
+//! `Mb` (the maximum number of magnitude bit-planes for a band, `Mb = εb + G −
+//! 1`) is supplied per band by the `mb_for(kind, level)` closure, where `level`
+//! is the band's *decomposition level* (`NL` for the LL band, `NL..=1` for the
+//! detail bands) — the same key the QCD marker uses to order its step sizes.
+//! Step 9 (codestream) will pass a closure computed from the parsed `QcdMarker`;
+//! the tests here use a constant.
+//!
+//! This module is not yet wired into the public `encode`/`decode` (still the
+//! frozen `legacy` path) — that is Workstream 1 step 9.
 
 use crate::dwt;
+use crate::ebcot::{decode_code_block, encode_code_block, CodedBlock};
+use crate::error::CodecError;
+use crate::geometry::{build_geometry, Band, BandKind, CodeBlockGeom, TileGeometry};
+use crate::packet::{read_packet, write_packet, PrecinctState};
 
-// ---------------------------------------------------------------------------
-// Tile encoder
-// ---------------------------------------------------------------------------
+/// Maximum tile area (samples) we will allocate for, guarding against hostile
+/// dimensions (matches the codestream-level cap in the plan).
+const MAX_TILE_AREA: usize = 1 << 28;
 
-/// Encodes a single-component tile.
-pub struct TileEncoder {
-    width: usize,
-    height: usize,
-    decomp_levels: usize,
-}
-
-impl TileEncoder {
-    pub fn new(width: usize, height: usize, decomp_levels: usize) -> Self {
-        Self {
-            width,
-            height,
-            decomp_levels,
-        }
-    }
-
-    /// Encode a tile (single component) and return the serialised byte stream.
-    ///
-    /// Format:
-    /// - `width`  (2 bytes, big-endian u16)
-    /// - `height` (2 bytes, big-endian u16)
-    /// - `coeffs` (width * height * 4 bytes, each i32 big-endian)
-    pub fn encode_tile(&self, data: &[i32]) -> Result<Vec<u8>, CodecError> {
-        let expected = self.width * self.height;
-        if data.len() != expected {
-            return Err(CodecError::DimensionMismatch {
-                expected,
-                actual: data.len(),
-            });
-        }
-
-        // Copy and apply forward DWT.
-        let mut coeffs = data.to_vec();
-        dwt::forward_multi_level(&mut coeffs, self.width, self.height, self.decomp_levels);
-
-        // Serialise.
-        let mut result = Vec::with_capacity(4 + expected * 4);
-        result.push((self.width >> 8) as u8);
-        result.push(self.width as u8);
-        result.push((self.height >> 8) as u8);
-        result.push(self.height as u8);
-
-        for &c in &coeffs {
-            result.push((c >> 24) as u8);
-            result.push((c >> 16) as u8);
-            result.push((c >> 8) as u8);
-            result.push(c as u8);
-        }
-
-        Ok(result)
+/// Decomposition level of a resolution's bands: `NL` for the coarsest
+/// resolution (`r = 0`, the LL band) and for `r = 1`, decreasing to `1` at the
+/// finest resolution. This mirrors `geometry`'s `n = NL − r + 1`.
+fn decomposition_level(r: u8, num_levels: u8) -> u8 {
+    if r == 0 {
+        num_levels
+    } else {
+        num_levels - r + 1
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tile decoder
-// ---------------------------------------------------------------------------
-
-/// Decodes a single-component tile.
-pub struct TileDecoder {
-    decomp_levels: usize,
+/// Validate dimensions and return the sample count `w * h`.
+fn checked_area(w: u32, h: u32) -> Result<usize, CodecError> {
+    if w == 0 || h == 0 {
+        return Err(CodecError::InvalidData("tile has a zero dimension".into()));
+    }
+    let n = (w as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| CodecError::InvalidData("tile dimensions overflow usize".into()))?;
+    if n > MAX_TILE_AREA {
+        return Err(CodecError::InvalidData(format!(
+            "tile area {n} exceeds the {MAX_TILE_AREA} sample cap"
+        )));
+    }
+    Ok(n)
 }
 
-impl TileDecoder {
-    pub fn new(decomp_levels: usize) -> Self {
-        Self { decomp_levels }
-    }
-
-    /// Decode a serialised tile and return the reconstructed pixel data.
-    ///
-    /// Returns `(width, height, pixels)`.
-    pub fn decode_tile(&self, data: &[u8]) -> Result<(usize, usize, Vec<i32>), CodecError> {
-        if data.len() < 4 {
-            return Err(CodecError::InvalidData(
-                "tile data too short for header".into(),
+/// Reject geometries that span more than one precinct per resolution.
+///
+/// The tier-2 pipeline emits exactly one packet per resolution and holds one
+/// [`PrecinctState`] per band, so it only handles the single-precinct case
+/// (every realistic tile with the default PPx=PPy=15 precinct exponent). A
+/// dimension large enough to cross the 2^15 precinct span (e.g. > 32768 in a
+/// resolution) would be silently mispacked; reject it loudly instead, matching
+/// the crate's "legal-but-unsupported is rejected" contract.
+fn ensure_single_precinct(geom: &TileGeometry) -> Result<(), CodecError> {
+    for res in &geom.resolutions {
+        if res.num_precincts_w as u64 * res.num_precincts_h as u64 > 1 {
+            return Err(CodecError::Unsupported(
+                "multi-precinct images not supported".into(),
             ));
         }
+    }
+    Ok(())
+}
 
-        let width = ((data[0] as usize) << 8) | (data[1] as usize);
-        let height = ((data[2] as usize) << 8) | (data[3] as usize);
+/// Gather a code-block's coefficients out of the packed Mallat tile buffer.
+///
+/// The block rectangle is band-native; its physical position in the full tile
+/// buffer is `band.placement + cb.rect.(x0, y0)`, indexed at the full tile
+/// `stride`.
+fn gather(buf: &[i32], stride: usize, band: &Band, cb: &CodeBlockGeom) -> Vec<i32> {
+    let bw = cb.rect.width() as usize;
+    let bh = cb.rect.height() as usize;
+    let x_off = band.placement.x_off as usize + cb.rect.x0 as usize;
+    let y_off = band.placement.y_off as usize + cb.rect.y0 as usize;
+    let mut v = vec![0i32; bw * bh];
+    for yy in 0..bh {
+        let src = (y_off + yy) * stride + x_off;
+        v[yy * bw..yy * bw + bw].copy_from_slice(&buf[src..src + bw]);
+    }
+    v
+}
 
-        let expected_len = 4 + width * height * 4;
-        if data.len() < expected_len {
-            return Err(CodecError::InvalidData(format!(
-                "tile data too short: expected {expected_len}, got {}",
-                data.len()
-            )));
+/// Scatter a code-block's decoded coefficients back into the Mallat buffer.
+fn scatter(buf: &mut [i32], stride: usize, band: &Band, cb: &CodeBlockGeom, coeffs: &[i32]) {
+    let bw = cb.rect.width() as usize;
+    let bh = cb.rect.height() as usize;
+    let x_off = band.placement.x_off as usize + cb.rect.x0 as usize;
+    let y_off = band.placement.y_off as usize + cb.rect.y0 as usize;
+    for yy in 0..bh {
+        let dst = (y_off + yy) * stride + x_off;
+        buf[dst..dst + bw].copy_from_slice(&coeffs[yy * bw..yy * bw + bw]);
+    }
+}
+
+/// Encode one tile-component (`w × h` samples, row-major) to a concatenation of
+/// LRCP packets.
+///
+/// `mb_for(kind, level)` supplies `Mb` per band. An `Err` is returned if any
+/// code-block needs more magnitude bit-planes than its band's `Mb` allows.
+pub fn encode_tile(
+    component: &[i32],
+    w: u32,
+    h: u32,
+    num_levels: u8,
+    xcb: u8,
+    ycb: u8,
+    mb_for: impl Fn(BandKind, u8) -> u32,
+) -> Result<Vec<u8>, CodecError> {
+    let n = checked_area(w, h)?;
+    if component.len() != n {
+        return Err(CodecError::DimensionMismatch {
+            expected: n,
+            actual: component.len(),
+        });
+    }
+    let stride = w as usize;
+
+    let geom = build_geometry(w, h, num_levels, xcb, ycb);
+    ensure_single_precinct(&geom)?;
+
+    // Forward DWT into a packed Mallat buffer.
+    let mut buf = component.to_vec();
+    dwt::forward_multi_level_conformant(&mut buf, stride, h as usize, num_levels as usize);
+
+    let mut out = Vec::new();
+
+    for res in &geom.resolutions {
+        let level = decomposition_level(res.r, num_levels);
+        let bands: Vec<Band> = res.bands.clone();
+        let mut states: Vec<PrecinctState> = bands
+            .iter()
+            .map(|b| PrecinctState::new(b.cb_grid_w, b.cb_grid_h))
+            .collect();
+        let mut mbs: Vec<u32> = Vec::with_capacity(bands.len());
+        let mut all_blocks: Vec<Vec<Option<CodedBlock>>> = Vec::with_capacity(bands.len());
+
+        for band in &bands {
+            let mb = mb_for(band.kind, level);
+            mbs.push(mb);
+            let mut blocks: Vec<Option<CodedBlock>> = Vec::with_capacity(band.cbs.len());
+            for cb in &band.cbs {
+                let bw = cb.rect.width() as usize;
+                let bh = cb.rect.height() as usize;
+                let coeffs = gather(&buf, stride, band, cb);
+                let coded = encode_code_block(&coeffs, bw, bh, band.kind);
+                // `mb` is caller-supplied (from QCD at step 9), so a too-small
+                // Mb is a runtime error, not an internal invariant — no
+                // debug_assert here, which would mask the clean Err in tests.
+                if coded.num_bitplanes > mb {
+                    return Err(CodecError::InvalidData(format!(
+                        "code-block needs {} bit-planes but Mb is {mb} (band {:?})",
+                        coded.num_bitplanes, band.kind
+                    )));
+                }
+                blocks.push(if coded.num_bitplanes == 0 {
+                    None
+                } else {
+                    Some(coded)
+                });
+            }
+            all_blocks.push(blocks);
         }
 
-        let mut coeffs = Vec::with_capacity(width * height);
-        let mut pos = 4;
-        for _ in 0..(width * height) {
-            let v = ((data[pos] as i32) << 24)
-                | ((data[pos + 1] as i32) << 16)
-                | ((data[pos + 2] as i32) << 8)
-                | (data[pos + 3] as i32);
-            coeffs.push(v);
-            pos += 4;
-        }
-
-        dwt::inverse_multi_level(&mut coeffs, width, height, self.decomp_levels);
-
-        Ok((width, height, coeffs))
+        let block_refs: Vec<&[Option<CodedBlock>]> =
+            all_blocks.iter().map(|v| v.as_slice()).collect();
+        write_packet(&mut states, &bands, &block_refs, &mbs, &mut out)?;
     }
 
-    /// Return the byte length consumed by a tile component's data block,
-    /// given the tile data starting at the header.
-    pub fn tile_data_len(data: &[u8]) -> Result<usize, CodecError> {
-        if data.len() < 4 {
-            return Err(CodecError::InvalidData(
-                "tile data too short for header".into(),
-            ));
+    Ok(out)
+}
+
+/// Decode a tile-component from a concatenation of LRCP packets.
+pub fn decode_tile(
+    bitstream: &[u8],
+    w: u32,
+    h: u32,
+    num_levels: u8,
+    xcb: u8,
+    ycb: u8,
+    mb_for: impl Fn(BandKind, u8) -> u32,
+) -> Result<Vec<i32>, CodecError> {
+    let n = checked_area(w, h)?;
+    let stride = w as usize;
+
+    let geom = build_geometry(w, h, num_levels, xcb, ycb);
+    ensure_single_precinct(&geom)?;
+    let mut buf = vec![0i32; n];
+    let mut pos = 0usize;
+
+    for res in &geom.resolutions {
+        let level = decomposition_level(res.r, num_levels);
+        let bands: Vec<Band> = res.bands.clone();
+        let mut states: Vec<PrecinctState> = bands
+            .iter()
+            .map(|b| PrecinctState::new(b.cb_grid_w, b.cb_grid_h))
+            .collect();
+        let mbs: Vec<u32> = bands.iter().map(|b| mb_for(b.kind, level)).collect();
+
+        if pos > bitstream.len() {
+            return Err(CodecError::InvalidData("tile bitstream truncated".into()));
         }
-        let width = ((data[0] as usize) << 8) | (data[1] as usize);
-        let height = ((data[2] as usize) << 8) | (data[3] as usize);
-        Ok(4 + width * height * 4)
+        let (contribs, header_len) = read_packet(&mut states, &bands, &mbs, &bitstream[pos..])?;
+        let mut body_pos = pos
+            .checked_add(header_len)
+            .ok_or_else(|| CodecError::InvalidData("packet offset overflow".into()))?;
+
+        for (bi, band) in bands.iter().enumerate() {
+            let mb = mbs[bi];
+            for (k, cb) in band.cbs.iter().enumerate() {
+                let bw = cb.rect.width() as usize;
+                let bh = cb.rect.height() as usize;
+                let coeffs = match &contribs[bi][k] {
+                    None => vec![0i32; bw * bh],
+                    Some(c) => {
+                        if c.zero_bitplanes > mb {
+                            return Err(CodecError::InvalidData(format!(
+                                "zero-bit-planes {} exceed Mb {mb}",
+                                c.zero_bitplanes
+                            )));
+                        }
+                        let num_bitplanes = mb - c.zero_bitplanes;
+                        if num_bitplanes == 0 {
+                            return Err(CodecError::InvalidData(
+                                "included block with zero magnitude bit-planes".into(),
+                            ));
+                        }
+                        let max_passes = 3 * num_bitplanes - 2;
+                        if c.num_passes > max_passes {
+                            return Err(CodecError::InvalidData(format!(
+                                "num_passes {} exceeds 3*{num_bitplanes}-2 = {max_passes}",
+                                c.num_passes
+                            )));
+                        }
+                        let end = body_pos.checked_add(c.len).ok_or_else(|| {
+                            CodecError::InvalidData("body offset overflow".into())
+                        })?;
+                        if end > bitstream.len() {
+                            return Err(CodecError::InvalidData(
+                                "code-block body truncated".into(),
+                            ));
+                        }
+                        let data = &bitstream[body_pos..end];
+                        body_pos = end;
+                        decode_code_block(data, bw, bh, band.kind, num_bitplanes, c.num_passes)?
+                    }
+                };
+                scatter(&mut buf, stride, band, cb, &coeffs);
+            }
+        }
+        pos = body_pos;
     }
+
+    dwt::inverse_multi_level_conformant(&mut buf, stride, h as usize, num_levels as usize);
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,104 +272,166 @@ impl TileDecoder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn tile_roundtrip_basic() {
-        let w = 8;
-        let h = 8;
-        let data: Vec<i32> = (0..(w * h) as i32).collect();
+    /// A comfortable constant Mb: 16-bit-ish input through a few DWT levels
+    /// never needs this many magnitude bit-planes, so encode never overflows.
+    /// Step 9 will supply real per-band values from the QCD marker.
+    fn mb40(_: BandKind, _: u8) -> u32 {
+        40
+    }
 
-        let enc = TileEncoder::new(w, h, 3);
-        let encoded = enc.encode_tile(&data).unwrap();
+    fn roundtrip(component: &[i32], w: u32, h: u32, nl: u8, xcb: u8, ycb: u8) {
+        let enc = encode_tile(component, w, h, nl, xcb, ycb, mb40)
+            .unwrap_or_else(|e| panic!("encode {w}x{h} nl={nl} cb=({xcb},{ycb}): {e}"));
+        let dec = decode_tile(&enc, w, h, nl, xcb, ycb, mb40)
+            .unwrap_or_else(|e| panic!("decode {w}x{h} nl={nl} cb=({xcb},{ycb}): {e}"));
+        assert_eq!(
+            dec, component,
+            "round-trip mismatch {w}x{h} nl={nl} cb=({xcb},{ycb})"
+        );
+    }
 
-        let dec = TileDecoder::new(3);
-        let (dw, dh, decoded) = dec.decode_tile(&encoded).unwrap();
-
-        assert_eq!(dw, w);
-        assert_eq!(dh, h);
-        assert_eq!(decoded, data);
+    /// Deterministic pixel patterns, values kept < 4096 (12-bit) so the DWT
+    /// output stays well within Mb=40.
+    fn pattern(kind: usize, w: u32, h: u32) -> Vec<i32> {
+        let n = (w * h) as usize;
+        match kind {
+            0 => vec![1234i32; n], // constant
+            1 => (0..n as u32) // gradient
+                .map(|i| ((i % w) as i32 * 3 + (i / w) as i32 * 5) % 4096)
+                .collect(),
+            2 => {
+                // seeded pseudo-random
+                let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ ((w as u64) << 20) ^ (h as u64);
+                (0..n)
+                    .map(|_| {
+                        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        ((s >> 40) as i32) & 0xFFF
+                    })
+                    .collect()
+            }
+            _ => {
+                // sparse
+                let mut v = vec![0i32; n];
+                if n > 0 {
+                    v[0] = 2000;
+                    v[n / 2] = -1500;
+                    v[n - 1] = 999;
+                }
+                v
+            }
+        }
     }
 
     #[test]
-    fn tile_roundtrip_16bit_values() {
-        let w = 16;
-        let h = 16;
-        let data: Vec<i32> = (0..(w * h) as i32).map(|x| x * 100 + 1000).collect();
-
-        let enc = TileEncoder::new(w, h, 4);
-        let encoded = enc.encode_tile(&data).unwrap();
-
-        let dec = TileDecoder::new(4);
-        let (_, _, decoded) = dec.decode_tile(&encoded).unwrap();
-        assert_eq!(decoded, data);
+    fn roundtrip_matrix() {
+        let dims = [1u32, 2, 3, 5, 8, 13, 16, 31, 64, 65, 130];
+        let levels = [0u8, 1, 2, 5];
+        let cbs = [(2u8, 2u8), (6, 6), (10, 2)];
+        for &w in &dims {
+            for &h in &dims {
+                for &nl in &levels {
+                    for &(xcb, ycb) in &cbs {
+                        for kind in 0..4 {
+                            let comp = pattern(kind, w, h);
+                            roundtrip(&comp, w, h, nl, xcb, ycb);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn tile_roundtrip_odd_dims() {
-        let w = 13;
-        let h = 7;
-        let data: Vec<i32> = (0..(w * h) as i32).collect();
-
-        let enc = TileEncoder::new(w, h, 2);
-        let encoded = enc.encode_tile(&data).unwrap();
-
-        let dec = TileDecoder::new(2);
-        let (dw, dh, decoded) = dec.decode_tile(&encoded).unwrap();
-        assert_eq!(dw, w);
-        assert_eq!(dh, h);
-        assert_eq!(decoded, data);
+    fn all_zero_image_empty_packets_to_zeros() {
+        let w = 64;
+        let h = 48;
+        let comp = vec![0i32; (w * h) as usize];
+        let enc = encode_tile(&comp, w, h, 5, 6, 6, mb40).unwrap();
+        // Every resolution's packet is empty (a single 0x00 byte). With NL=5
+        // there are 6 resolutions.
+        assert_eq!(enc, vec![0x00; 6]);
+        let dec = decode_tile(&enc, w, h, 5, 6, 6, mb40).unwrap();
+        assert_eq!(dec, comp);
     }
 
     #[test]
-    fn tile_roundtrip_all_zeros() {
+    fn tight_mb_equal_to_actual_bitplanes() {
+        // Discover the minimal Mb for which encode succeeds (== global max
+        // num_bitplanes), then round-trip at exactly that Mb.
+        let w = 31;
+        let h = 17;
+        let comp = pattern(2, w, h);
+        let nl = 3u8;
+        let (xcb, ycb) = (4u8, 4u8);
+
+        let tight = (0..=48u32)
+            .find(|&mb| encode_tile(&comp, w, h, nl, xcb, ycb, |_, _| mb).is_ok())
+            .expect("some Mb must work");
+        assert!(tight > 0, "non-zero image needs at least one bit-plane");
+
+        let enc = encode_tile(&comp, w, h, nl, xcb, ycb, |_, _| tight).unwrap();
+        let dec = decode_tile(&enc, w, h, nl, xcb, ycb, |_, _| tight).unwrap();
+        assert_eq!(dec, comp, "tight-Mb round-trip");
+
+        // One below the tight value must fail cleanly at encode time.
+        let err = encode_tile(&comp, w, h, nl, xcb, ycb, |_, _| tight - 1);
+        assert!(matches!(err, Err(CodecError::InvalidData(_))));
+    }
+
+    #[test]
+    fn mismatched_mb_decode_errors_cleanly() {
         let w = 32;
         let h = 32;
-        let data = vec![0i32; w * h];
-
-        let enc = TileEncoder::new(w, h, 5);
-        let encoded = enc.encode_tile(&data).unwrap();
-
-        let dec = TileDecoder::new(5);
-        let (_, _, decoded) = dec.decode_tile(&encoded).unwrap();
-        assert_eq!(decoded, data);
+        let comp = pattern(1, w, h);
+        let nl = 2u8;
+        let enc = encode_tile(&comp, w, h, nl, 6, 6, mb40).unwrap();
+        // Decoding with an Mb far smaller than the encoded bit-planes must
+        // error, not panic and not silently corrupt.
+        let dec = decode_tile(&enc, w, h, nl, 6, 6, |_, _| 5);
+        assert!(matches!(dec, Err(CodecError::InvalidData(_))));
     }
 
     #[test]
-    fn tile_roundtrip_constant() {
+    fn truncated_bitstream_never_panics() {
         let w = 16;
-        let h = 16;
-        let data = vec![12345i32; w * h];
-
-        let enc = TileEncoder::new(w, h, 3);
-        let encoded = enc.encode_tile(&data).unwrap();
-
-        let dec = TileDecoder::new(3);
-        let (_, _, decoded) = dec.decode_tile(&encoded).unwrap();
-        assert_eq!(decoded, data);
+        let h = 13;
+        let comp = pattern(2, w, h);
+        let nl = 2u8;
+        let enc = encode_tile(&comp, w, h, nl, 4, 4, mb40).unwrap();
+        for cut in 0..enc.len() {
+            // Must return Ok or Err but never panic.
+            let _ = decode_tile(&enc[..cut], w, h, nl, 4, 4, mb40);
+        }
+        // The full stream decodes.
+        assert_eq!(decode_tile(&enc, w, h, nl, 4, 4, mb40).unwrap(), comp);
     }
 
     #[test]
-    fn tile_data_len_calculation() {
-        let w = 10;
-        let h = 20;
-        let data: Vec<i32> = (0..(w * h) as i32).collect();
-
-        let enc = TileEncoder::new(w, h, 2);
-        let encoded = enc.encode_tile(&data).unwrap();
-
-        let len = TileDecoder::tile_data_len(&encoded).unwrap();
-        assert_eq!(len, encoded.len());
+    fn zero_dimension_rejected() {
+        assert!(matches!(
+            encode_tile(&[], 0, 4, 0, 6, 6, mb40),
+            Err(CodecError::InvalidData(_))
+        ));
+        assert!(matches!(
+            decode_tile(&[0], 4, 0, 0, 6, 6, mb40),
+            Err(CodecError::InvalidData(_))
+        ));
     }
 
     #[test]
-    fn tile_decode_too_short() {
-        let dec = TileDecoder::new(3);
-        assert!(dec.decode_tile(&[0, 0]).is_err());
+    fn dimension_mismatch_rejected() {
+        let comp = vec![0i32; 10];
+        assert!(matches!(
+            encode_tile(&comp, 4, 4, 0, 6, 6, mb40),
+            Err(CodecError::DimensionMismatch { .. })
+        ));
     }
 
     #[test]
-    fn tile_encode_dimension_mismatch() {
-        let enc = TileEncoder::new(4, 4, 2);
-        let data = vec![0i32; 10]; // wrong size
-        assert!(enc.encode_tile(&data).is_err());
+    fn single_pixel() {
+        for v in [0i32, 1, 2047, -2047] {
+            roundtrip(&[v], 1, 1, 0, 2, 2);
+            roundtrip(&[v], 1, 1, 3, 6, 6);
+        }
     }
 }

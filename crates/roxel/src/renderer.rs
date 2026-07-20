@@ -48,6 +48,7 @@ pub struct RenderParams<'a> {
     pub viewport: [u32; 2],
     pub threats: &'a [ThreatBox],
     pub show_threats: bool,
+    pub settings: &'a crate::state::RenderSettings,
 }
 
 /// GPU volume renderer state.
@@ -64,18 +65,9 @@ pub struct VolumeRenderer {
     volume_sampler: wgpu::Sampler,
     transfer_sampler: wgpu::Sampler,
 
-    // Rendering parameters.
-    pub window_center: f32,
-    pub window_width: f32,
-    pub alpha_scale: f32,
+    // Volume-derived rendering parameter (not part of `RenderSettings` — set
+    // from DICOS rescale slope/intercept metadata in `upload_volume`).
     pub rescale_intercept: f32,
-    pub density_threshold: f32,
-    pub quality: Quality,
-
-    // Lighting.
-    pub ambient: f32,
-    pub diffuse: f32,
-    pub specular: f32,
 
     // Volume dimensions for scale_z computation.
     dim_x: u32,
@@ -285,15 +277,7 @@ impl VolumeRenderer {
             transfer_texture: None,
             volume_sampler,
             transfer_sampler,
-            window_center: 32768.0,
-            window_width: 65536.0,
-            alpha_scale: 1.0,
             rescale_intercept: 0.0,
-            density_threshold: 0.0,
-            quality: Quality::Medium,
-            ambient: 0.3,
-            diffuse: 0.6,
-            specular: 0.3,
             dim_x: 1,
             dim_y: 1,
             dim_z: 1,
@@ -431,24 +415,74 @@ impl VolumeRenderer {
         vertices
     }
 
-    /// Upload volume data to a 3D GPU texture.
+    /// Upload volume data to a 3D GPU texture, packing on the calling thread.
+    ///
+    /// This is the fallback path used by callers that do not already hold a
+    /// precomputed GPU buffer (e.g. switching the active layer via the
+    /// sidebar). The background loader path uses [`Self::upload_volume_packed`]
+    /// with a buffer produced off the render thread.
     pub fn upload_volume(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, volume: &Volume) {
-        self.dim_x = volume.dim_x as u32;
-        self.dim_y = volume.dim_y as u32;
-        self.dim_z = volume.dim_z as u32;
+        let packed = volume.pack_for_gpu();
+        self.upload_volume_packed(device, queue, volume, &packed);
+    }
 
-        self.window_center = volume.window_center as f32;
-        self.window_width = volume.window_width as f32;
+    /// Upload volume data to a 3D GPU texture using a precomputed packed
+    /// buffer (see [`Volume::pack_for_gpu`]).
+    ///
+    /// The `packed` slice must correspond to `volume`'s dimensions. Keeping
+    /// packing off this method lets the background loader do the expensive CPU
+    /// work, leaving only wgpu resource operations on the render thread.
+    pub fn upload_volume_packed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: &Volume,
+        packed: &[u16],
+    ) {
+        let new_dim_x = volume.dim_x as u32;
+        let new_dim_y = volume.dim_y as u32;
+        let new_dim_z = volume.dim_z as u32;
+
+        // Reuse the existing 3D texture when dimensions match: avoids a
+        // texture allocation + bind-group rebuild on every volume swap.
+        let dims_match = (self.dim_x, self.dim_y, self.dim_z) == (new_dim_x, new_dim_y, new_dim_z);
+        let can_reuse = dims_match && self.volume_texture.is_some();
+
+        self.dim_x = new_dim_x;
+        self.dim_y = new_dim_y;
+        self.dim_z = new_dim_z;
+
         self.rescale_intercept = volume.rescale_intercept as f32;
         self.voxel_spacing = volume.voxel_spacing;
-
-        let packed = volume.pack_for_gpu();
 
         let size = wgpu::Extent3d {
             width: self.dim_x,
             height: self.dim_y,
             depth_or_array_layers: self.dim_z,
         };
+
+        if can_reuse {
+            let texture = self
+                .volume_texture
+                .as_ref()
+                .expect("volume texture must exist");
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(packed),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.dim_x * 4 * 2), // 4 u16 channels
+                    rows_per_image: Some(self.dim_y),
+                },
+                size,
+            );
+            return;
+        }
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("volume_texture"),
@@ -468,7 +502,7 @@ impl VolumeRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&packed),
+            bytemuck::cast_slice(packed),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(self.dim_x * 4 * 2), // 4 u16 channels
@@ -592,12 +626,16 @@ impl VolumeRenderer {
         };
         let camera = params.camera;
         let [width, height] = params.viewport;
+        let settings = params.settings;
 
         let max_dim = self.dim_x.max(self.dim_y).max(self.dim_z) as f32;
         let base_voxel_size = if max_dim > 0.0 { 1.0 / max_dim } else { 0.01 };
-        let zoom_factor = 1.0 / camera.distance.clamp(0.5, 5.0);
+        let zoom_factor = 1.0
+            / camera
+                .distance
+                .clamp(Camera::MIN_DISTANCE, Camera::MAX_DISTANCE);
 
-        let step_size = match self.quality {
+        let step_size = match settings.quality {
             Quality::Fast => base_voxel_size * zoom_factor * 1.5,
             Quality::Medium => base_voxel_size * zoom_factor * 1.0,
             Quality::High => base_voxel_size * zoom_factor * 0.5,
@@ -606,7 +644,7 @@ impl VolumeRenderer {
 
         let scale_z = self.compute_scale_z();
 
-        let window_min = self.window_center - self.window_width * 0.5;
+        let window_min = settings.window_center - settings.window_width * 0.5;
         let aspect = if height > 0 {
             width as f32 / height as f32
         } else {
@@ -628,13 +666,13 @@ impl VolumeRenderer {
             cam_up: up.into(),
             scale_z,
             window_min,
-            window_range: self.window_width,
-            alpha_scale: self.alpha_scale,
+            window_range: settings.window_width,
+            alpha_scale: settings.global_opacity,
             rescale_intercept: self.rescale_intercept,
-            density_threshold: self.density_threshold,
-            ambient_intensity: self.ambient,
-            diffuse_intensity: self.diffuse,
-            specular_intensity: self.specular,
+            density_threshold: settings.density_threshold,
+            ambient_intensity: settings.ambient,
+            diffuse_intensity: settings.diffuse,
+            specular_intensity: settings.specular,
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));

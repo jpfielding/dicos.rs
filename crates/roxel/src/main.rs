@@ -37,35 +37,76 @@ impl RoxelApp {
     }
 
     fn init_gpu(&mut self, window: Arc<Window>) {
+        match Self::try_init_gpu(&window) {
+            Ok(gpu) => {
+                let device = Arc::new(gpu.device);
+                let queue = Arc::new(gpu.queue);
+
+                let mut app =
+                    roxel::app::App::new(&window, device.clone(), queue.clone(), gpu.config.format);
+
+                // Load the initial path if provided via CLI.
+                if let Some(path) = self.initial_path.take() {
+                    app.load_path(&path);
+                }
+
+                self.window = Some(window);
+                self.surface = Some(gpu.surface);
+                self.device = Some(device);
+                self.queue = Some(queue);
+                self.surface_config = Some(gpu.config);
+                self.app = Some(app);
+            }
+            Err(message) => {
+                show_gpu_error(&message);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// Attempt to initialize the GPU surface, adapter, and device.
+    ///
+    /// Returns a descriptive error message (rather than panicking) on
+    /// failure so the caller can present it to the user before exiting.
+    fn try_init_gpu(window: &Arc<Window>) -> Result<GpuInit, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create surface");
+        let surface = instance.create_surface(window.clone()).map_err(|e| {
+            format!(
+                "Failed to create a GPU rendering surface for the window:\n{e}\n\n\
+                 This usually means your graphics drivers do not support any of \
+                 roxel's supported backends (Vulkan, Metal, or DX12). Try updating \
+                 your graphics drivers."
+            )
+        })?;
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .expect("failed to find GPU adapter");
+        let adapter = Self::request_adapter(&instance, &surface)?;
+
+        let required_features =
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | wgpu::Features::FLOAT32_FILTERABLE;
+        let required_limits = wgpu::Limits::default();
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("roxel_device"),
-            required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-                | wgpu::Features::FLOAT32_FILTERABLE,
-            required_limits: wgpu::Limits::default(),
+            required_features,
+            required_limits: required_limits.clone(),
             memory_hints: Default::default(),
             trace: Default::default(),
             experimental_features: Default::default(),
         }))
-        .expect("failed to create GPU device");
-
-        let device = Arc::new(device);
-        let queue = Arc::new(queue);
+        .map_err(|e| {
+            format!(
+                "Failed to create a GPU device:\n{e}\n\n\
+                 roxel requires a GPU/driver supporting the features \
+                 {required_features:?} and at least the default wgpu resource \
+                 limits ({required_limits:?}). Please update your graphics \
+                 drivers, or try running on a different GPU if more than one \
+                 is available."
+            )
+        })?;
 
         let size = window.inner_size();
         let surface_caps = surface.get_capabilities(&adapter);
@@ -91,20 +132,65 @@ impl RoxelApp {
         };
         surface.configure(&device, &config);
 
-        let mut app = roxel::app::App::new(&window, device.clone(), queue.clone(), surface_format);
+        Ok(GpuInit {
+            surface,
+            device,
+            queue,
+            config,
+        })
+    }
 
-        // Load the initial path if provided via CLI.
-        if let Some(path) = self.initial_path.take() {
-            app.load_path(&path);
+    /// Request a GPU adapter, retrying once against a software fallback
+    /// adapter if the preferred high-performance adapter is unavailable.
+    fn request_adapter(
+        instance: &wgpu::Instance,
+        surface: &wgpu::Surface<'static>,
+    ) -> Result<wgpu::Adapter, String> {
+        let primary = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(surface),
+            force_fallback_adapter: false,
+        }));
+
+        if let Ok(adapter) = primary {
+            return Ok(adapter);
         }
 
-        self.window = Some(window);
-        self.surface = Some(surface);
-        self.device = Some(device);
-        self.queue = Some(queue);
-        self.surface_config = Some(config);
-        self.app = Some(app);
+        // Retry once against a fallback (software) adapter before giving up.
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(surface),
+            force_fallback_adapter: true,
+        }))
+        .map_err(|e| {
+            format!(
+                "Failed to find a compatible GPU adapter, even with a software \
+                 fallback adapter:\n{e}\n\n\
+                 roxel requires a GPU (or software renderer) reachable via \
+                 Vulkan, Metal, or DX12. Please check that your graphics \
+                 drivers are installed and up to date."
+            )
+        })
     }
+}
+
+/// Resources produced by a successful GPU initialization.
+struct GpuInit {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+}
+
+/// Show a blocking error dialog describing a fatal GPU initialization
+/// failure.
+fn show_gpu_error(message: &str) {
+    rfd::MessageDialog::new()
+        .set_title("roxel")
+        .set_description(message)
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 impl ApplicationHandler for RoxelApp {

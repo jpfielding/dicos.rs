@@ -5,6 +5,13 @@ Releases are cut by pushing a semver tag. The
 with **Trusted Publishing (OIDC)** — there is no `CARGO_REGISTRY_TOKEN` secret
 stored in the repository.
 
+> **2.0.0 is the first conformant release.** It is the first release where
+> `pure_jpeg2k` emits real ITU-T T.800 JPEG 2000 (1.0.0 emitted raw DWT
+> coefficients), and where `pure_jpegls` emits conformant T.87. Files written
+> by 1.0.0 remain decodable via `LegacyPolicy` (jpeg2k) / `Profile::LegacyGo`
+> (jpegls). Crate names and the tag flow are unchanged from 1.0.0. See
+> [MIGRATION.md](MIGRATION.md) for the full breaking-change list.
+
 ## Published crates
 
 | Package on crates.io | Imported as | Notes |
@@ -57,8 +64,8 @@ After that, releases are fully automated.
 2. Commit and tag with a matching `v` prefix:
 
    ```sh
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v2.0.0
+   git push origin v2.0.0
    ```
 
 The workflow verifies the tag matches the `dicos` crate version, then publishes

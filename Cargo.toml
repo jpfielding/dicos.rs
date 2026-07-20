@@ -8,9 +8,18 @@ members = [
     "crates/jpeg2k",
     "crates/roxel",
 ]
+# The cargo-fuzz subcrates are nightly-only and build against libFuzzer; keep
+# them out of the normal workspace build.
+exclude = [
+    "fuzz",
+    "crates/jpeg2k/fuzz",
+    "crates/jpegls/fuzz",
+    "crates/jpegli/fuzz",
+    "crates/jpegrle/fuzz",
+]
 
 [workspace.package]
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.75"
@@ -24,6 +33,7 @@ byteorder = "1"
 log = "0.4"
 env_logger = "0.11"
 proptest = "1"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -32,11 +42,11 @@ serde_json = "1"
 # The codec crates publish under `pure_*` package names (signalling pure Rust,
 # and avoiding the taken `jpegli`/`jpeg2k` native-wrapper names) while keeping
 # their plain lib names — imports and the dep keys below are unchanged.
-dicos = { path = "crates/dicos", version = "1.0.0" }
-jpegrle = { path = "crates/jpegrle", package = "pure_jpegrle", version = "1.0.0" }
-jpegls = { path = "crates/jpegls", package = "pure_jpegls", version = "1.0.0" }
-jpegli = { path = "crates/jpegli", package = "pure_jpegli", version = "1.0.0" }
-jpeg2k = { path = "crates/jpeg2k", package = "pure_jpeg2k", version = "1.0.0" }
+dicos = { path = "crates/dicos", version = "2.0.0" }
+jpegrle = { path = "crates/jpegrle", package = "pure_jpegrle", version = "2.0.0" }
+jpegls = { path = "crates/jpegls", package = "pure_jpegls", version = "2.0.0" }
+jpegli = { path = "crates/jpegli", package = "pure_jpegli", version = "2.0.0" }
+jpeg2k = { path = "crates/jpeg2k", package = "pure_jpeg2k", version = "2.0.0" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -51,6 +61,3 @@ glam = "0.29"
 pollster = "0.4"
 rfd = "0.15"
 bytemuck = { version = "1", features = ["derive"] }
-
-# Benchmarks
-criterion = { version = "0.5", features = ["html_reports"] }

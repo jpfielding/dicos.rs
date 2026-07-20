@@ -20,7 +20,7 @@ Add the package under the plain import name:
 
 ```toml
 [dependencies]
-jpegrle = { package = "pure_jpegrle", version = "1.0" }
+jpegrle = { package = "pure_jpegrle", version = "2.0" }
 ```
 
 ### Encoding

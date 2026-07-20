@@ -2,12 +2,28 @@
 
 Pure Rust implementation of JPEG Lossless (ITU-T T.81 Annex H) encoder and decoder.
 
+## Conformance scope (2.0.0)
+
+This crate emits **conformant ITU-T T.81 Process 14 SV1** (non-hierarchical,
+first-order) lossless streams for **single-component** images. Supported:
+predictors **1–7**, **point transform** (reduced-domain coding), and
+**restart intervals** (row-aligned per H.1.1 — the DRI value is a multiple of
+the image width). Precision `2..=16`. Interop is verified against
+**libjpeg-turbo ≥ 3.0** (`cjpeg -lossless` / `djpeg`).
+
+Encoder tuning is via `EncodeOptions { predictor, point_transform,
+restart_interval_rows, precision }` through `encode_with_options`; plain
+`encode` uses predictor 1, no point transform, no restarts, 16-bit. Note: the
+`.70` transfer syntax specifically means predictor 1, so registry encodes pin
+defaults to keep the emitted UID truthful.
+
 ## Features
 
 - **Lossless compression** using differential pulse code modulation (DPCM)
 - **Predictors 1-7** supported for optimal compression
+- **Point transform** and **row-aligned restart intervals**
 - **Huffman entropy coding** for prediction residuals
-- **8-bit and 16-bit** grayscale images
+- **Single-component** grayscale images, precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.70`
 - **Pure Rust**: No external codec dependencies
 
@@ -21,7 +37,7 @@ Add the package under the plain import name:
 
 ```toml
 [dependencies]
-jpegli = { package = "pure_jpegli", version = "1.0" }
+jpegli = { package = "pure_jpegli", version = "2.0" }
 ```
 
 ### Encoding
@@ -74,10 +90,9 @@ prediction uses 2^(precision-1) as the initial value.
 
 ## Supported Image Types
 
-| Pixel Type | Precision | Description |
-|------------|-----------|-------------|
-| `u8` | 8-bit | 8-bit grayscale |
-| `u16` | 16-bit | 16-bit grayscale |
+| Pixel Type | Precision | Components | Description |
+|------------|-----------|------------|-------------|
+| `u16` | `2..=16` bits | 1 (`Nf = 1`) | single-component grayscale |
 
 ## JPEG Lossless Stream Format
 

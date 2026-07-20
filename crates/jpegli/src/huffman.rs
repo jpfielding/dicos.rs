@@ -155,6 +155,28 @@ impl HuffmanTable {
     }
 }
 
+/// Returns `true` if `bits` (count of Huffman codes per length 1..=16) forms a
+/// valid, non-oversubscribed code assignment (ITU-T T.81 Annex C / the Kraft
+/// inequality).
+///
+/// At each length `L` the running code value -- the counts accumulated so far,
+/// shifted left once per length -- must never exceed `2^L`. An oversubscribed
+/// table requests more codes than the prefix code space allows, which would
+/// make canonical code generation emit codes that alias and overflow the 8-bit
+/// `build_lookup` index (an out-of-bounds panic). This must be rejected before
+/// [`HuffmanTable::from_bits_values`] builds the table.
+pub(crate) fn bits_valid(bits: &[u8; 17]) -> bool {
+    let mut code: u32 = 0;
+    for (len, &count) in bits.iter().enumerate().take(17).skip(1) {
+        code += count as u32;
+        if code > (1u32 << len) {
+            return false;
+        }
+        code <<= 1;
+    }
+    true
+}
+
 /// Returns the SSSS category (number of bits needed) for a difference value.
 ///
 /// For JPEG lossless, the category indicates how many additional bits are

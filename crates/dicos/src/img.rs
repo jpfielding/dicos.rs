@@ -4,9 +4,9 @@
 /// Native format is `u16` little-endian for DICOS 16-bit images.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrayImage<T: Copy> {
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<T>,
+    width: u32,
+    height: u32,
+    data: Vec<T>,
 }
 
 impl<T: Copy> GrayImage<T> {
@@ -33,6 +33,36 @@ impl<T: Copy> GrayImage<T> {
             height,
             data,
         })
+    }
+
+    /// Returns the image width in pixels.
+    #[inline]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the image height in pixels.
+    #[inline]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns a shared slice over the row-major pixel data.
+    #[inline]
+    pub fn data(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Returns a mutable slice over the row-major pixel data.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [T] {
+        &mut self.data
+    }
+
+    /// Consumes the image and returns the owned pixel buffer.
+    #[inline]
+    pub fn into_data(self) -> Vec<T> {
+        self.data
     }
 
     /// Returns the number of pixels in the image.
@@ -88,19 +118,19 @@ mod tests {
     #[test]
     fn new_fills_with_value() {
         let img = GrayImage::<u16>::new(4, 3, 42);
-        assert_eq!(img.width, 4);
-        assert_eq!(img.height, 3);
-        assert_eq!(img.data.len(), 12);
-        assert!(img.data.iter().all(|&v| v == 42));
+        assert_eq!(img.width(), 4);
+        assert_eq!(img.height(), 3);
+        assert_eq!(img.data().len(), 12);
+        assert!(img.data().iter().all(|&v| v == 42));
     }
 
     #[test]
     fn from_data_valid() {
         let data = vec![1u16, 2, 3, 4, 5, 6];
         let img = GrayImage::from_data(3, 2, data.clone()).unwrap();
-        assert_eq!(img.width, 3);
-        assert_eq!(img.height, 2);
-        assert_eq!(img.data, data);
+        assert_eq!(img.width(), 3);
+        assert_eq!(img.height(), 2);
+        assert_eq!(img.data(), data.as_slice());
     }
 
     #[test]
@@ -145,6 +175,6 @@ mod tests {
     fn zero_dimension_image() {
         let img = GrayImage::<u16>::new(0, 5, 0);
         assert_eq!(img.num_pixels(), 0);
-        assert!(img.data.is_empty());
+        assert!(img.data().is_empty());
     }
 }

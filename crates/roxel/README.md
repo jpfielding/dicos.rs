@@ -2,7 +2,7 @@
 
 GPU-accelerated DICOS volume viewer with 3D ray-casting and 2D slice viewing.
 
-![roxel 3D Rendering](../../roxel-lrg.gif)
+![roxel 3D Rendering](https://github.com/jpfielding/dicos.rs/releases/download/v2.0.0/roxel-lrg.gif)
 
 Renders 3D CT volumes from DICOS files using wgpu ray-casting with an egui
 control panel. Supports multi-volume loading, five-band material classification

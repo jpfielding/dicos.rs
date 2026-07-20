@@ -82,8 +82,8 @@ fn cmd_dump(path: &str, pretty: bool) -> Result<(), Box<dyn std::error::Error>> 
 fn dataset_to_json(ds: &Dataset) -> JsonValue {
     let mut map = serde_json::Map::new();
 
-    for (tag, elem) in ds.iter() {
-        let key = format_tag(tag);
+    for elem in ds.iter() {
+        let key = format_tag(&elem.tag);
         let entry = element_to_json(elem);
         map.insert(key, entry);
     }
@@ -164,6 +164,8 @@ fn element_to_json(elem: &dicos::types::Element) -> JsonValue {
             "Encapsulated": pd.is_compressed(),
             "Frames": pd.num_frames(),
         }),
+        // `Value` is #[non_exhaustive]; future variants render generically.
+        _ => json!({ "vr": vr_str }),
     }
 }
 
@@ -181,10 +183,10 @@ fn cmd_info(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         println!("Modality: {modality}");
     }
 
-    let rows = ds.rows();
-    let cols = ds.columns();
-    if rows > 0 && cols > 0 {
-        println!("Dimensions: {cols}x{rows}");
+    if let (Some(rows), Some(cols)) = (ds.rows(), ds.columns()) {
+        if rows > 0 && cols > 0 {
+            println!("Dimensions: {cols}x{rows}");
+        }
     }
 
     let frames = ds.number_of_frames();
@@ -192,8 +194,9 @@ fn cmd_info(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         println!("Frames: {frames}");
     }
 
-    let bits = ds.bits_allocated();
-    println!("Bits Allocated: {bits}");
+    if let Some(bits) = ds.bits_allocated() {
+        println!("Bits Allocated: {bits}");
+    }
 
     let ts = ds.transfer_syntax();
     println!("Transfer Syntax: {} ({})", ts.name(), ts.uid());

@@ -141,7 +141,7 @@ Add `dicos` to your `Cargo.toml`:
 dicos = "1.0"
 
 # Enable compression codecs as needed:
-# dicos = { version = "1.0", features = ["all-codecs"] }
+# dicos = { version = "2.0", features = ["all-codecs"] }
 ```
 
 ### Reading a DICOS File

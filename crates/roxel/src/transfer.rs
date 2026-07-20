@@ -100,6 +100,41 @@ fn interpolate_opacity(map: &[(f32, f32)], density: f32) -> f32 {
 }
 
 /// An RGBA transfer function table (1024 entries, 4 bytes each).
+///
+/// # Opacity model
+///
+/// Final on-screen opacity is the product of four independent, multiplicative
+/// factors. Each answers a different question and lives in a different
+/// place, so reach for the right one rather than fighting the others:
+///
+/// 1. **`OPACITY_MAP` density curve** (shape) -- the base opacity-vs-density
+///    ramp baked into [`from_bands`](TransferFunction::from_bands) (see the
+///    `OPACITY_MAP` constant). This is the overall "how see-through is bone
+///    vs. metal vs. air" silhouette. Reach for this when the *shape* of the
+///    density-to-opacity ramp is wrong (e.g. everything above a threshold
+///    should fade in faster/slower).
+/// 2. **Per-band alpha** (material-selective gain) -- [`ColorBand::alpha`],
+///    a multiplier applied on top of the density curve for one specific
+///    material band (Air, Organic, Inorganic, Metal, Dense). This is
+///    retained state, not redundant with the other factors: it is the only
+///    per-material knob. Reach for this to make e.g. only "Metal" more or
+///    less opaque without touching any other material or the global scale.
+/// 3. **Global opacity** -- [`SliceView::alpha_scale`](crate::slice_view::SliceView::alpha_scale)
+///    on the CPU composite path, kept in sync with
+///    [`RenderSettings::global_opacity`](crate::state::RenderSettings::global_opacity)
+///    (`u.alpha_scale` on the GPU raycast path). A single uniform scale
+///    applied to every sample regardless of material. Reach for this for a
+///    single "make the whole volume more/less see-through" slider.
+/// 4. **Shader gradient edge boost** -- WGSL-only (`raycast.wgsl`, the
+///    `alpha *= 1.0 + grad_mag * 0.5` line), boosts alpha at high-gradient
+///    voxels (surfaces/edges) to make boundaries pop visually. This has no
+///    CPU-composite equivalent and is not user-configurable; it is a fixed
+///    rendering heuristic, not a control to reach for.
+///
+/// These compose as: `alpha = curve(density) * band.alpha * global_opacity *
+/// gradient_boost`. Factors 1-3 apply to both the CPU composite path
+/// ([`crate::slice_view::SliceView::render_composite`]) and the GPU raycast
+/// path (`raycast.wgsl`); factor 4 is GPU-only.
 pub struct TransferFunction {
     /// RGBA data: `[R, G, B, A]` for each of `TRANSFER_SIZE` entries.
     pub data: Vec<[f32; 4]>,

@@ -1,9 +1,20 @@
-//! Bit-level reader and writer for JPEG-LS Golomb-Rice coded bitstreams.
+//! Bit-level reader and writer for T.87 (ITU-T T.87 / ISO 14495-1) JPEG-LS
+//! entropy-coded segments.
 //!
-//! Handles 0xFF byte-stuffing as required by the JPEG-LS standard:
-//! - On write: after emitting a 0xFF byte, a 0x00 stuff byte is inserted.
-//! - On read: 0xFF followed by 0x00 is consumed as a single 0xFF data byte;
-//!   0xFF followed by anything else signals a marker.
+//! # Single-bit stuffing (T.87 A.1)
+//!
+//! Whenever an output byte equals `0xFF`, the *next* byte carries only 7 data
+//! bits and its most-significant bit is forced to `0` (the "stuffed" bit).
+//! On read, a byte `< 0x80` following a `0xFF` contributes 7 data bits (its
+//! MSB is the stuffed zero); a byte `>= 0x80` following `0xFF` is a **marker**
+//! and is surfaced as a structured signal ([`BitReader::pending_marker`] plus
+//! [`CodecError::Marker`]) rather than a string error.
+//!
+//! # Limited-length Golomb (T.87 A.5.3)
+//!
+//! [`BitWriter::write_limited_golomb`] / [`BitReader::read_limited_golomb`]
+//! implement the length-limited mapped-error code, replacing the pre-spec
+//! uncapped unary coder (which lives on, frozen, in `legacy.rs`).
 
 use std::io::{self, Write};
 
@@ -13,14 +24,19 @@ use crate::error::CodecError;
 // BitReader
 // ---------------------------------------------------------------------------
 
-/// Reads bits from a byte slice, handling JPEG byte-stuffing.
+/// Reads bits from a byte slice, handling T.87 single-bit stuffing.
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
-    /// Bit accumulator (MSB-first).
+    /// Bit accumulator (MSB-first, valid bits are the low `n_bits`).
     bits: u64,
     /// Number of valid bits in `bits`.
     n_bits: i32,
+    /// Whether the most recently consumed byte was `0xFF` (so the next byte is
+    /// a stuffed 7-bit byte or a marker).
+    last_ff: bool,
+    /// Set when a marker (0xFFxx, xx >= 0x80) was encountered mid-scan.
+    pending_marker: Option<u16>,
 }
 
 impl<'a> BitReader<'a> {
@@ -31,41 +47,85 @@ impl<'a> BitReader<'a> {
             pos: 0,
             bits: 0,
             n_bits: 0,
+            last_ff: false,
+            pending_marker: None,
+        }
+    }
+
+    /// If a marker terminated the entropy-coded segment, return it.
+    ///
+    /// The value is the full 16-bit marker code (e.g. `0xFFD9` for EOI).
+    pub fn pending_marker(&self) -> Option<u16> {
+        self.pending_marker
+    }
+
+    /// Byte offset of the first unconsumed input byte.
+    ///
+    /// After a scan is fully decoded, any residual bits in the accumulator are
+    /// the flush padding of the last consumed byte (always `< 8`), so this
+    /// points at the byte following the entropy-coded data — i.e. the trailing
+    /// marker (EOI).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Byte offset of the marker terminating the scan.
+    ///
+    /// If the final consumed data byte was `0xFF`, its mandatory stuff byte
+    /// (T.87 A.1) may not have been pulled into the accumulator yet; it sits at
+    /// [`Self::pos`] and the marker begins immediately after it.
+    pub fn marker_pos(&self) -> usize {
+        if self.last_ff {
+            self.pos + 1
+        } else {
+            self.pos
         }
     }
 
     /// Fill the accumulator so it contains at least `n` bits.
     fn fill(&mut self, n: i32) -> Result<(), CodecError> {
         while self.n_bits < n {
+            if let Some(m) = self.pending_marker {
+                return Err(CodecError::Marker(m));
+            }
             if self.pos >= self.data.len() {
                 return Err(CodecError::InvalidData(
                     "unexpected end of JPEG-LS data".into(),
                 ));
             }
             let b = self.data[self.pos];
-            self.pos += 1;
 
-            if b == 0xFF {
-                // Peek at the next byte.
-                if self.pos >= self.data.len() {
-                    return Err(CodecError::InvalidData(
-                        "unexpected end of data after 0xFF".into(),
-                    ));
+            if self.last_ff {
+                // The previous byte was a `0xFF` data byte. By construction (we
+                // only treat `0xFF` as data when the following byte is < 0x80)
+                // this byte is a stuffed 7-bit byte: its MSB is the stuffed 0.
+                self.pos += 1;
+                self.bits = (self.bits << 7) | (u64::from(b) & 0x7F);
+                self.n_bits += 7;
+                self.last_ff = false; // b < 0x80, cannot be 0xFF
+            } else if b == 0xFF {
+                // Look ahead: a following byte >= 0x80 makes `0xFF` the first
+                // half of a marker (0xFF is NOT data); a following byte < 0x80
+                // makes `0xFF` an 8-bit data byte with a stuffed byte after it.
+                match self.data.get(self.pos + 1).copied() {
+                    Some(next) if next >= 0x80 => {
+                        let marker = 0xFF00u16 | u16::from(next);
+                        self.pending_marker = Some(marker);
+                        return Err(CodecError::Marker(marker));
+                    }
+                    _ => {
+                        self.pos += 1;
+                        self.bits = (self.bits << 8) | 0xFF;
+                        self.n_bits += 8;
+                        self.last_ff = true;
+                    }
                 }
-                let next = self.data[self.pos];
-                if next == 0x00 {
-                    // Byte stuffing -- consume the 0x00 and treat as 0xFF data.
-                    self.pos += 1;
-                } else {
-                    // This is a marker (e.g. EOI). Stop reading.
-                    // Back up so the marker can be parsed later.
-                    self.pos -= 1;
-                    return Err(CodecError::InvalidData("marker encountered".into()));
-                }
+            } else {
+                self.pos += 1;
+                self.bits = (self.bits << 8) | u64::from(b);
+                self.n_bits += 8;
+                self.last_ff = false;
             }
-
-            self.bits = (self.bits << 8) | u64::from(b);
-            self.n_bits += 8;
         }
         Ok(())
     }
@@ -89,30 +149,36 @@ impl<'a> BitReader<'a> {
         self.read_bits(1)
     }
 
-    /// Read a Golomb-Rice code with parameter `k`.
+    /// Read a length-limited Golomb code (T.87 A.5.3).
     ///
-    /// The format is: unary-coded quotient (zeros followed by a 1-bit),
-    /// then `k` bits for the remainder.
-    pub fn read_golomb(&mut self, k: i32) -> Result<u32, CodecError> {
-        // Count leading zeros (the quotient).
-        let mut q: u32 = 0;
-        loop {
-            let b = self.read_bit()?;
-            if b == 1 {
-                break;
-            }
-            q += 1;
-            if q > 65536 {
-                return Err(CodecError::InvalidData("golomb q overflow".into()));
+    /// Counts the zeros preceding the terminating `1`:
+    /// - `count < glimit - qbpp - 1` → `(count << k) | read_bits(k)`;
+    /// - `count == glimit - qbpp - 1` (escape) → `read_bits(qbpp) + 1`;
+    /// - anything longer → [`CodecError::InvalidData`].
+    pub fn read_limited_golomb(
+        &mut self,
+        k: i32,
+        glimit: i32,
+        qbpp: i32,
+    ) -> Result<u32, CodecError> {
+        let escape = glimit - qbpp - 1;
+        let mut count: i32 = 0;
+        while self.read_bit()? == 0 {
+            count += 1;
+            if count > escape {
+                return Err(CodecError::InvalidData(
+                    "limited-Golomb unary run exceeds escape length".into(),
+                ));
             }
         }
 
-        if k == 0 {
-            return Ok(q);
+        if count < escape {
+            let r = if k > 0 { self.read_bits(k)? } else { 0 };
+            Ok(((count as u32) << k) | r)
+        } else {
+            // count == escape: the escape carries (val - 1) in qbpp bits.
+            Ok(self.read_bits(qbpp)?.wrapping_add(1))
         }
-
-        let r = self.read_bits(k)?;
-        Ok(q.wrapping_shl(k as u32) | r)
     }
 }
 
@@ -120,13 +186,17 @@ impl<'a> BitReader<'a> {
 // BitWriter
 // ---------------------------------------------------------------------------
 
-/// Writes bits to an underlying `Write` sink, handling JPEG byte-stuffing.
+/// Writes bits to an underlying `Write` sink, applying T.87 single-bit
+/// stuffing.
 pub(crate) struct BitWriter<W: Write> {
     inner: W,
-    /// Bit accumulator (MSB-first).
+    /// Bit accumulator (MSB-first, valid bits are the low `n_bits`).
     bits: u64,
     /// Number of valid bits in `bits`.
     n_bits: i32,
+    /// Whether the most recently emitted byte was `0xFF` (so the next byte
+    /// must carry only 7 data bits with its MSB forced to 0).
+    last_ff: bool,
 }
 
 impl<W: Write> BitWriter<W> {
@@ -136,27 +206,36 @@ impl<W: Write> BitWriter<W> {
             inner,
             bits: 0,
             n_bits: 0,
+            last_ff: false,
         }
     }
 
-    /// Write `n` bits from `val` (MSB-first).
-    pub fn write_bits(&mut self, val: u32, n: i32) -> Result<(), CodecError> {
-        self.bits = (self.bits << n) | (u64::from(val) & ((1u64 << n) - 1));
-        self.n_bits += n;
-
-        while self.n_bits >= 8 {
-            let shift = self.n_bits - 8;
-            let b = (self.bits >> shift) as u8;
-            self.inner.write_all(&[b])?;
-
-            // Byte stuffing: after 0xFF, insert 0x00.
-            if b == 0xFF {
-                self.inner.write_all(&[0x00])?;
+    /// Emit whole output bytes while enough bits are buffered. After a `0xFF`
+    /// byte the next byte carries only 7 bits (MSB forced 0) per T.87 A.1.
+    fn drain(&mut self) -> Result<(), CodecError> {
+        loop {
+            let width = if self.last_ff { 7 } else { 8 };
+            if self.n_bits < width {
+                break;
             }
-
-            self.n_bits -= 8;
+            let shift = self.n_bits - width;
+            let mask = (1u64 << width) - 1;
+            let b = ((self.bits >> shift) & mask) as u8;
+            self.inner.write_all(&[b])?;
+            self.n_bits -= width;
+            self.last_ff = b == 0xFF;
         }
         Ok(())
+    }
+
+    /// Write `n` bits (0..=32) from `val` (MSB-first).
+    pub fn write_bits(&mut self, val: u32, n: i32) -> Result<(), CodecError> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.bits = (self.bits << n) | (u64::from(val) & ((1u64 << n) - 1));
+        self.n_bits += n;
+        self.drain()
     }
 
     /// Write a single bit.
@@ -165,56 +244,88 @@ impl<W: Write> BitWriter<W> {
         self.write_bits(bit, 1)
     }
 
-    /// Flush remaining bits (zero-padded to byte boundary) and the
+    /// Write a length-limited Golomb code (T.87 A.5.3).
+    ///
+    /// With `q = val >> k` and `escape = glimit - qbpp - 1`:
+    /// - `q < escape` → `q` zeros, a `1`, then the low `k` bits of `val`;
+    /// - otherwise → `escape` zeros, a `1`, then `val - 1` in `qbpp` bits.
+    pub fn write_limited_golomb(
+        &mut self,
+        k: i32,
+        val: u32,
+        glimit: i32,
+        qbpp: i32,
+    ) -> Result<(), CodecError> {
+        let q = (val >> k) as i32;
+        let escape = glimit - qbpp - 1;
+
+        if q < escape {
+            for _ in 0..q {
+                self.write_bit(0)?;
+            }
+            self.write_bit(1)?;
+            if k > 0 {
+                self.write_bits(val & ((1u32 << k) - 1), k)?;
+            }
+        } else {
+            for _ in 0..escape {
+                self.write_bit(0)?;
+            }
+            self.write_bit(1)?;
+            self.write_bits(val.wrapping_sub(1), qbpp)?;
+        }
+        Ok(())
+    }
+
+    /// Flush remaining bits (zero-padded to a byte boundary) and the
     /// underlying writer.
+    ///
+    /// Padding respects the stuffing state: if the previous emitted byte was
+    /// `0xFF`, the final byte carries 7 bits (MSB forced 0); otherwise 8. The
+    /// zero padding can never itself produce a `0xFF`, so no trailing stuff
+    /// byte is required (T.87 A.1).
     pub fn flush(&mut self) -> Result<(), CodecError> {
         if self.n_bits > 0 {
-            let shift = 8 - self.n_bits;
-            let b = (self.bits << shift) as u8;
+            let width = if self.last_ff { 7 } else { 8 };
+            debug_assert!(self.n_bits < width, "drain should leave < width bits");
+            let pad = width - self.n_bits;
+            self.bits <<= pad;
+            self.n_bits += pad;
+            let mask = (1u64 << width) - 1;
+            let b = (self.bits & mask) as u8;
             self.inner.write_all(&[b])?;
-            if b == 0xFF {
-                self.inner.write_all(&[0x00])?;
-            }
-            self.n_bits = 0;
             self.bits = 0;
+            self.n_bits = 0;
+            self.last_ff = b == 0xFF;
+        }
+        // A `0xFF` emitted as the final data byte (by `drain`) still needs its
+        // mandatory stuff byte (T.87 A.1); otherwise the following marker's
+        // `0xFF` would be misread as this byte's continuation / a marker prefix.
+        if self.last_ff {
+            self.inner.write_all(&[0x00])?;
+            self.last_ff = false;
         }
         self.inner.flush()?;
         Ok(())
     }
 
-    /// Write a Golomb-Rice code for the non-negative mapped value `val`.
-    ///
-    /// Format: unary quotient (q zeros + one 1-bit), then k remainder bits.
-    pub fn write_golomb(&mut self, k: i32, val: u32) -> Result<(), CodecError> {
-        let q = val >> k;
-        let r = val & ((1u32 << k) - 1);
-
-        // Unary: q zeros then a 1.
-        for _ in 0..q {
-            self.write_bit(0)?;
-        }
-        self.write_bit(1)?;
-
-        // Remainder.
-        if k > 0 {
-            self.write_bits(r, k)?;
-        }
-        Ok(())
-    }
-
     /// Write a raw byte directly (used for markers, not bit-coded data).
+    ///
+    /// Must be byte-aligned; markers are exempt from stuffing.
     pub fn write_byte(&mut self, b: u8) -> Result<(), CodecError> {
+        debug_assert_eq!(self.n_bits, 0, "write_byte called mid-byte");
         self.inner.write_all(&[b]).map_err(CodecError::from)
     }
 
-    /// Write a big-endian 16-bit word directly.
+    /// Write a big-endian 16-bit word directly (marker payloads).
     pub fn write_u16be(&mut self, v: u16) -> Result<(), CodecError> {
+        debug_assert_eq!(self.n_bits, 0, "write_u16be called mid-byte");
         self.inner
             .write_all(&v.to_be_bytes())
             .map_err(CodecError::from)
     }
 
-    /// Borrow the inner writer (e.g. for writing marker bytes directly).
+    /// Borrow the inner writer.
     pub fn inner_mut(&mut self) -> &mut W {
         &mut self.inner
     }
@@ -223,13 +334,8 @@ impl<W: Write> BitWriter<W> {
     pub fn into_inner(self) -> W {
         self.inner
     }
-}
 
-// Convenience: allow using `io::Write` on the inner writer through the
-// BitWriter when we know we are byte-aligned (marker writing).
-impl<W: Write> BitWriter<W> {
-    /// Write raw bytes. Must only be called when the bit buffer is empty
-    /// (byte-aligned).
+    /// Write raw bytes. Must only be called when byte-aligned.
     pub fn write_bytes(&mut self, buf: &[u8]) -> io::Result<()> {
         debug_assert_eq!(
             self.n_bits, 0,
@@ -247,8 +353,18 @@ impl<W: Write> BitWriter<W> {
 mod tests {
     use super::*;
 
+    fn write_bytes_via_bits(values: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut bw = BitWriter::new(&mut buf);
+        for &v in values {
+            bw.write_bits(u32::from(v), 8).unwrap();
+        }
+        bw.flush().unwrap();
+        buf
+    }
+
     #[test]
-    fn roundtrip_bits() {
+    fn plain_bits_roundtrip() {
         let mut buf = Vec::new();
         {
             let mut bw = BitWriter::new(&mut buf);
@@ -257,7 +373,6 @@ mod tests {
             bw.write_bits(0b1, 1).unwrap();
             bw.flush().unwrap();
         }
-        // 10111001 = 0xB9
         assert_eq!(buf, vec![0xB9]);
 
         let mut br = BitReader::new(&buf);
@@ -267,98 +382,163 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_golomb_k0() {
+    fn single_bit_stuffing_after_ff() {
+        // A single 0xFF data byte followed by more bits. Under T.87 single-bit
+        // stuffing the byte after 0xFF carries only 7 data bits (MSB = 0), so
+        // the encoded stream is NOT `FF 00` (that is the legacy behavior).
         let mut buf = Vec::new();
         {
             let mut bw = BitWriter::new(&mut buf);
-            // val=0, k=0 -> just "1"
-            bw.write_golomb(0, 0).unwrap();
-            // val=3, k=0 -> "0001"
-            bw.write_golomb(0, 3).unwrap();
-            // val=1, k=0 -> "01"
-            bw.write_golomb(0, 1).unwrap();
+            bw.write_bits(0xFF, 8).unwrap();
+            bw.write_bits(0b1, 1).unwrap();
             bw.flush().unwrap();
         }
-
-        let mut br = BitReader::new(&buf);
-        assert_eq!(br.read_golomb(0).unwrap(), 0);
-        assert_eq!(br.read_golomb(0).unwrap(), 3);
-        assert_eq!(br.read_golomb(0).unwrap(), 1);
+        // 0xFF, then a stuffed byte: MSB 0, next bit 1, padded => 0b0100_0000.
+        assert_eq!(buf, vec![0xFF, 0x40]);
+        // Every byte after a 0xFF is < 0x80.
+        for w in buf.windows(2) {
+            if w[0] == 0xFF {
+                assert!(w[1] < 0x80, "byte after 0xFF must be stuffed (< 0x80)");
+            }
+        }
     }
 
     #[test]
-    fn roundtrip_golomb_k2() {
-        let mut buf = Vec::new();
-        {
-            let mut bw = BitWriter::new(&mut buf);
-            // val=5, k=2 -> q=1, r=1 -> "01" + "01" = "0101"
-            bw.write_golomb(2, 5).unwrap();
-            // val=0, k=2 -> q=0, r=0 -> "1" + "00" = "100"
-            bw.write_golomb(2, 0).unwrap();
-            bw.flush().unwrap();
+    fn stuffing_roundtrip_many_ff_boundaries() {
+        // Patterns that force runs of 0xFF data bytes and 0xFF-adjacent bits.
+        let patterns: &[&[u8]] = &[
+            &[0xFF],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0xFF, 0x00, 0xFF, 0x00],
+            &[0x00, 0xFF, 0xFF, 0x01, 0xFF, 0xFF, 0xFF, 0x80, 0x7F],
+            &[0xFF; 16],
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x12, 0x34],
+        ];
+        for pat in patterns {
+            let encoded = write_bytes_via_bits(pat);
+            // Invariant: no byte following 0xFF is >= 0x80 (no accidental
+            // markers), i.e. the stuffing held across every boundary.
+            for w in encoded.windows(2) {
+                if w[0] == 0xFF {
+                    assert!(w[1] < 0x80, "pattern {pat:?} produced FF {:02X}", w[1]);
+                }
+            }
+            let mut br = BitReader::new(&encoded);
+            for &v in pat.iter() {
+                assert_eq!(br.read_bits(8).unwrap(), u32::from(v), "pattern {pat:?}");
+            }
         }
-
-        let mut br = BitReader::new(&buf);
-        assert_eq!(br.read_golomb(2).unwrap(), 5);
-        assert_eq!(br.read_golomb(2).unwrap(), 0);
     }
 
     #[test]
-    fn roundtrip_golomb_many_values() {
-        for k in 0..8 {
-            let values: Vec<u32> = (0..50).collect();
+    fn limited_golomb_roundtrip_all_k_non_escape() {
+        let glimit = 32;
+        let qbpp = 16;
+        let escape = glimit - qbpp - 1; // = 15
+        for k in 0..=15 {
+            let kbits = 1u32 << k;
+            // Build values whose quotient q = val >> k stays strictly below the
+            // escape so the non-escape branch is exercised for every k.
+            let mut values: Vec<u32> = Vec::new();
+            for q in [0u32, 1, 7, (escape as u32) - 1] {
+                for r in [0u32, kbits / 2, kbits - 1] {
+                    values.push((q << k) | (r & (kbits - 1)));
+                }
+            }
             let mut buf = Vec::new();
             {
                 let mut bw = BitWriter::new(&mut buf);
                 for &v in &values {
-                    bw.write_golomb(k, v).unwrap();
+                    assert!((v >> k) < escape as u32);
+                    bw.write_limited_golomb(k, v, glimit, qbpp).unwrap();
                 }
                 bw.flush().unwrap();
             }
-
             let mut br = BitReader::new(&buf);
             for &v in &values {
-                let decoded = br.read_golomb(k).unwrap();
-                assert_eq!(decoded, v, "k={k}, expected {v}, got {decoded}");
+                let got = br.read_limited_golomb(k, glimit, qbpp).unwrap();
+                assert_eq!(got, v, "k={k}, v={v}");
             }
         }
     }
 
     #[test]
-    fn byte_stuffing_0xff_on_write() {
-        let mut buf = Vec::new();
-        {
-            let mut bw = BitWriter::new(&mut buf);
-            bw.write_bits(0xFF, 8).unwrap();
-            bw.flush().unwrap();
+    fn limited_golomb_escape_path() {
+        let glimit = 32;
+        let qbpp = 16;
+        // For k=0 the escape triggers at q = val >= glimit - qbpp - 1 = 15.
+        let escape = glimit - qbpp - 1;
+        let values: Vec<u32> = vec![15, 16, 100, 1000, 65535, (1 << qbpp)];
+        for k in 0..=15 {
+            let mut buf = Vec::new();
+            {
+                let mut bw = BitWriter::new(&mut buf);
+                for &v in &values {
+                    // Confirm at least some of these take the escape branch.
+                    bw.write_limited_golomb(k, v, glimit, qbpp).unwrap();
+                }
+                bw.flush().unwrap();
+            }
+            let mut br = BitReader::new(&buf);
+            for &v in &values {
+                let got = br.read_limited_golomb(k, glimit, qbpp).unwrap();
+                assert_eq!(got, v, "escape k={k}, v={v}");
+            }
         }
-        // 0xFF should be followed by 0x00 stuff byte
-        assert_eq!(buf, vec![0xFF, 0x00]);
+        assert!(escape > 0);
     }
 
     #[test]
-    fn byte_stuffing_roundtrip() {
-        let mut buf = Vec::new();
-        {
-            let mut bw = BitWriter::new(&mut buf);
-            // Write value 0xFF (8 bits) then value 0x01 (8 bits)
-            bw.write_bits(0xFF, 8).unwrap();
-            bw.write_bits(0x01, 8).unwrap();
-            bw.flush().unwrap();
-        }
-        // Should be: FF 00 01
-        assert_eq!(buf, vec![0xFF, 0x00, 0x01]);
-
-        let mut br = BitReader::new(&buf);
-        assert_eq!(br.read_bits(8).unwrap(), 0xFF);
-        assert_eq!(br.read_bits(8).unwrap(), 0x01);
+    fn marker_detection_mid_stream() {
+        // 0xFF followed by 0xD9 (EOI) is a marker, surfaced structurally.
+        let data = [0xFFu8, 0xD9];
+        let mut br = BitReader::new(&data);
+        // Reading any bit must fail with a structured marker signal.
+        let err = br.read_bit().unwrap_err();
+        assert!(matches!(err, CodecError::Marker(0xFFD9)));
+        assert_eq!(br.pending_marker(), Some(0xFFD9));
+        // Subsequent reads keep reporting the marker, not garbage.
+        assert!(matches!(
+            br.read_bit().unwrap_err(),
+            CodecError::Marker(0xFFD9)
+        ));
     }
 
     #[test]
-    fn read_bits_empty_returns_error() {
-        let buf = [];
+    fn marker_after_valid_data() {
+        // Some real bits, then a 0xFF-prefixed marker.
+        let data = [0b1010_0000u8, 0xFF, 0xD9];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_bits(3).unwrap(), 0b101);
+        // Continue reading until we cross into the marker.
+        let mut hit_marker = false;
+        for _ in 0..16 {
+            match br.read_bit() {
+                Ok(_) => {}
+                Err(CodecError::Marker(0xFFD9)) => {
+                    hit_marker = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(hit_marker, "expected to reach the EOI marker");
+    }
+
+    #[test]
+    fn truncation_is_error_not_panic() {
+        let data = [0b1010_1010u8];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_bits(8).unwrap(), 0b1010_1010);
+        // Nothing left: further reads error cleanly.
+        assert!(matches!(br.read_bit(), Err(CodecError::InvalidData(_))));
+    }
+
+    #[test]
+    fn read_zero_bits_returns_zero() {
+        let buf = [0xAB];
         let mut br = BitReader::new(&buf);
-        assert!(br.read_bit().is_err());
+        assert_eq!(br.read_bits(0).unwrap(), 0);
     }
 
     #[test]
@@ -373,9 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn read_zero_bits_returns_zero() {
-        let buf = [0xAB];
-        let mut br = BitReader::new(&buf);
-        assert_eq!(br.read_bits(0).unwrap(), 0);
+    fn limited_golomb_rejects_overlong_unary() {
+        // A stream of all-zero bits never terminates the unary run within the
+        // escape budget -> InvalidData, not an infinite loop or panic.
+        let data = [0x00u8; 8];
+        let mut br = BitReader::new(&data);
+        assert!(matches!(
+            br.read_limited_golomb(0, 32, 16),
+            Err(CodecError::InvalidData(_))
+        ));
     }
 }

@@ -6,7 +6,10 @@
 
 pub mod app;
 pub mod camera;
+pub mod loader;
 pub mod renderer;
 pub mod slice_view;
+pub mod state;
 pub mod transfer;
+pub mod ui;
 pub mod volume;

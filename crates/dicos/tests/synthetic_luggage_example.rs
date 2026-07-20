@@ -40,8 +40,8 @@ fn bag_ct_sample_is_ct() {
         first_string(&ds, tag::TRANSFER_SYNTAX_UID),
         "1.2.840.10008.1.2.1"
     );
-    assert!(ds.rows() > 0);
-    assert!(ds.columns() > 0);
+    assert!(ds.rows().is_some_and(|r| r > 0));
+    assert!(ds.columns().is_some_and(|c| c > 0));
     assert!(ds.number_of_frames() >= 1);
 }
 
@@ -52,7 +52,7 @@ fn bag_ct_sample_is_public_safe() {
     };
     let joined = ds
         .iter()
-        .filter_map(|(_, e)| e.value.as_str())
+        .filter_map(|e| e.value.as_str())
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
@@ -68,8 +68,8 @@ fn bag_ct_sample_has_non_uniform_pixel_data() {
         return;
     };
 
-    let rows = ds.rows() as usize;
-    let cols = ds.columns() as usize;
+    let rows = ds.rows().expect("Rows present") as usize;
+    let cols = ds.columns().expect("Columns present") as usize;
     let frames = ds.number_of_frames() as usize;
 
     // After normalization, pixel data is PixelData::Native, not raw bytes.

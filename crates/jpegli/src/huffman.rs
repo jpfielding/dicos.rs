@@ -81,7 +81,11 @@ impl HuffmanTable {
                 si += 1;
             }
             self.codes[k] = code;
-            code += 1;
+            // Every *assigned* canonical code fits in u16 under a valid (Kraft)
+            // `bits` table, but a complete length-16 code assigns 0xFFFF to its
+            // last symbol; the trailing increment past it is unused yet would
+            // overflow. `wrapping_add` keeps that final, discarded step panic-free.
+            code = code.wrapping_add(1);
         }
     }
 
@@ -411,5 +415,24 @@ mod tests {
             assert_eq!(sz, 1);
             assert_eq!(val, 42);
         }
+    }
+
+    // Regression: a *complete* code (one symbol at each length 1..=15, two at
+    // length 16) is Kraft-valid, so it passes `bits_valid` and reaches
+    // `from_bits_values`. Its final canonical code is exactly 0xFFFF, and the
+    // trailing `code += 1` used to overflow u16 and panic. A libFuzzer decode
+    // crash (crates/jpegli/fuzz decode target) minimized to this table.
+    #[test]
+    fn complete_length16_code_does_not_overflow() {
+        let mut bits = [0u8; 17];
+        for len in 1..=15 {
+            bits[len] = 1;
+        }
+        bits[16] = 2;
+        assert!(bits_valid(&bits), "complete code must be Kraft-valid");
+        let values: Vec<u8> = (0..17).collect();
+        let ht = HuffmanTable::from_bits_values(bits, values);
+        assert_eq!(ht.codes.len(), 17);
+        assert_eq!(*ht.codes.last().unwrap(), 0xFFFF);
     }
 }

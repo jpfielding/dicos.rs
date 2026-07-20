@@ -425,9 +425,7 @@ mod tests {
     #[test]
     fn complete_length16_code_does_not_overflow() {
         let mut bits = [0u8; 17];
-        for len in 1..=15 {
-            bits[len] = 1;
-        }
+        bits[1..=15].fill(1);
         bits[16] = 2;
         assert!(bits_valid(&bits), "complete code must be Kraft-valid");
         let values: Vec<u8> = (0..17).collect();

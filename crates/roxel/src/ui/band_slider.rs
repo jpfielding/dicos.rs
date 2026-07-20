@@ -133,7 +133,7 @@ pub(crate) fn draw_band_range_slider(ui: &mut egui::Ui, bands: &mut [ColorBand])
         };
 
         painter.circle_filled(center, 6.0, ui.visuals().extreme_bg_color);
-        painter.circle_stroke(center, 6.0, egui::Stroke::new(1.5, stroke_color));
+        painter.circle_stroke(center, 6.0, egui::Stroke::new(1.5_f32, stroke_color));
         painter.text(
             egui::pos2(hx, track_rect.top() - 4.0),
             egui::Align2::CENTER_BOTTOM,

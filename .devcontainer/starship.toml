@@ -1,0 +1,35 @@
+"$schema" = 'https://starship.rs/config-schema.json'
+
+# Default starship, plus: full path, clock right-aligned on line 1, prompt char on line 2.
+# $all expands to every default module not referenced explicitly here.
+format = """
+$all\
+$fill\
+$os\
+${custom.arch}\
+$time\
+$line_break\
+$character"""
+
+[directory]
+truncation_length = 100   # effectively never truncate
+truncate_to_repo = false  # show ~/projects/agentstate, not just agentstate
+
+[fill]
+symbol = ' '              # use '─' for the line-style gap from your old prompt
+
+[time]
+disabled = false
+time_format = '%H:%M:%S'
+format = '[$time]($style)'
+
+[os]
+disabled = false
+format = '[$symbol]($style)'   # add $version to show the OS version too
+style = 'bold white'
+
+[custom.arch]
+command = 'uname -m'           # arm64, x86_64, aarch64...
+when = true
+format = '[$output]($style) '
+style = 'bold white'

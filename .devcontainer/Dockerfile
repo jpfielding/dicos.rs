@@ -40,6 +40,17 @@ ENV PATH ${HOME}/.cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         bash -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal -c rustfmt,clippy
 
+# starship — config lives outside ~/.config because that dir is bind-mounted from the host
+RUN set -eux && \
+    export ASSET="starship-$(uname -m)-unknown-linux-musl" && \
+    curl -fsSL -o "/tmp/${ASSET}.tar.gz" "https://github.com/starship/starship/releases/latest/download/${ASSET}.tar.gz" && \
+    tar xzf "/tmp/${ASSET}.tar.gz" -C "${HOME}/bin" starship && \
+    chmod +x "${HOME}/bin/starship" && \
+    rm "/tmp/${ASSET}.tar.gz" && \
+    starship --version
+ENV STARSHIP_CONFIG="${HOME}/.starship.toml"
+COPY --chown=${USERNAME}:${USERNAME} starship.toml ${HOME}/.starship.toml
+
 # pretty bash
 COPY --chown=${USERNAME}:${USERNAME} .bash_pretty ${HOME}/.bash_rust
 RUN set -eux && \

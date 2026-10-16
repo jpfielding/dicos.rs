@@ -347,9 +347,13 @@ impl<'a> Decoder<'a> {
                 MARKER_SOF55 => frame = Some(self.read_sof(length)?),
                 MARKER_LSE => self.read_lse(length, &mut presets)?,
                 MARKER_DRI => {
-                    return Err(CodecError::Unsupported(
-                        "JPEG-LS restart intervals (DRI) not supported".into(),
-                    ));
+                    // Tolerate and skip DRI, as CharLS does: a zero restart
+                    // interval is a no-op. A non-zero interval that actually
+                    // emits RSTn markers in the scan is rejected by the entropy
+                    // decoder (scan_error), so restarts are still unsupported —
+                    // but a benign DRI segment no longer fails an otherwise
+                    // decodable stream.
+                    self.skip(length)?;
                 }
                 MARKER_SOS => {
                     scan = self.read_sos(length)?;
@@ -421,9 +425,13 @@ impl<'a> Decoder<'a> {
                 MARKER_SOF55 => frame = Some(self.read_sof(length)?),
                 MARKER_LSE => self.read_lse(length, &mut presets)?,
                 MARKER_DRI => {
-                    return Err(CodecError::Unsupported(
-                        "JPEG-LS restart intervals (DRI) not supported".into(),
-                    ));
+                    // Tolerate and skip DRI, as CharLS does: a zero restart
+                    // interval is a no-op. A non-zero interval that actually
+                    // emits RSTn markers in the scan is rejected by the entropy
+                    // decoder (scan_error), so restarts are still unsupported —
+                    // but a benign DRI segment no longer fails an otherwise
+                    // decodable stream.
+                    self.skip(length)?;
                 }
                 MARKER_SOS => {
                     // read_sos rejects Ns != 1 and ILV != 0, so an interleaved
@@ -837,20 +845,24 @@ mod tests {
     }
 
     #[test]
-    fn dri_unsupported() {
-        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
-        out.extend_from_slice(&11u16.to_be_bytes());
-        out.push(8);
-        out.extend_from_slice(&4u16.to_be_bytes());
-        out.extend_from_slice(&4u16.to_be_bytes());
-        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
-        out.extend_from_slice(&[0xFF, 0xDD]);
-        out.extend_from_slice(&4u16.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        assert!(matches!(
-            decode(&out, 4, 4),
-            Err(CodecError::Unsupported(_))
-        ));
+    fn dri_zero_interval_is_tolerated() {
+        // A benign DRI segment (restart interval 0) before the scan must not
+        // fail an otherwise decodable stream — CharLS accepts it. (A non-zero
+        // interval that actually emits RSTn markers is still rejected by the
+        // scan decoder.)
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u16> = (0..16).map(|i| i * 4).collect();
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w, h, &EncodeOptions::default(), &mut buf).unwrap();
+        let sos = buf
+            .windows(2)
+            .position(|p| p == [0xFF, 0xDA])
+            .expect("SOS present");
+        let mut with_dri = buf[..sos].to_vec();
+        with_dri.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04, 0x00, 0x00]); // DRI, interval 0
+        with_dri.extend_from_slice(&buf[sos..]);
+        let (decoded, _, _) = decode(&with_dri, w, h).expect("benign DRI should decode");
+        assert_eq!(decoded, pixels);
     }
 
     /// Assemble a 3-component, planar (ILV 0) JPEG-LS stream: one SOS + scan

@@ -180,14 +180,18 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_marker(&mut self) -> Result<(u16, usize), CodecError> {
-        let b1 = self.read_byte()?;
-        if b1 != 0xFF {
+        let mut b = self.read_byte()?;
+        if b != 0xFF {
             return Err(CodecError::InvalidData(format!(
-                "expected 0xFF, got 0x{b1:02X}"
+                "expected 0xFF marker prefix, got 0x{b:02X}"
             )));
         }
-        let b2 = self.read_byte()?;
-        let marker = 0xFF00u16 | u16::from(b2);
+        // A marker may be preceded by any number of 0xFF fill bytes
+        // (T.81 B.1.1.2); skip them. The first non-0xFF byte is the code.
+        while b == 0xFF {
+            b = self.read_byte()?;
+        }
+        let marker = 0xFF00u16 | u16::from(b);
 
         let length = self.read_u16be()? as usize;
         // Length field includes its own 2 bytes.
@@ -862,6 +866,22 @@ mod tests {
         with_dri.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04, 0x00, 0x00]); // DRI, interval 0
         with_dri.extend_from_slice(&buf[sos..]);
         let (decoded, _, _) = decode(&with_dri, w, h).expect("benign DRI should decode");
+        assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn fill_bytes_before_marker_tolerated() {
+        // 0xFF fill bytes may precede any marker (T.81 B.1.1.2); they must be
+        // skipped, not mistaken for a marker.
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u16> = (0..16).map(|i| i * 4).collect();
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w, h, &EncodeOptions::default(), &mut buf).unwrap();
+        // Two 0xFF fill bytes right after SOI, before SOF55.
+        let mut filled = buf[..2].to_vec();
+        filled.extend_from_slice(&[0xFF, 0xFF]);
+        filled.extend_from_slice(&buf[2..]);
+        let (decoded, _, _) = decode(&filled, w, h).expect("fill bytes should be skipped");
         assert_eq!(decoded, pixels);
     }
 

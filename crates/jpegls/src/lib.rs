@@ -5,10 +5,13 @@
 //!
 //! # Conformance scope
 //!
-//! Conformant T.87 for **single-component** images (`Nf = 1`, `ILV = 0`),
-//! precision `2..=16`, with LSE ID=1 presets, run mode, and near-lossless.
-//! `DRI`/restart markers, `Nf ≠ 1`, and `ILV ≠ 0` are rejected as
-//! `Unsupported`. Verified against CharLS fixtures.
+//! Conformant T.87 for **single-component** images and **multi-component
+//! planar** images (`ILV = 0`, one scan per component, e.g. RGB, through
+//! [`decode_image`] / [`encode_image`]), precision `2..=16`, with LSE ID=1
+//! presets, run mode, and near-lossless. Line- and sample-interleaved scans
+//! (`ILV ≠ 0`) and restart markers inside a scan are rejected as
+//! `Unsupported`; a `DRI` segment on its own is skipped. Verified against
+//! CharLS fixtures.
 //!
 //! # Profiles
 //!
@@ -33,8 +36,8 @@ mod legacy;
 mod predictor;
 mod run_mode;
 
-pub use decode::{decode, decode_with_options};
-pub use encode::{encode, encode_with_options};
+pub use decode::{decode, decode_image, decode_with_options, DecodedImage};
+pub use encode::{encode, encode_image, encode_with_options};
 pub use error::CodecError;
 
 /// DICOM Transfer Syntax UID for JPEG-LS Lossless.

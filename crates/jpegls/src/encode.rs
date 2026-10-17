@@ -142,6 +142,105 @@ pub fn encode_with_options(
     Ok(())
 }
 
+/// Encode a multi-component image as a **planar** (ILV 0) JPEG-LS stream: a
+/// shared SOF55 with `components` components, then one SOS + entropy scan per
+/// component. `samples` is component-planar — all of component 0, then
+/// component 1, … — of length `width * height * components`. `components == 1`
+/// is the grayscale case and produces the same stream as [`encode`]. T.87
+/// profile only (the legacy profile is grayscale-only via [`encode`]).
+pub fn encode_image(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    components: u8,
+    opts: &EncodeOptions,
+    w: &mut dyn Write,
+) -> Result<(), CodecError> {
+    if components == 0 {
+        return Err(CodecError::InvalidParameter {
+            name: "components",
+            value: 0,
+            allowed: "1..=255",
+        });
+    }
+    if opts.profile != Profile::T87 {
+        return Err(CodecError::Unsupported(
+            "encode_image supports only the T87 profile".into(),
+        ));
+    }
+    if width == 0 || width > 65535 {
+        return Err(CodecError::InvalidParameter {
+            name: "width",
+            value: i64::from(width),
+            allowed: "1..=65535",
+        });
+    }
+    if height == 0 || height > 65535 {
+        return Err(CodecError::InvalidParameter {
+            name: "height",
+            value: i64::from(height),
+            allowed: "1..=65535",
+        });
+    }
+
+    let (wu, hu) = (width as usize, height as usize);
+    let plane = wu * hu;
+    let expected = plane * components as usize;
+    if samples.len() != expected {
+        return Err(CodecError::DimensionMismatch {
+            expected,
+            actual: samples.len(),
+        });
+    }
+
+    let max_pixel = samples.iter().copied().max().unwrap_or(0);
+    let precision = match opts.precision {
+        Some(p) => {
+            if !(2..=16).contains(&p) {
+                return Err(CodecError::InvalidParameter {
+                    name: "precision",
+                    value: i64::from(p),
+                    allowed: "2..=16",
+                });
+            }
+            u32::from(p)
+        }
+        None => effective_precision(max_pixel),
+    };
+    let max_val: i32 = (1i32 << precision) - 1;
+    if i32::from(max_pixel) > max_val {
+        return Err(CodecError::InvalidParameter {
+            name: "precision",
+            value: i64::from(precision as u16),
+            allowed: "large enough to hold every sample",
+        });
+    }
+
+    let near = i32::from(opts.near);
+    let near_max = (max_val / 2).min(255);
+    if near > near_max {
+        return Err(CodecError::InvalidParameter {
+            name: "near",
+            value: i64::from(opts.near),
+            allowed: "0..=min(255, MAXVAL/2)",
+        });
+    }
+
+    write_marker(w, MARKER_SOI)?;
+    write_sof(w, precision as u8, height as u16, width as u16, components)?;
+    // One SOS + entropy scan per component (ILV 0). Each scan gets a fresh
+    // context, as the decoder expects.
+    for c in 0..components as usize {
+        write_sos(w, 1, opts.near)?;
+        let ctx = ContextModel::new(max_val, near, DEFAULT_RESET);
+        encode_scan_t87(w, &samples[c * plane..(c + 1) * plane], wu, hu, ctx)?;
+    }
+    write_marker(w, MARKER_EOI)?;
+
+    w.flush()?;
+    Ok(())
+}
+
 /// Write SOI, SOF55, and SOS headers for a single-component image.
 fn write_headers(
     w: &mut dyn Write,

@@ -240,9 +240,30 @@ impl<'a> Decoder<'a> {
             )));
         }
 
-        // Skip component specs (Nf * 3 bytes); payload is 6 + Nf*3.
-        let to_skip = payload_len.saturating_sub(6);
-        self.skip(to_skip)?;
+        // Component specs: [Ci, sampling (Hi<<4 | Vi), Tqi] per component.
+        // Require 1:1 sampling (no subsampling) and no per-component mapping
+        // table (Tq 0); otherwise the scan would be mis-decoded. CharLS
+        // enforces the same. The component id Ci is not checked.
+        for _ in 0..nf {
+            let _ci = self.read_byte()?;
+            let sampling = self.read_byte()?;
+            let tq = self.read_byte()?;
+            if sampling != 0x11 {
+                return Err(CodecError::Unsupported(format!(
+                    "JPEG-LS component sampling {sampling:#04x} not supported (must be 1:1 = 0x11)"
+                )));
+            }
+            if tq != 0 {
+                return Err(CodecError::Unsupported(format!(
+                    "JPEG-LS component mapping table {tq} not supported (must be 0)"
+                )));
+            }
+        }
+        // Skip any trailing bytes in an over-long segment (payload is 6 + Nf*3).
+        let consumed = 6 + nf as usize * 3;
+        if payload_len > consumed {
+            self.skip(payload_len - consumed)?;
+        }
 
         Ok(FrameHeader {
             precision: u32::from(p),
@@ -298,20 +319,39 @@ impl<'a> Decoder<'a> {
     fn read_sos(&mut self, _payload_len: usize) -> Result<ScanHeader, CodecError> {
         let ns = self.read_byte()?;
         if ns != 1 {
+            // This decoder codes one component per scan (ILV 0); a scan over
+            // several components (ILV 1/2) is unsupported.
             return Err(CodecError::Unsupported(
                 "multi-component scan (Ns != 1) not supported".into(),
             ));
         }
-        self.skip(ns as usize * 2)?;
+        // Component spec: [Csj, mapping-table selector]. The component selector
+        // Csj is not checked (CharLS ignores it); a non-zero mapping-table
+        // selector references an LSE mapping table this decoder does not apply,
+        // so reject it rather than silently mis-decode.
+        let _csj = self.read_byte()?;
+        let mapping = self.read_byte()?;
+        if mapping != 0 {
+            return Err(CodecError::Unsupported(format!(
+                "SOS mapping-table selector {mapping} not supported (must be 0)"
+            )));
+        }
 
         let near = self.read_byte()?;
         let ilv = self.read_byte()?;
-        let _al_ah = self.read_byte()?;
+        let al_ah = self.read_byte()?;
 
         if ilv != 0 {
             return Err(CodecError::Unsupported(
                 "interleaved scan (ILV != 0) not supported".into(),
             ));
+        }
+        // Point transform (the Ah/Al byte) must be 0: a non-zero value shifts
+        // the samples, which this decoder does not apply.
+        if al_ah != 0 {
+            return Err(CodecError::InvalidData(format!(
+                "SOS point-transform byte {al_ah:#04x} must be 0"
+            )));
         }
 
         Ok(ScanHeader {
@@ -883,6 +923,48 @@ mod tests {
         filled.extend_from_slice(&buf[2..]);
         let (decoded, _, _) = decode(&filled, w, h).expect("fill bytes should be skipped");
         assert_eq!(decoded, pixels);
+    }
+
+    fn encode_mono_4x4() -> (Vec<u8>, Vec<u16>) {
+        let pixels: Vec<u16> = (0..16).map(|i| i * 4).collect();
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, 4, 4, &EncodeOptions::default(), &mut buf).unwrap();
+        (buf, pixels)
+    }
+
+    #[test]
+    fn sos_mapping_table_and_point_transform_rejected() {
+        // SOS: FF DA | Ls(2) | Ns | Csj | mapping | NEAR | ILV | Ah/Al.
+        let (buf, _) = encode_mono_4x4();
+        let sos = buf.windows(2).position(|p| p == [0xFF, 0xDA]).unwrap();
+        let mut mapping = buf.clone();
+        mapping[sos + 6] = 1; // non-zero mapping-table selector
+        assert!(matches!(
+            decode(&mapping, 4, 4),
+            Err(CodecError::Unsupported(_))
+        ));
+        let mut point = buf.clone();
+        point[sos + 9] = 3; // non-zero point transform
+        assert!(matches!(
+            decode(&point, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn sof_subsampling_and_component_mapping_rejected() {
+        // SOF55: FF F7 | Ls(2) | P | H(2) | W(2) | Nf | [Ci, sampling, Tq]...
+        let (buf, _) = encode_mono_4x4();
+        let sof = buf.windows(2).position(|p| p == [0xFF, 0xF7]).unwrap();
+        let mut sub = buf.clone();
+        sub[sof + 11] = 0x22; // 2:2 subsampling, not 1:1
+        assert!(matches!(
+            decode(&sub, 4, 4),
+            Err(CodecError::Unsupported(_))
+        ));
+        let mut tq = buf.clone();
+        tq[sof + 12] = 1; // per-component mapping table
+        assert!(matches!(decode(&tq, 4, 4), Err(CodecError::Unsupported(_))));
     }
 
     /// Assemble a 3-component, planar (ILV 0) JPEG-LS stream: one SOS + scan

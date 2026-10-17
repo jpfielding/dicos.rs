@@ -34,7 +34,7 @@ mod predictor;
 mod run_mode;
 
 pub use decode::{decode, decode_image, decode_with_options, DecodedImage};
-pub use encode::{encode, encode_with_options};
+pub use encode::{encode, encode_image, encode_with_options};
 pub use error::CodecError;
 
 /// DICOM Transfer Syntax UID for JPEG-LS Lossless.

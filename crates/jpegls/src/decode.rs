@@ -694,7 +694,7 @@ pub(crate) fn decode_scan_t87(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{encode_scan_t87, encode_with_options};
+    use crate::encode::{encode_image, encode_scan_t87, encode_with_options};
     use crate::{EncodeOptions, Profile};
 
     fn roundtrip(pixels: &[u16], w: u32, h: u32) -> Vec<u16> {
@@ -1036,6 +1036,30 @@ mod tests {
         assert_eq!(img.components, 1);
         assert_eq!((img.width, img.height), (w, h));
         assert_eq!(img.samples, pixels);
+    }
+
+    #[test]
+    fn encode_image_roundtrips_through_decode_image() {
+        // Mono.
+        let mono: Vec<u16> = (0..35u16).map(|i| i * 3 % 256).collect();
+        let mut buf = Vec::new();
+        encode_image(&mono, 7, 5, 1, &EncodeOptions::default(), &mut buf).unwrap();
+        let img = decode_image(&buf).unwrap();
+        assert_eq!((img.components, img.width, img.height), (1, 7, 5));
+        assert_eq!(img.samples, mono);
+
+        // 3-component planar (ILV 0).
+        let (w, h) = (5u32, 3u32);
+        let n = (w * h) as u16;
+        let mut planar: Vec<u16> = Vec::new();
+        planar.extend((0..n).map(|i| i * 3 % 256));
+        planar.extend((0..n).map(|i| (i * 7 + 1) % 256));
+        planar.extend((0..n).map(|i| 200u16.wrapping_sub(i * 5) % 256));
+        let mut buf = Vec::new();
+        encode_image(&planar, w, h, 3, &EncodeOptions::default(), &mut buf).unwrap();
+        let img = decode_image(&buf).unwrap();
+        assert_eq!((img.components, img.interleave_mode), (3, 0));
+        assert_eq!(img.samples, planar);
     }
 
     #[test]

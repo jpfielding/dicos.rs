@@ -11,36 +11,13 @@
 //! - exactly `width * height * components` samples, none above `2^P - 1`;
 //! - a single-component stream decodes identically through `jpegls::decode`.
 
+use jpegls_fuzz::{assert_decode_agrees, assert_image_contract};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(img) = jpegls::decode_image(data) else {
         return;
     };
-
-    assert!(
-        img.components == 1 || img.components == 3,
-        "components = {}",
-        img.components
-    );
-    assert_eq!(img.interleave_mode, 0);
-    assert!(
-        (2..=16).contains(&img.bits_per_sample),
-        "bits_per_sample = {}",
-        img.bits_per_sample
-    );
-    let expected = img.width as usize * img.height as usize * usize::from(img.components);
-    assert_eq!(img.samples.len(), expected);
-    let max = (1u32 << img.bits_per_sample) - 1;
-    assert!(
-        img.samples.iter().all(|&s| u32::from(s) <= max),
-        "a sample exceeds 2^P - 1 = {max}"
-    );
-
-    if img.components == 1 {
-        let (samples, w, h) = jpegls::decode(data, img.width, img.height)
-            .expect("decode rejected a grayscale stream decode_image accepted");
-        assert_eq!((w, h), (img.width, img.height));
-        assert_eq!(samples, img.samples, "decode and decode_image disagree");
-    }
+    assert_image_contract(&img, None);
+    assert_decode_agrees(data, &img);
 });

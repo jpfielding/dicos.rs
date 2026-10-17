@@ -12,6 +12,12 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 jpegls = { path = "..", package = "pure_jpegls" }
 
+[lib]
+name = "jpegls_fuzz"
+path = "src/lib.rs"
+test = false
+doc = false
+
 # Prevent this fuzzing crate from being merged into the root workspace; it is
 # nightly/cargo-fuzz-only and is listed in the root `[workspace] exclude`.
 [workspace]
@@ -36,6 +42,34 @@ bench = false
 [[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_gray"
+path = "fuzz_targets/encode_gray.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_params"
+path = "fuzz_targets/encode_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_lse"
+path = "fuzz_targets/decode_lse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_mutated"
+path = "fuzz_targets/decode_mutated.rs"
 test = false
 doc = false
 bench = false

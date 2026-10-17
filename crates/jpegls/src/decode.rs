@@ -316,8 +316,24 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn read_sos(&mut self, _payload_len: usize) -> Result<ScanHeader, CodecError> {
+    /// `nf` is the frame's component count when SOF55 has already been read
+    /// (`None` if SOS precedes it; that stream fails later as missing SOF55).
+    fn read_sos(
+        &mut self,
+        _payload_len: usize,
+        nf: Option<usize>,
+    ) -> Result<ScanHeader, CodecError> {
         let ns = self.read_byte()?;
+        // T.87 C.2.3: 1 <= Ns <= 4, and a scan cannot cover more components
+        // than the frame has. Such a header is malformed, not merely a scan
+        // shape this decoder lacks, so it is InvalidData rather than
+        // Unsupported.
+        if ns == 0 || ns > 4 || nf.is_some_and(|nf| usize::from(ns) > nf) {
+            let frame = nf.map_or(String::new(), |nf| format!(" for a frame with Nf = {nf}"));
+            return Err(CodecError::InvalidData(format!(
+                "SOS component count Ns = {ns} is invalid{frame}"
+            )));
+        }
         if ns != 1 {
             // This decoder codes one component per scan (ILV 0); a scan over
             // several components (ILV 1/2) is unsupported.
@@ -400,7 +416,7 @@ impl<'a> Decoder<'a> {
                     self.skip(length)?;
                 }
                 MARKER_SOS => {
-                    scan = self.read_sos(length)?;
+                    scan = self.read_sos(length, frame.as_ref().map(|f| f.components))?;
                     break;
                 }
                 MARKER_EOI => {
@@ -481,7 +497,7 @@ impl<'a> Decoder<'a> {
                     // read_sos rejects Ns != 1 and ILV != 0, so an interleaved
                     // (ILV 1/2) multi-component scan surfaces here as
                     // Unsupported — interleaved RGB is intentionally deferred.
-                    first_scan = self.read_sos(length)?;
+                    first_scan = self.read_sos(length, frame.as_ref().map(|f| f.components))?;
                     break;
                 }
                 MARKER_EOI => {
@@ -512,7 +528,7 @@ impl<'a> Decoder<'a> {
                         "expected SOS for component {c}, got marker 0x{marker:04X}"
                     )));
                 }
-                let scan = self.read_sos(length)?;
+                let scan = self.read_sos(length, Some(components))?;
                 if scan.near != near {
                     return Err(CodecError::InvalidData(format!(
                         "per-scan NEAR differs across components ({near} then {})",
@@ -947,6 +963,38 @@ mod tests {
         point[sos + 9] = 3; // non-zero point transform
         assert!(matches!(
             decode(&point, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn sos_component_count_is_validated_against_the_frame() {
+        // An impossible Ns (0, > 4, or more than the frame's Nf) is malformed;
+        // a legal multi-component scan (ILV 1/2) is merely unsupported.
+        let (mono, _) = encode_mono_4x4();
+        let sos = mono.windows(2).position(|p| p == [0xFF, 0xDA]).unwrap();
+        for ns in [0u8, 2, 5, 7] {
+            let mut bad = mono.clone();
+            bad[sos + 4] = ns;
+            match decode(&bad, 4, 4) {
+                Err(CodecError::InvalidData(m)) => assert!(m.contains("Ns = "), "{m}"),
+                other => panic!("mono Ns = {ns}: {other:?}"),
+            }
+        }
+
+        let planes: Vec<Vec<u16>> = (0..3).map(|c| vec![c * 40; 16]).collect();
+        let rgb = build_planar_rgb(&planes, 4, 4, 8);
+        let sos = rgb.windows(2).position(|p| p == [0xFF, 0xDA]).unwrap();
+        let mut interleaved = rgb.clone();
+        interleaved[sos + 4] = 3;
+        assert!(matches!(
+            decode_image(&interleaved),
+            Err(CodecError::Unsupported(_))
+        ));
+        let mut too_many = rgb.clone();
+        too_many[sos + 4] = 4;
+        assert!(matches!(
+            decode_image(&too_many),
             Err(CodecError::InvalidData(_))
         ));
     }

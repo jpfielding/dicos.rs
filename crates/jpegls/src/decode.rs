@@ -684,6 +684,7 @@ pub(crate) fn decode_scan_t87(
                 Err(e) => return Err(scan_error(e, base_offset + br.pos())),
             };
             let err_q = run_mode::unmap_error(mapped, correction);
+            run_mode::check_err_in_range(err_q, range)?;
             ctx.update_stats(q, err_q);
 
             let recon = run_mode::fix_reconstructed(

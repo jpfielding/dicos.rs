@@ -78,6 +78,26 @@ pub(crate) fn modulo_range(mut e: i32, range: i32) -> i32 {
     e
 }
 
+/// Reject a decoded error that [`modulo_range`] could never have produced.
+///
+/// The encoder reduces every coded error into `-(RANGE/2)..=(RANGE+1)/2 - 1`,
+/// so `|Errval| > RANGE/2` can only come from a corrupt Golomb code. Left
+/// unchecked, such a value inflates the context's A accumulator, which raises
+/// k, which lets the next code decode larger still, until A overflows `i32`.
+/// Within the bound, A stays at most `RESET * RANGE/2 <= 65535 * 32768`, which
+/// fits.
+#[inline]
+pub(crate) fn check_err_in_range(err: i32, range: i32) -> Result<(), CodecError> {
+    if err.unsigned_abs() > (range / 2) as u32 {
+        return Err(CodecError::InvalidParameter {
+            name: "Errval",
+            value: i64::from(err),
+            allowed: "|Errval| <= RANGE/2 (T.87 A.4.5)",
+        });
+    }
+    Ok(())
+}
+
 /// Reconstruct a sample value, folding it back into `[0, max_val]` (A.4.6).
 #[inline]
 pub(crate) fn fix_reconstructed(value: i32, near: i32, range: i32, max_val: i32) -> i32 {
@@ -216,6 +236,16 @@ fn decode_run_interruption(
     let k = ctx.compute_k_run(ri_type);
     let glimit = ctx.limit - ctx.j[ctx.run_index] - 1;
     let e_mapped = br.read_limited_golomb(k, glimit, ctx.qbpp)?;
+    // A valid EMErrval is 2*|err| - RItype - map <= RANGE (|err| <= RANGE/2,
+    // see check_err_in_range). Rejecting a larger one also keeps the
+    // arithmetic below and the run-context A accumulator from overflowing.
+    if e_mapped > ctx.range as u32 {
+        return Err(CodecError::InvalidParameter {
+            name: "EMErrval",
+            value: i64::from(e_mapped),
+            allowed: "<= RANGE (T.87 A.7.2)",
+        });
+    }
 
     // temp = e_mapped + RItype = 2*|err| - map, so its parity is `map` and
     // ceil(temp/2) is |err| (A.22). The sign is recovered from the same
@@ -229,6 +259,7 @@ fn decode_run_interruption(
     } else {
         -abs_e
     };
+    check_err_in_range(err_q, ctx.range)?;
 
     ctx.update_run_stats(ri_type, e_mapped, err_q < 0);
 

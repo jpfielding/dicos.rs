@@ -44,6 +44,9 @@ struct FrameHeader {
     precision: u32,
     height: usize,
     width: usize,
+    /// Number of components (Nf). 1 (grayscale) or 3 (e.g. RGB); other counts
+    /// are rejected in [`Decoder::read_sof`].
+    components: usize,
 }
 
 struct ScanHeader {
@@ -83,6 +86,40 @@ pub fn decode_with_options(
 ) -> Result<(Vec<u16>, u32, u32), CodecError> {
     let mut dec = Decoder::new(data);
     dec.decode(width, height, opts.profile)
+}
+
+/// A decoded JPEG-LS image with the frame metadata a DICOM caller needs.
+///
+/// Supports grayscale (`components == 1`) and 3-component **planar** (ILV 0)
+/// frames. Line- and sample-interleaved multi-component scans (ILV 1/2) are
+/// rejected with [`CodecError::Unsupported`], so `interleave_mode` is always
+/// `0` on success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedImage {
+    /// Samples in component-planar order — all of component 0, then component
+    /// 1, … (`RRR…GGG…BBB…`). Length `width * height * components`.
+    pub samples: Vec<u16>,
+    /// Image width in pixels (from the codestream).
+    pub width: u32,
+    /// Image height in pixels (from the codestream).
+    pub height: u32,
+    /// Sample precision in bits (2..=16).
+    pub bits_per_sample: u8,
+    /// Component count (1 or 3).
+    pub components: u8,
+    /// Interleave mode from the scan headers; `0` (none/planar) on success.
+    pub interleave_mode: u8,
+    /// NEAR error bound (0 = lossless).
+    pub near: u8,
+}
+
+/// Decode a JPEG-LS bitstream, reading the geometry from the codestream.
+///
+/// Unlike [`decode`], this takes no expected dimensions and returns the full
+/// frame metadata in [`DecodedImage`], including 3-component planar (ILV 0)
+/// frames. T.87 conformant path only (no `LegacyGo`).
+pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
+    Decoder::new(data).decode_image()
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +227,16 @@ impl<'a> Decoder<'a> {
         }
 
         let nf = self.read_byte()?;
-        if nf != 1 {
-            return Err(CodecError::Unsupported(
-                "multi-component JPEG-LS (Nf != 1) not supported".into(),
-            ));
+        // Grayscale (1) and 3-component (e.g. RGB) frames are supported. The
+        // single-scan `decode()` entry remains grayscale-only (it re-checks
+        // below); `decode_image()` handles 3-component planar (ILV 0) streams.
+        if nf != 1 && nf != 3 {
+            return Err(CodecError::Unsupported(format!(
+                "JPEG-LS component count {nf} not supported (only 1 or 3)"
+            )));
         }
 
-        // Skip component specs (Nf * 3 bytes).
+        // Skip component specs (Nf * 3 bytes); payload is 6 + Nf*3.
         let to_skip = payload_len.saturating_sub(6);
         self.skip(to_skip)?;
 
@@ -204,6 +244,7 @@ impl<'a> Decoder<'a> {
             precision: u32::from(p),
             height,
             width,
+            components: nf as usize,
         })
     }
 
@@ -330,44 +371,16 @@ impl<'a> Decoder<'a> {
             });
         }
 
-        let sof_max_val = (1i32 << frame.precision) - 1;
-        let max_val = presets.maxval.unwrap_or(sof_max_val);
-
-        // Effective MAXVAL must be positive and fit the SOF precision range
-        // (T.87 C.2.4.1.1). A preset MAXVAL exceeding (1<<precision)-1 would
-        // desync context arithmetic from the sample range.
-        if max_val <= 0 || max_val > sof_max_val {
-            return Err(CodecError::InvalidData(format!(
-                "LSE MAXVAL={max_val} outside 1..={sof_max_val} for precision {}",
-                frame.precision
+        // Grayscale-only contract for this entry; 3-component streams go
+        // through `decode_image` (which handles planar ILV 0).
+        if frame.components != 1 {
+            return Err(CodecError::Unsupported(format!(
+                "decode() is grayscale-only; {}-component frames need decode_image()",
+                frame.components
             )));
         }
 
-        // NEAR validity depends on the effective MAXVAL (T.87 C.2.4.1.1).
-        let near_max = (max_val / 2).min(255);
-        if scan.near < 0 || scan.near > near_max {
-            return Err(CodecError::InvalidParameter {
-                name: "near",
-                value: i64::from(scan.near),
-                allowed: "0..=min(255, MAXVAL/2)",
-            });
-        }
-
-        // Effective quantization thresholds must satisfy the T.87 C.2.4.1.1
-        // ordering NEAR < T1 <= T2 <= T3 <= MAXVAL. Preset fields left at 0
-        // fall back to the spec defaults (already valid); an explicit preset
-        // that violates the ordering feeds a nonconformant quantizer.
-        let (dt1, dt2, dt3) = ContextModel::default_thresholds(max_val, scan.near);
-        let t1 = presets.t1.unwrap_or(dt1);
-        let t2 = presets.t2.unwrap_or(dt2);
-        let t3 = presets.t3.unwrap_or(dt3);
-        if !(scan.near < t1 && t1 <= t2 && t2 <= t3 && t3 <= max_val) {
-            return Err(CodecError::InvalidData(format!(
-                "LSE thresholds violate NEAR<T1<=T2<=T3<=MAXVAL \
-                 (NEAR={}, T1={t1}, T2={t2}, T3={t3}, MAXVAL={max_val})",
-                scan.near
-            )));
-        }
+        let (max_val, reset) = validate_params(&frame, &presets, scan.near)?;
 
         let w = exp_width as usize;
         let h = exp_height as usize;
@@ -379,7 +392,6 @@ impl<'a> Decoder<'a> {
                 legacy::decode_scan(scan_data, &mut pixels, w, h, max_val, scan.near)?;
             }
             Profile::T87 => {
-                let reset = presets.reset.unwrap_or(DEFAULT_RESET);
                 let ctx = ContextModel::with_presets(
                     max_val, scan.near, reset, presets.t1, presets.t2, presets.t3,
                 );
@@ -393,6 +405,137 @@ impl<'a> Decoder<'a> {
 
         Ok((pixels, exp_width, exp_height))
     }
+
+    /// Decode a full image (grayscale or 3-component planar), reading geometry
+    /// from the codestream. T.87 path only.
+    fn decode_image(&mut self) -> Result<DecodedImage, CodecError> {
+        self.expect_marker(MARKER_SOI)?;
+
+        let mut frame: Option<FrameHeader> = None;
+        let mut presets = Presets::default();
+        let first_scan: ScanHeader;
+
+        loop {
+            let (marker, length) = self.read_marker()?;
+            match marker {
+                MARKER_SOF55 => frame = Some(self.read_sof(length)?),
+                MARKER_LSE => self.read_lse(length, &mut presets)?,
+                MARKER_DRI => {
+                    return Err(CodecError::Unsupported(
+                        "JPEG-LS restart intervals (DRI) not supported".into(),
+                    ));
+                }
+                MARKER_SOS => {
+                    // read_sos rejects Ns != 1 and ILV != 0, so an interleaved
+                    // (ILV 1/2) multi-component scan surfaces here as
+                    // Unsupported — interleaved RGB is intentionally deferred.
+                    first_scan = self.read_sos(length)?;
+                    break;
+                }
+                MARKER_EOI => {
+                    return Err(CodecError::InvalidData("unexpected EOI before SOS".into()));
+                }
+                _ => self.skip(length)?,
+            }
+        }
+
+        let frame = frame.ok_or_else(|| CodecError::InvalidData("missing SOF55 marker".into()))?;
+        let near = first_scan.near;
+        let (max_val, reset) = validate_params(&frame, &presets, near)?;
+
+        let w = frame.width;
+        let h = frame.height;
+        let components = frame.components;
+        // w*h*components cannot overflow: read_sof caps w*h at MAX_PIXELS
+        // (1<<28) and components <= 3.
+        let plane = w * h;
+        let mut samples = vec![0u16; plane * components];
+
+        // ILV 0 codes one component per scan; the first SOS is already read.
+        for (c, plane_slot) in samples.chunks_mut(plane).enumerate() {
+            if c > 0 {
+                let (marker, length) = self.read_marker()?;
+                if marker != MARKER_SOS {
+                    return Err(CodecError::InvalidData(format!(
+                        "expected SOS for component {c}, got marker 0x{marker:04X}"
+                    )));
+                }
+                let scan = self.read_sos(length)?;
+                if scan.near != near {
+                    return Err(CodecError::InvalidData(format!(
+                        "per-scan NEAR differs across components ({near} then {})",
+                        scan.near
+                    )));
+                }
+            }
+            let ctx = ContextModel::with_presets(
+                max_val, near, reset, presets.t1, presets.t2, presets.t3,
+            );
+            let scan_start = self.pos;
+            let consumed =
+                decode_scan_t87(&self.data[scan_start..], plane_slot, w, h, ctx, scan_start)?;
+            self.pos = scan_start + consumed;
+        }
+        self.expect_eoi()?;
+
+        Ok(DecodedImage {
+            samples,
+            width: w as u32,
+            height: h as u32,
+            bits_per_sample: frame.precision as u8,
+            components: components as u8,
+            interleave_mode: 0,
+            near: near as u8,
+        })
+    }
+}
+
+/// Validate MAXVAL / NEAR / threshold ordering (T.87 C.2.4.1.1) for a scan and
+/// return the effective `(max_val, reset)`. Shared by [`Decoder::decode`] and
+/// [`Decoder::decode_image`]. `near` is the scan's NEAR; `presets` carries any
+/// LSE ID=1 overrides (a `None` field means "use the spec default").
+fn validate_params(
+    frame: &FrameHeader,
+    presets: &Presets,
+    near: i32,
+) -> Result<(i32, i32), CodecError> {
+    let sof_max_val = (1i32 << frame.precision) - 1;
+    let max_val = presets.maxval.unwrap_or(sof_max_val);
+
+    // Effective MAXVAL must be positive and fit the SOF precision range; a
+    // preset MAXVAL above (1<<precision)-1 would desync context arithmetic.
+    if max_val <= 0 || max_val > sof_max_val {
+        return Err(CodecError::InvalidData(format!(
+            "LSE MAXVAL={max_val} outside 1..={sof_max_val} for precision {}",
+            frame.precision
+        )));
+    }
+
+    // NEAR validity depends on the effective MAXVAL.
+    let near_max = (max_val / 2).min(255);
+    if near < 0 || near > near_max {
+        return Err(CodecError::InvalidParameter {
+            name: "near",
+            value: i64::from(near),
+            allowed: "0..=min(255, MAXVAL/2)",
+        });
+    }
+
+    // Thresholds must satisfy NEAR < T1 <= T2 <= T3 <= MAXVAL. Preset fields
+    // left at their default fall back to the spec defaults (already valid).
+    let (dt1, dt2, dt3) = ContextModel::default_thresholds(max_val, near);
+    let t1 = presets.t1.unwrap_or(dt1);
+    let t2 = presets.t2.unwrap_or(dt2);
+    let t3 = presets.t3.unwrap_or(dt3);
+    if !(near < t1 && t1 <= t2 && t2 <= t3 && t3 <= max_val) {
+        return Err(CodecError::InvalidData(format!(
+            "LSE thresholds violate NEAR<T1<=T2<=T3<=MAXVAL \
+             (NEAR={near}, T1={t1}, T2={t2}, T3={t3}, MAXVAL={max_val})"
+        )));
+    }
+
+    let reset = presets.reset.unwrap_or(DEFAULT_RESET);
+    Ok((max_val, reset))
 }
 
 // ---------------------------------------------------------------------------
@@ -710,19 +853,75 @@ mod tests {
         ));
     }
 
+    /// Assemble a 3-component, planar (ILV 0) JPEG-LS stream: one SOS + scan
+    /// per plane, sharing one SOF55 (Nf = 3). Lossless, default presets.
+    fn build_planar_rgb(planes: &[Vec<u16>], w: usize, h: usize, precision: u8) -> Vec<u8> {
+        let nf = planes.len();
+        let max_val = (1i32 << precision) - 1;
+        let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
+                                                 // SOF55: Ls = 8 + 3*Nf.
+        out.extend_from_slice(&[0xFF, 0xF7]);
+        out.extend_from_slice(&((8 + 3 * nf) as u16).to_be_bytes());
+        out.push(precision);
+        out.extend_from_slice(&(h as u16).to_be_bytes());
+        out.extend_from_slice(&(w as u16).to_be_bytes());
+        out.push(nf as u8);
+        for c in 0..nf {
+            out.extend_from_slice(&[(c as u8) + 1, 0x11, 0x00]); // id, sampling 1:1, Tq 0
+        }
+        // One SOS + entropy scan per component (ILV 0).
+        for (c, plane) in planes.iter().enumerate() {
+            out.extend_from_slice(&[0xFF, 0xDA]);
+            out.extend_from_slice(&8u16.to_be_bytes()); // Ls = 8 for Ns = 1
+            out.push(1); // Ns = 1
+            out.extend_from_slice(&[(c as u8) + 1, 0x00]); // Csj, mapping table 0
+            out.extend_from_slice(&[0x00, 0x00, 0x00]); // NEAR = 0, ILV = 0, point transform 0
+            let ctx = ContextModel::new(max_val, 0, DEFAULT_RESET);
+            encode_scan_t87(&mut out, plane, w, h, ctx).unwrap();
+        }
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
     #[test]
-    fn multi_component_unsupported() {
-        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
-        out.extend_from_slice(&14u16.to_be_bytes()); // 8 + 3*Nf, Nf=3 -> but length only guards skip
-        out.push(8);
-        out.extend_from_slice(&4u16.to_be_bytes());
-        out.extend_from_slice(&4u16.to_be_bytes());
-        out.push(3); // Nf = 3
-        out.extend_from_slice(&[1, 0x11, 0x00, 2, 0x11, 0x00, 3, 0x11, 0x00]);
-        assert!(matches!(
-            decode(&out, 4, 4),
-            Err(CodecError::Unsupported(_))
-        ));
+    fn decode_is_grayscale_only() {
+        // A well-formed 3-component stream is rejected by the grayscale-only
+        // decode() entry; decode_image() handles it (next test).
+        let plane: Vec<u16> = (0..16).collect();
+        let s = build_planar_rgb(&[plane.clone(), plane.clone(), plane], 4, 4, 8);
+        assert!(matches!(decode(&s, 4, 4), Err(CodecError::Unsupported(_))));
+    }
+
+    #[test]
+    fn decode_image_rgb_planar_roundtrip() {
+        let (w, h) = (5usize, 3usize);
+        let n = (w * h) as u16;
+        let r: Vec<u16> = (0..n).map(|i| i * 3 % 256).collect();
+        let g: Vec<u16> = (0..n).map(|i| (i * 7 + 1) % 256).collect();
+        let b: Vec<u16> = (0..n).map(|i| 200u16.wrapping_sub(i * 5) % 256).collect();
+        let s = build_planar_rgb(&[r.clone(), g.clone(), b.clone()], w, h, 8);
+        let img = decode_image(&s).expect("decode_image");
+        assert_eq!((img.width, img.height), (w as u32, h as u32));
+        assert_eq!(img.components, 3);
+        assert_eq!(img.interleave_mode, 0);
+        assert_eq!((img.near, img.bits_per_sample), (0, 8));
+        // Component-planar layout: R plane, then G, then B.
+        let mut expected = r;
+        expected.extend_from_slice(&g);
+        expected.extend_from_slice(&b);
+        assert_eq!(img.samples, expected);
+    }
+
+    #[test]
+    fn decode_image_mono_matches_source() {
+        let (w, h) = (7u32, 5u32);
+        let pixels: Vec<u16> = (0..w * h).map(|i| (i * 3 % 256) as u16).collect();
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w, h, &EncodeOptions::default(), &mut buf).unwrap();
+        let img = decode_image(&buf).expect("decode_image mono");
+        assert_eq!(img.components, 1);
+        assert_eq!((img.width, img.height), (w, h));
+        assert_eq!(img.samples, pixels);
     }
 
     #[test]

@@ -33,7 +33,7 @@ mod legacy;
 mod predictor;
 mod run_mode;
 
-pub use decode::{decode, decode_with_options};
+pub use decode::{decode, decode_image, decode_with_options, DecodedImage};
 pub use encode::{encode, encode_with_options};
 pub use error::CodecError;
 

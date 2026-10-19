@@ -377,7 +377,15 @@ impl<'a> Decoder<'a> {
 
     fn expect_eoi(&mut self) -> Result<(), CodecError> {
         let b1 = self.read_byte()?;
-        let b2 = self.read_byte()?;
+        let mut b2 = self.read_byte()?;
+        // As in `read_marker`, 0xFF fill bytes may precede the EOI (T.81
+        // B.1.1.2). DCMTK pads an odd-length stream to even this way by
+        // default (`FF FF D9`); skip them. The first non-0xFF byte is the code.
+        if b1 == 0xFF {
+            while b2 == 0xFF {
+                b2 = self.read_byte()?;
+            }
+        }
         let marker = u16::from(b1) << 8 | u16::from(b2);
         if marker != MARKER_EOI {
             return Err(CodecError::InvalidData(format!(
@@ -940,6 +948,44 @@ mod tests {
         filled.extend_from_slice(&buf[2..]);
         let (decoded, _, _) = decode(&filled, w, h).expect("fill bytes should be skipped");
         assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn fill_bytes_before_eoi_tolerated() {
+        // The EOI after the last scan may be preceded by 0xFF fill bytes too:
+        // DCMTK's default padding of an odd-length stream is `FF FF D9`.
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u16> = (0..16).map(|i| i * 4).collect();
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w, h, &EncodeOptions::default(), &mut buf).unwrap();
+        let (scan, eoi) = buf.split_at(buf.len() - 2);
+        assert_eq!(eoi, [0xFF, 0xD9]);
+        for fill in 1..=3 {
+            let mut filled = scan.to_vec();
+            filled.extend_from_slice(&vec![0xFF; fill]);
+            filled.extend_from_slice(eoi);
+            let (decoded, _, _) = decode(&filled, w, h).expect("fill bytes should be skipped");
+            assert_eq!(decoded, pixels, "{fill} fill byte(s), decode");
+            let image = decode_image(&filled).expect("fill bytes should be skipped");
+            assert_eq!(image.samples, pixels, "{fill} fill byte(s), decode_image");
+        }
+    }
+
+    #[test]
+    fn fill_bytes_without_eoi_rejected() {
+        // A run of 0xFF fill bytes that ends the data, or that ends in a
+        // marker other than EOI, is still not an EOI.
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u16> = (0..16).map(|i| i * 4).collect();
+        let mut buf = Vec::new();
+        encode_with_options(&pixels, w, h, &EncodeOptions::default(), &mut buf).unwrap();
+        let scan = &buf[..buf.len() - 2];
+        for tail in [&[0xFF][..], &[0xFF, 0xFF], &[0xFF, 0xFF, 0xD8]] {
+            let mut bad = scan.to_vec();
+            bad.extend_from_slice(tail);
+            assert!(decode(&bad, w, h).is_err(), "tail {tail:02X?}");
+            assert!(decode_image(&bad).is_err(), "tail {tail:02X?}");
+        }
     }
 
     fn encode_mono_4x4() -> (Vec<u8>, Vec<u16>) {

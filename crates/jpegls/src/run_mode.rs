@@ -78,6 +78,23 @@ pub(crate) fn modulo_range(mut e: i32, range: i32) -> i32 {
     e
 }
 
+/// Reject a decoded error value no conformant encoder can produce.
+///
+/// The encoder reduces every error modulo RANGE (A.4.5), so `|Errval| <=
+/// RANGE/2`. A larger value can only come from a corrupt Golomb code; left
+/// unchecked it inflates the context's A accumulator, which raises k, which
+/// lets the next code decode larger still, until A overflows `i32`. Within
+/// the bound A stays below `RESET * RANGE/2 <= 65535 * 32768 < i32::MAX`.
+#[inline]
+pub(crate) fn check_errval(err: i32, range: i32) -> Result<(), CodecError> {
+    if err.unsigned_abs() > (range / 2) as u32 {
+        return Err(CodecError::InvalidData(format!(
+            "decoded error {err} outside +/-RANGE/2 (RANGE = {range})"
+        )));
+    }
+    Ok(())
+}
+
 /// Reconstruct a sample value, folding it back into `[0, max_val]` (A.4.6).
 #[inline]
 pub(crate) fn fix_reconstructed(value: i32, near: i32, range: i32, max_val: i32) -> i32 {
@@ -230,6 +247,8 @@ fn decode_run_interruption(
         -abs_e
     };
 
+    // Also bounds e_mapped (<= 2*|err|) before it reaches the run-context A.
+    check_errval(err_q, ctx.range)?;
     ctx.update_run_stats(ri_type, e_mapped, err_q < 0);
 
     Ok(fix_reconstructed(

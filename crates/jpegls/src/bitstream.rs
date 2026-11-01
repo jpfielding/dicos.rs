@@ -149,6 +149,48 @@ impl<'a> BitReader<'a> {
         self.read_bits(1)
     }
 
+    /// Count the `0` bits before the terminating `1` (the unary prefix of a
+    /// limited-length Golomb code), capped at `escape`.
+    ///
+    /// Byte-buffered replacement for the per-bit loop: find
+    /// the terminating `1` with `leading_zeros()` over the whole buffered
+    /// window. This is the decoder's hottest path, so it avoids a `Result` hop
+    /// and a `fill()` call per bit. The accept/reject behaviour is identical to
+    /// the per-bit loop for every conformant code; an over-long run (more than
+    /// `escape` zeros before a `1`) is rejected.
+    fn read_unary_capped(&mut self, escape: i32) -> Result<i32, CodecError> {
+        let mut count: i32 = 0;
+        loop {
+            if self.n_bits == 0 {
+                self.fill(1)?; // propagates a marker / end-of-data as Err
+            }
+            // Left-justify the n_bits-wide window into the u64 so the next bit
+            // (the window's MSB) sits at bit 63; leading_zeros then counts the
+            // run of 0s from there. (n_bits stays well below 64.)
+            let window = (self.bits & ((1u64 << self.n_bits) - 1)) << (64 - self.n_bits);
+            let zeros = (window.leading_zeros() as i32).min(self.n_bits);
+            if zeros < self.n_bits {
+                // Terminating 1 sits `zeros` bits in; consume the zeros and it.
+                self.n_bits -= zeros + 1;
+                let total = count + zeros;
+                if total > escape {
+                    return Err(CodecError::InvalidData(
+                        "limited-Golomb unary run exceeds escape length".into(),
+                    ));
+                }
+                return Ok(total);
+            }
+            // The whole buffered window was zero: consume it and refill.
+            count += self.n_bits;
+            self.n_bits = 0;
+            if count > escape {
+                return Err(CodecError::InvalidData(
+                    "limited-Golomb unary run exceeds escape length".into(),
+                ));
+            }
+        }
+    }
+
     /// Read a length-limited Golomb code (T.87 A.5.3).
     ///
     /// Counts the zeros preceding the terminating `1`:
@@ -162,16 +204,7 @@ impl<'a> BitReader<'a> {
         qbpp: i32,
     ) -> Result<u32, CodecError> {
         let escape = glimit - qbpp - 1;
-        let mut count: i32 = 0;
-        while self.read_bit()? == 0 {
-            count += 1;
-            if count > escape {
-                return Err(CodecError::InvalidData(
-                    "limited-Golomb unary run exceeds escape length".into(),
-                ));
-            }
-        }
-
+        let count = self.read_unary_capped(escape)?;
         if count < escape {
             let r = if k > 0 { self.read_bits(k)? } else { 0 };
             Ok(((count as u32) << k) | r)

@@ -35,6 +35,15 @@ fn crash_0ac3d3b_with_valid_sof_is_rejected_without_overflow() {
     assert_eq!(&data[6..10], &[0xFF, 0xF7, 0x00, 0x05]);
     data[9] = 11; // Ls = 8 + 3*Nf
     data.splice(16..16, [1u8, 0x11, 0x00]); // Ci, 1:1 sampling, Tq 0
+                                            // Repair the minimized SOS length and selector as well, so header
+                                            // validation cannot mask the entropy-code regression.
+    let sos = data.windows(2).position(|b| b == [0xff, 0xda]).unwrap();
+    data[sos + 2..sos + 4].copy_from_slice(&8u16.to_be_bytes());
+    data[sos + 5] = 1;
     let (body, w, h) = split(&data);
-    assert!(decode(body, w, h).is_err());
+    let result = decode(body, w, h);
+    assert!(
+        matches!(result, Err(CodecError::Truncated { .. })),
+        "{result:?}"
+    );
 }

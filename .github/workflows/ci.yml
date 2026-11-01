@@ -35,6 +35,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
+      - name: Check JPEG-LS fuzz targets
+        run: cargo check --manifest-path crates/jpegls/fuzz/Cargo.toml --bins --locked
+
       # Curated samples under testdata/ are tracked, so the integration tests
       # that read them run in CI. This step additionally exercises the example
       # generator end to end (it writes the gitignored testdata/synthetic/
@@ -89,11 +92,11 @@ jobs:
       - name: jpegli interop (fixture decode only; encode needs libjpeg-turbo >= 3.0)
         run: cargo test -p pure_jpegli --test interop -- --nocapture
 
-      # jpegls: fixture-gated. No charls CLI here and no *.jls fixtures checked
-      # in, so decode_charls_fixtures self-skips. Run anyway so the harness stays
-      # compiled and its skip path is exercised on every CI run.
-      - name: jpegls interop (fixture-gated, self-skips when empty)
-        run: cargo test -p pure_jpegls --test interop -- --nocapture
+      - name: Install CharLS reference decoder
+        run: sudo apt-get install -y libcharls-dev
+
+      - name: jpegls interop (RGB encode via CharLS and fixture decode)
+        run: DICOS_CHARLS_INTEROP=1 cargo test -p pure_jpegls --test charls_encode_interop --test interop -- --nocapture
 
   # Weekly (and on-demand) libFuzzer smoke run over every fuzz target. Gated to
   # schedule/workflow_dispatch: fuzzing is nightly-only and slow, so it MUST NOT

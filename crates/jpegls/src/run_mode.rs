@@ -78,16 +78,15 @@ pub(crate) fn modulo_range(mut e: i32, range: i32) -> i32 {
     e
 }
 
-/// Reject a decoded error that [`modulo_range`] could never have produced.
+/// Reject a decoded error value no conformant encoder can produce.
 ///
-/// The encoder reduces every coded error into `-(RANGE/2)..=(RANGE+1)/2 - 1`,
-/// so `|Errval| > RANGE/2` can only come from a corrupt Golomb code. Left
-/// unchecked, such a value inflates the context's A accumulator, which raises
-/// k, which lets the next code decode larger still, until A overflows `i32`.
-/// Within the bound, A stays at most `RESET * RANGE/2 <= 65535 * 32768`, which
-/// fits.
+/// The encoder reduces every error modulo RANGE (A.4.5), so `|Errval| <=
+/// RANGE/2`. A larger value can only come from a corrupt Golomb code; left
+/// unchecked it inflates the context's A accumulator, which raises k, which
+/// lets the next code decode larger still, until A overflows `i32`. Within
+/// the bound A stays below `RESET * RANGE/2 <= 65535 * 32768 < i32::MAX`.
 #[inline]
-pub(crate) fn check_err_in_range(err: i32, range: i32) -> Result<(), CodecError> {
+pub(crate) fn check_errval(err: i32, range: i32) -> Result<(), CodecError> {
     if err.unsigned_abs() > (range / 2) as u32 {
         return Err(CodecError::InvalidData(format!(
             "decoded error {err} outside +/-RANGE/2 (RANGE = {range})"
@@ -234,15 +233,6 @@ fn decode_run_interruption(
     let k = ctx.compute_k_run(ri_type);
     let glimit = ctx.limit - ctx.j[ctx.run_index] - 1;
     let e_mapped = br.read_limited_golomb(k, glimit, ctx.qbpp)?;
-    // A valid EMErrval is 2*|err| - RItype - map <= RANGE (|err| <= RANGE/2,
-    // see check_err_in_range). Rejecting a larger one also keeps the
-    // arithmetic below and the run-context A accumulator from overflowing.
-    if e_mapped > ctx.range as u32 {
-        return Err(CodecError::InvalidData(format!(
-            "mapped run error {e_mapped} exceeds RANGE {}",
-            ctx.range
-        )));
-    }
 
     // temp = e_mapped + RItype = 2*|err| - map, so its parity is `map` and
     // ceil(temp/2) is |err| (A.22). The sign is recovered from the same
@@ -256,8 +246,9 @@ fn decode_run_interruption(
     } else {
         -abs_e
     };
-    check_err_in_range(err_q, ctx.range)?;
 
+    // Also bounds e_mapped (<= 2*|err|) before it reaches the run-context A.
+    check_errval(err_q, ctx.range)?;
     ctx.update_run_stats(ri_type, e_mapped, err_q < 0);
 
     Ok(fix_reconstructed(

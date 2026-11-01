@@ -228,8 +228,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_sof(&mut self, payload_len: usize) -> Result<FrameHeader, CodecError> {
+        // P(1) + Y(2) + X(2) + Nf(1); checked before reading so a short
+        // segment cannot pull its fields from the following marker.
         if payload_len < 6 {
-            return Err(CodecError::InvalidData("SOF55 segment too short".into()));
+            return Err(CodecError::InvalidData(format!(
+                "SOF55 segment too short ({payload_len} payload bytes, need >= 6)"
+            )));
         }
         let p = self.read_byte()?;
         if !(2..=16).contains(&p) {
@@ -272,10 +276,12 @@ impl<'a> Decoder<'a> {
             )));
         }
 
-        if payload_len != 6 + 3 * usize::from(nf) {
-            return Err(CodecError::InvalidData(
-                "SOF55 length does not match component count".into(),
-            ));
+        // T.87 C.2.2: Lf = 8 + 3*Nf, i.e. the payload is exactly 6 + 3*Nf.
+        let expected = 6 + 3 * usize::from(nf);
+        if payload_len != expected {
+            return Err(CodecError::InvalidData(format!(
+                "SOF55 payload is {payload_len} bytes, expected {expected} for Nf = {nf}"
+            )));
         }
         let mut component_ids = Vec::new();
         // Component specs: [Ci, sampling (Hi<<4 | Vi), Tqi] per component.
@@ -745,8 +751,9 @@ pub(crate) fn decode_scan_t87(
                 Err(e) => return Err(scan_error(e, base_offset + br.pos())),
             };
             let err_q = run_mode::unmap_error(mapped, correction);
-            run_mode::check_err_in_range(err_q, range)
-                .map_err(|e| scan_error(e, base_offset + br.pos()))?;
+            if let Err(e) = run_mode::check_errval(err_q, range) {
+                return Err(scan_error(e, base_offset + br.pos()));
+            }
             ctx.update_stats(q, err_q);
 
             let recon = run_mode::fix_reconstructed(
@@ -891,9 +898,12 @@ mod tests {
 
     #[test]
     fn sof_length_must_match_component_count() {
+        // Lf must be exactly 8 + 3*Nf (11 for Nf = 1). A short segment must not
+        // read its fields from the next marker; a long one is malformed too.
         let mut buf = Vec::new();
         encode_with_options(&[0u16; 16], 4, 4, &EncodeOptions::default(), &mut buf).unwrap();
         let sof = buf.windows(2).position(|p| p == [0xFF, 0xF7]).unwrap();
+        assert_eq!(&buf[sof + 2..sof + 4], &[0x00, 11]);
         for lf in [2u8, 5, 8, 10, 12] {
             let mut bad = buf.clone();
             bad[sof + 3] = lf;

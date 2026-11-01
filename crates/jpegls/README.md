@@ -2,14 +2,24 @@
 
 Pure Rust implementation of JPEG-LS (ITU-T T.87 / ISO/IEC 14495-1) encoder and decoder.
 
-## Conformance scope (2.0.0)
+## Conformance scope
 
-This crate emits **conformant ITU-T T.87 streams** for **single-component**
-(`Nf = 1`, `ILV = 0`) images. Supported: LSE ID=1 presets
+This crate emits **conformant ITU-T T.87 streams**. Supported: LSE ID=1 presets
 (MAXVAL/T1/T2/T3/RESET) honored on decode, run mode, near-lossless, sample
-precision `2..=16`. `DRI`/restart markers, multi-component (`Nf ≠ 1`), and
-interleaved scans (`ILV ≠ 0`) are rejected as `Unsupported`. Interop is verified
-against **CharLS** `.jls` fixtures (including an LSE-bearing stream).
+precision `2..=16`, for:
+
+- **Single-component** images (`Nf = 1`) — `encode` / `decode`, and
+  `encode_image` / `decode_image`.
+- **Multi-component planar** images (`ILV = 0`: a shared frame header, then one
+  scan per component, e.g. RGB) — `encode_image` / `decode_image`.
+  `decode_image` accepts 1 or 3 components; `encode_image` accepts the same counts.
+
+Rejected: line- and sample-interleaved scans (`ILV = 1/2`), restart markers
+inside a scan (`RSTn`), LSE mapping tables, and component subsampling
+(`Unsupported`); a non-zero point transform or an impossible scan component
+count (`InvalidData`). A `DRI` segment on its own is tolerated and skipped.
+Interop is verified against **CharLS** `.jls` fixtures (including an
+LSE-bearing stream).
 
 ### Profiles
 
@@ -26,7 +36,8 @@ Near-lossless and explicit precision are set through `EncodeOptions` via
 - **Context-based adaptive prediction** with Median Edge Detection (MED)
 - **Golomb-Rice entropy coding** with adaptive parameter selection
 - **Run-length mode** for efficient coding of uniform regions
-- **Single-component** grayscale images, precision `2..=16`
+- **Grayscale and planar multi-component** (e.g. RGB, `ILV = 0`) images,
+  precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.80`
 - **Pure Rust**: No external codec dependencies
 
@@ -60,6 +71,29 @@ use jpegls::decode;
 
 let (decoded, width, height) = decode(&compressed, 16, 16).unwrap();
 assert_eq!(decoded, pixels);
+```
+
+### Planar multi-component (e.g. RGB)
+
+`encode_image` / `decode_image` take and return **component-planar** samples
+(all of component 0, then component 1, …). `decode_image` reads the geometry
+from the codestream and returns it with the frame metadata.
+
+`decode_image` limits the output sample buffer to 64 MiB by default. Use
+`decode_image_with_options` with `DecodeImageOptions { max_decoded_bytes }`
+to select a different budget; every component counts toward this limit.
+
+```rust
+use jpegls::{decode_image, encode_image, EncodeOptions};
+
+let (w, h) = (16u32, 16u32);
+let planar: Vec<u16> = (0..3 * 256).map(|i| (i % 256) as u16).collect(); // R, G, B planes
+let mut rgb = Vec::new();
+encode_image(&planar, w, h, 3, &EncodeOptions::default(), &mut rgb).unwrap();
+
+let img = decode_image(&rgb).unwrap();
+assert_eq!((img.width, img.height, img.components), (w, h, 3));
+assert_eq!(img.samples, planar);
 ```
 
 ## JPEG-LS Algorithm
@@ -99,6 +133,7 @@ selection, allowing the codec to adapt to local image characteristics.
 | Pixel Type | Precision | Components | Description |
 |------------|-----------|------------|-------------|
 | `u16` | `2..=16` bits | 1 (`Nf = 1`, `ILV = 0`) | single-component grayscale |
+| `u16` | `2..=16` bits | 3 (`Nf = 3`, `ILV = 0`) | planar multi-component, e.g. RGB  |
 
 ## JPEG-LS Stream Format
 
@@ -111,6 +146,7 @@ LSE   - JPEG-LS Preset Parameters (0xFFF8, optional)
 SOS   - Start of Scan (0xFFDA)
         Component selector, Near parameter (0 = lossless)
 [entropy-coded image data]
+(SOS + scan repeat once per component for planar, ILV = 0, multi-component)
 EOI   - End of Image (0xFFD9)
 ```
 
@@ -118,7 +154,7 @@ EOI   - End of Image (0xFFD9)
 
 ```
 jpegls/src/
-  lib.rs        # Public API (encode, decode, TRANSFER_SYNTAX_UID)
+  lib.rs        # Public API (encode, decode, encode_image, decode_image, TRANSFER_SYNTAX_UID)
   encode.rs     # Encoder: prediction + context + Golomb-Rice output
   decode.rs     # Decoder: Golomb-Rice input + context + reconstruction
   predictor.rs  # MED predictor and gradient computation

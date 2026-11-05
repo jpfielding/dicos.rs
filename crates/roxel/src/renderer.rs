@@ -32,6 +32,9 @@ struct Uniforms {
     ambient_intensity: f32,
     diffuse_intensity: f32,
     specular_intensity: f32,
+    clip_plane: [f32; 4],
+    depth_cue: f32,
+    _padding: [f32; 3],
 }
 
 /// Rendering quality preset.
@@ -46,6 +49,8 @@ pub enum Quality {
 pub struct RenderParams<'a> {
     pub camera: &'a Camera,
     pub viewport: [u32; 2],
+    pub viewport_rect: Option<[f32; 4]>,
+    pub clip_plane: Option<[f32; 4]>,
     pub threats: &'a [ThreatBox],
     pub show_threats: bool,
     pub settings: &'a crate::state::RenderSettings,
@@ -673,6 +678,9 @@ impl VolumeRenderer {
             ambient_intensity: settings.ambient,
             diffuse_intensity: settings.diffuse,
             specular_intensity: settings.specular,
+            clip_plane: params.clip_plane.unwrap_or([0.0, 0.0, 0.0, -1.0]),
+            depth_cue: settings.depth_cue,
+            _padding: [0.0; 3],
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -699,9 +707,9 @@ impl VolumeRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.84,
-                            g: 0.84,
-                            b: 0.84,
+                            r: 0.063,
+                            g: 0.086,
+                            b: 0.114,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -713,6 +721,9 @@ impl VolumeRenderer {
                 occlusion_query_set: None,
             });
 
+            if let Some([x, y, w, h]) = params.viewport_rect {
+                rpass.set_viewport(x, y, w, h, 0.0, 1.0);
+            }
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, bind_group, &[]);
             rpass.draw(0..3, 0..1); // Full-screen triangle.

@@ -249,8 +249,8 @@ impl TransferFunction {
 
         for (i, entry) in data.iter_mut().enumerate() {
             let t = i as f32 / (TRANSFER_SIZE - 1) as f32;
-            // Grayscale ramp: 0 -> 0.67 (170/255)
-            let gray = 0.67 * t;
+            // Lift midtones for the dark inspection workspace; opacity remains linear.
+            let gray = 0.9 * t.powf(0.65);
             let alpha = 0.5 * t;
             *entry = [gray, gray, gray, alpha];
         }

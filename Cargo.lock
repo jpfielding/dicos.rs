@@ -2666,6 +2666,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
+ "png",
  "pollster",
  "rayon",
  "rfd",

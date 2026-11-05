@@ -36,3 +36,6 @@ rfd.workspace = true
 
 # Data casting
 bytemuck.workspace = true
+
+# Reproducible screenshots of the actual GPU-rendered workspace.
+png = "0.18"

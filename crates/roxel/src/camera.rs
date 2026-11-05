@@ -24,8 +24,8 @@ impl Default for Camera {
     fn default() -> Self {
         Self {
             target: Vec3::new(0.5, 0.5, 0.5),
-            azimuth: 0.5,    // ~29 degrees from front
-            elevation: -0.4, // slight top-down view
+            azimuth: 0.25,   // slight oblique view
+            elevation: -1.1, // inspect the open volume from above
             distance: 1.0,
             fov: 0.8,
         }
@@ -37,6 +37,27 @@ impl Camera {
     pub const MIN_DISTANCE: f32 = 0.5;
     /// Maximum allowed orbit distance (furthest zoom-out).
     pub const MAX_DISTANCE: f32 = 5.0;
+
+    /// Fit all eight volume corners into the current viewport with a 6% margin.
+    pub fn fit_bounds(&mut self, min: Vec3, max: Vec3, aspect: f32) {
+        self.target = (min + max) * 0.5;
+        let forward = self.forward();
+        let right = self.right();
+        let up = self.up();
+        let mut distance = Self::MIN_DISTANCE;
+        for x in [min.x, max.x] {
+            for y in [min.y, max.y] {
+                for z in [min.z, max.z] {
+                    let delta = Vec3::new(x, y, z) - self.target;
+                    let depth = delta.dot(forward);
+                    distance = distance
+                        .max(delta.dot(right).abs() * 1.06 / (self.fov * aspect.max(0.1)) - depth);
+                    distance = distance.max(delta.dot(up).abs() * 1.06 / self.fov - depth);
+                }
+            }
+        }
+        self.distance = distance.clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE);
+    }
 
     /// Compute the camera position in world space.
     pub fn position(&self) -> Vec3 {
@@ -109,6 +130,29 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fitted_volume_corners_stay_inside_viewport() {
+        for aspect in [0.8, 1.2, 2.0] {
+            for depth in [0.1, 0.5, 1.0, 2.0] {
+                let mut camera = Camera::default();
+                camera.fit_bounds(Vec3::ZERO, Vec3::new(1.0, 1.0, depth), aspect);
+                for x in [0.0, 1.0] {
+                    for y in [0.0, 1.0] {
+                        for z in [0.0, depth] {
+                            let delta = Vec3::new(x, y, z) - camera.position();
+                            let d = delta.dot(camera.forward());
+                            assert!(d > 0.0);
+                            assert!(
+                                delta.dot(camera.right()).abs() / (d * camera.fov * aspect) < 1.0
+                            );
+                            assert!(delta.dot(camera.up()).abs() / (d * camera.fov) < 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn default_camera_looks_at_center() {

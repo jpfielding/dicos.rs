@@ -56,6 +56,7 @@ pub struct App {
     dragging: bool,
     last_mouse_pos: Option<(f32, f32)>,
     shift_down: bool,
+    pointer_pos: egui::Pos2,
 }
 
 impl App {
@@ -66,6 +67,7 @@ impl App {
         surface_format: wgpu::TextureFormat,
     ) -> Self {
         let egui_ctx = egui::Context::default();
+        crate::ui::theme::apply(&egui_ctx);
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -98,19 +100,42 @@ impl App {
             dragging: false,
             last_mouse_pos: None,
             shift_down: false,
+            pointer_pos: egui::Pos2::ZERO,
         }
     }
 
     pub fn handle_event(&mut self, window: &winit::window::Window, event: &WindowEvent) -> bool {
+        // Releases and modifier changes must be observed even over an egui panel.
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer_pos = egui::pos2(position.x as f32, position.y as f32)
+                    / self.egui_ctx.pixels_per_point();
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Released,
+                button: winit::event::MouseButton::Left,
+                ..
+            }
+            | WindowEvent::Focused(false) => {
+                self.dragging = false;
+                self.last_mouse_pos = None;
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.shift_down = modifiers.state().shift_key();
+            }
+            _ => {}
+        }
         let response = self.egui_state.on_window_event(window, event);
-        if response.consumed {
+        if response.consumed || self.ui.slice_expanded {
             return true;
         }
 
         let needs_repaint = match event {
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == winit::event::MouseButton::Left {
-                    self.dragging = *state == winit::event::ElementState::Pressed;
+                    self.dragging = *state == winit::event::ElementState::Pressed
+                        && self.ui.viewport.contains(self.pointer_pos)
+                        && self.renderer.is_ready();
                     if !self.dragging {
                         self.last_mouse_pos = None;
                     }
@@ -139,7 +164,9 @@ impl App {
                 }
                 self.dragging
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. }
+                if self.ui.viewport.contains(self.pointer_pos) && self.renderer.is_ready() =>
+            {
                 let scroll = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => *y,
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.01,
@@ -194,6 +221,22 @@ impl App {
             crate::ui::draw_ui(ctx, ui);
         });
 
+        if self.ui.fit_camera {
+            if let Some(layer) = self
+                .ui
+                .library
+                .active_3d_index
+                .and_then(|i| self.ui.library.volumes.get(i))
+            {
+                let scale = camera_target(&layer.volume, [1.0, 1.0, 1.0]).z;
+                self.ui.camera.fit_bounds(
+                    glam::Vec3::ZERO,
+                    glam::Vec3::new(1.0, 1.0, scale),
+                    self.ui.viewport.width() / self.ui.viewport.height().max(1.0),
+                );
+            }
+            self.ui.fit_camera = false;
+        }
         // Process UI actions.
         if let Some(path) = self.ui.actions.file_to_load.take() {
             self.request_load(path);
@@ -287,7 +330,28 @@ impl App {
             surface_view,
             RenderParams {
                 camera: &self.ui.camera,
-                viewport: [width, height],
+                viewport: [
+                    self.ui.viewport.width().max(1.0) as u32,
+                    self.ui.viewport.height().max(1.0) as u32,
+                ],
+                viewport_rect: Some([
+                    self.ui.viewport.left() * full_output.pixels_per_point,
+                    self.ui.viewport.top() * full_output.pixels_per_point,
+                    self.ui.viewport.width().max(1.0) * full_output.pixels_per_point,
+                    self.ui.viewport.height().max(1.0) * full_output.pixels_per_point,
+                ]),
+                clip_plane: if self.ui.cutaway
+                    && !self.ui.slice_view.composite
+                    && self.ui.library.active_3d_index == Some(self.ui.slice_view.volume_index)
+                {
+                    self.ui
+                        .library
+                        .volumes
+                        .get(self.ui.slice_view.volume_index)
+                        .map(|layer| self.ui.slice_view.clip_plane(&layer.volume))
+                } else {
+                    None
+                },
                 threats: active_3d_threats,
                 show_threats: self.ui.library.show_threats,
                 settings: &self.ui.settings,
@@ -347,6 +411,23 @@ impl App {
     /// The heavy CPU pipeline (parse, decode, threat merge, GPU packing,
     /// center-of-mass) runs on a worker thread; [`App::render`] installs the
     /// result when it completes. See [`crate::loader`].
+    pub fn enable_cutaway(&mut self) {
+        self.ui.cutaway = true;
+    }
+
+    pub fn focus_volume(&mut self) {
+        self.ui.focus_volume = true;
+        self.ui.fit_camera = true;
+    }
+
+    pub fn expand_slice_view(&mut self) {
+        self.ui.slice_expanded = true;
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loader.loading().is_some()
+    }
+
     pub fn load_path(&mut self, path: &std::path::Path) {
         self.request_load(path.to_path_buf());
     }
@@ -398,8 +479,8 @@ impl App {
             return;
         }
 
-        // Initialize the 3D camera view to coronal on each new dataset load.
-        self.ui.camera.set_coronal();
+        // Start with a spatial view; orthogonal views remain one click away.
+        self.ui.camera = Camera::default();
 
         // Upload first volume to 3D renderer.
         match first_pack {
@@ -441,7 +522,8 @@ impl App {
         if let Some(layer) = self.ui.library.volumes.get(idx) {
             let vol = &layer.volume;
             let com = vol.center_of_mass();
-            self.ui.camera.target = glam::Vec3::from(com);
+            self.ui.camera.target = camera_target(vol, com);
+            self.ui.volume_extent = camera_target(vol, [1.0, 1.0, 1.0]);
 
             self.renderer.upload_volume(&self.device, &self.queue, vol);
 
@@ -450,6 +532,7 @@ impl App {
                 .upload_transfer_function(&self.device, &self.queue, &tf);
 
             self.ui.library.active_3d_index = Some(idx);
+            self.ui.fit_camera = true;
         }
     }
 
@@ -459,7 +542,8 @@ impl App {
     fn upload_volume_to_gpu_precomputed(&mut self, idx: usize, packed: &[u16], com: [f32; 3]) {
         if let Some(layer) = self.ui.library.volumes.get(idx) {
             let vol = &layer.volume;
-            self.ui.camera.target = glam::Vec3::from(com);
+            self.ui.camera.target = camera_target(vol, com);
+            self.ui.volume_extent = camera_target(vol, [1.0, 1.0, 1.0]);
 
             self.renderer
                 .upload_volume_packed(&self.device, &self.queue, vol, packed);
@@ -469,6 +553,7 @@ impl App {
                 .upload_transfer_function(&self.device, &self.queue, &tf);
 
             self.ui.library.active_3d_index = Some(idx);
+            self.ui.fit_camera = true;
         }
     }
 
@@ -532,4 +617,16 @@ pub(crate) fn merge_unique_threats(dst: &mut Vec<ThreatBox>, src: Vec<ThreatBox>
         threat.color = volume::threat_color_for_index(i);
     }
     added
+}
+
+/// The renderer stretches normalized Z by the volume's physical aspect ratio.
+/// Orbit about the same space so non-cubic studies stay centered.
+fn camera_target(vol: &Volume, com: [f32; 3]) -> glam::Vec3 {
+    let xy = (vol.dim_x as f64 * vol.voxel_spacing[0]).max(vol.dim_y as f64 * vol.voxel_spacing[1]);
+    let scale = if xy > 0.0 {
+        (vol.dim_z as f64 * vol.voxel_spacing[2] / xy).clamp(0.1, 10.0) as f32
+    } else {
+        1.0
+    };
+    glam::Vec3::new(com[0], com[1], com[2] * scale)
 }

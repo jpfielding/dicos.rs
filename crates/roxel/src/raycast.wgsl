@@ -22,6 +22,8 @@ struct Uniforms {
     ambient_intensity: f32,
     diffuse_intensity: f32,
     specular_intensity: f32,
+    clip_plane: vec4<f32>,
+    depth_cue: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -78,7 +80,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Intersect with volume bounding box.
     let t_range = intersect_box(u.cam_pos, ray_dir);
     if t_range.x >= t_range.y {
-        return vec4<f32>(0.84, 0.84, 0.84, 1.0); // Background color.
+        return vec4<f32>(0.063, 0.086, 0.114, 1.0); // Background color.
     }
 
     // Light directions.
@@ -99,6 +101,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Normalize to [0,1] texture coordinates.
         let tex_coord = vec3<f32>(pos.x, pos.y, pos.z / u.scale_z);
+
+        if dot(tex_coord, u.clip_plane.xyz) < u.clip_plane.w {
+            t += u.step_size;
+            continue;
+        }
 
         // Sample volume.
         let sample = textureSampleLevel(volume_tex, volume_sampler, tex_coord, 0.0);
@@ -135,7 +142,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         );
 
         let grad_mag = length(gradient);
-        if grad_mag > 0.01 {
+        // RGBA16 gradients retain meaningful surface normals far below 0.01.
+        if grad_mag > 0.0001 {
             let normal = gradient / grad_mag;
 
             // Phong lighting.
@@ -162,6 +170,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             color = color * u.ambient_intensity;
         }
 
+        // Depth cue separates overlapping surfaces without changing voxel values
+        // or opacity. The lighting control can disable this attenuation entirely.
+        let ray_depth = clamp((t - t_range.x) / max(t_range.y - t_range.x, 0.0001), 0.0, 1.0);
+        color *= 1.0 - u.depth_cue * ray_depth;
+
         // Front-to-back blending.
         let src_alpha = alpha * (1.0 - accum.a);
         accum = vec4<f32>(
@@ -173,7 +186,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Blend with background.
-    let bg = vec3<f32>(0.84, 0.84, 0.84);
+    let bg = vec3<f32>(0.063, 0.086, 0.114);
     let final_color = accum.rgb + bg * (1.0 - accum.a);
     return vec4<f32>(final_color, 1.0);
 }

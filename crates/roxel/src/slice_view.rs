@@ -71,7 +71,7 @@ impl Default for SliceView {
             max_slices: 1,
             window_center: 32768.0,
             window_width: 65536.0,
-            composite: true,
+            composite: false,
             volume_index: 0,
             alpha_scale: 0.5,
             transfer_func: None,
@@ -81,6 +81,51 @@ impl Default for SliceView {
 }
 
 impl SliceView {
+    /// Keep the half-volume at or after the selected voxel-center plane.
+    pub fn clip_plane(&self, vol: &Volume, reverse: bool) -> [f32; 4] {
+        let depth = Self::depth_for_orientation(vol, self.orientation).max(1);
+        let t = (self.slice_index.min(depth - 1) as f32 + 0.5) / depth as f32;
+        let plane = match self.orientation {
+            Orientation::Axial => [0.0, 0.0, 1.0, t],
+            Orientation::Coronal => [0.0, 1.0, 0.0, t],
+            Orientation::Sagittal => [1.0, 0.0, 0.0, t],
+        };
+        if reverse {
+            plane.map(|value| -value)
+        } else {
+            plane
+        }
+    }
+
+    /// Physical image dimensions for aspect-preserving display.
+    pub fn physical_slice_size(&self, vol: &Volume) -> egui::Vec2 {
+        let spacing = vol.voxel_spacing.map(|s| {
+            if s.is_finite() && s > 0.0 {
+                s as f32
+            } else {
+                1.0
+            }
+        });
+        let (w, h) = Self::slice_dims(vol, self.orientation);
+        let (sx, sy) = match self.orientation {
+            Orientation::Axial => (spacing[0], spacing[1]),
+            Orientation::Coronal => (spacing[0], spacing[2]),
+            Orientation::Sagittal => (spacing[1], spacing[2]),
+        };
+        egui::vec2(w as f32 * sx, h as f32 * sy)
+    }
+
+    /// Normalized corners of the selected voxel-center plane, in texture space.
+    pub fn plane_corners(&self, vol: &Volume) -> [[f32; 3]; 4] {
+        let depth = Self::depth_for_orientation(vol, self.orientation).max(1);
+        let t = (self.slice_index.min(depth - 1) as f32 + 0.5) / depth as f32;
+        match self.orientation {
+            Orientation::Axial => [[0.0, 0.0, t], [1.0, 0.0, t], [1.0, 1.0, t], [0.0, 1.0, t]],
+            Orientation::Coronal => [[0.0, t, 0.0], [1.0, t, 0.0], [1.0, t, 1.0], [0.0, t, 1.0]],
+            Orientation::Sagittal => [[t, 0.0, 0.0], [t, 1.0, 0.0], [t, 1.0, 1.0], [t, 0.0, 1.0]],
+        }
+    }
+
     /// Update max_slices based on the loaded volume and current orientation.
     pub fn update_for_volume(&mut self, vol: &Volume) {
         self.max_slices = Self::depth_for_orientation(vol, self.orientation);
@@ -120,7 +165,7 @@ impl SliceView {
 
     /// Render a single slice as a grayscale `egui::ColorImage`.
     ///
-    /// Applies window/level to map raw uint16 voxel values to 0-255 grayscale.
+    /// Applies rescale intercept and window/level to map uint16 voxel values to 0-255 grayscale.
     pub fn render_slice(&self, vol: &Volume) -> egui::ColorImage {
         let (w, h) = Self::slice_dims(vol, self.orientation);
         if w == 0 || h == 0 {
@@ -139,7 +184,8 @@ impl SliceView {
         for v in 0..h {
             for u in 0..w {
                 let raw = Self::sample(vol, self.orientation, u, v, self.slice_index) as f32;
-                let gray = ((raw - low) * inv_width).clamp(0.0, 255.0) as u8;
+                let gray = ((raw + vol.rescale_intercept as f32 - low) * inv_width)
+                    .clamp(0.0, 255.0) as u8;
                 pixels.push(egui::Color32::from_gray(gray));
             }
         }
@@ -180,7 +226,8 @@ impl SliceView {
                 break;
             }
 
-            let density = Self::sample(vol, orientation, u, v, s) as f32;
+            let density =
+                Self::sample(vol, orientation, u, v, s) as f32 + vol.rescale_intercept as f32;
 
             // Window/level normalization.
             if density <= w_min {
@@ -364,6 +411,69 @@ impl SliceView {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rescale_intercept_matches_slice_and_projection_window() {
+        let mut vol = test_volume();
+        vol.dim_x = 1;
+        vol.dim_y = 1;
+        vol.dim_z = 1;
+        vol.data = vec![1524];
+        vol.rescale_intercept = -1024.0;
+        let view = SliceView {
+            window_center: 500.0,
+            window_width: 1000.0,
+            ..Default::default()
+        };
+        assert_eq!(view.render_slice(&vol).pixels[0].r(), 127);
+        assert_eq!(view.render_composite(&vol).pixels[0].r(), 127);
+    }
+
+    #[test]
+    fn reverse_cutaway_keeps_opposite_half_and_physical_slice_preserves_aspect() {
+        let mut vol = test_volume();
+        vol.dim_y = 2;
+        vol.voxel_spacing = [1.0, 2.0, 2.0];
+        for orientation in [
+            Orientation::Axial,
+            Orientation::Coronal,
+            Orientation::Sagittal,
+        ] {
+            let view = SliceView {
+                orientation,
+                slice_index: 0,
+                ..Default::default()
+            };
+            assert_eq!(view.physical_slice_size(&vol), egui::vec2(4.0, 4.0));
+            let plane = view.clip_plane(&vol, false);
+            assert_eq!(view.clip_plane(&vol, true), plane.map(|v| -v));
+            let at_origin = -plane[3];
+            let at_far = plane[0] + plane[1] + plane[2] - plane[3];
+            assert!(at_origin < 0.0 && at_far > 0.0);
+        }
+    }
+
+    #[test]
+    fn locator_plane_uses_the_selected_voxel_center() {
+        let vol = test_volume();
+        for (orientation, axis, depth) in [
+            (Orientation::Axial, 2, vol.dim_z),
+            (Orientation::Coronal, 1, vol.dim_y),
+            (Orientation::Sagittal, 0, vol.dim_x),
+        ] {
+            for index in [0, depth - 1] {
+                let view = SliceView {
+                    orientation,
+                    slice_index: index,
+                    ..Default::default()
+                };
+                for corner in view.plane_corners(&vol) {
+                    assert!((corner[axis] - (index as f32 + 0.5) / depth as f32).abs() < 1e-6);
+                    assert!(corner.iter().all(|v| (0.0..=1.0).contains(v)));
+                }
+            }
+        }
+    }
+
     fn test_volume() -> Volume {
         // 4x3x2 volume with predictable values.
         let dim_x = 4;
@@ -472,7 +582,7 @@ mod tests {
             max_slices: 2,
             window_center: 1000.0,
             window_width: 2000.0,
-            composite: true,
+            composite: false,
             volume_index: 0,
             ..SliceView::default()
         };
@@ -491,7 +601,7 @@ mod tests {
             // Wide window so all values map linearly.
             window_center: 1000.0,
             window_width: 3000.0,
-            composite: true,
+            composite: false,
             volume_index: 0,
             ..SliceView::default()
         };
@@ -586,7 +696,7 @@ mod tests {
                 max_slices: 1,
                 window_center: 20000.0,
                 window_width: 40000.0,
-                composite: true,
+                composite: false,
                 volume_index: 0,
                 alpha_scale: 0.5,
                 transfer_func: Some(tf.data.clone()),

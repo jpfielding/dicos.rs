@@ -24,6 +24,15 @@ use std::time::Instant;
 /// UI state that can be passed into egui closures without borrowing the whole App.
 pub(crate) struct UiState {
     pub(crate) camera: Camera,
+    pub(crate) viewport: egui::Rect,
+    pub(crate) fit_camera: bool,
+    pub(crate) volume_extent: glam::Vec3,
+    pub(crate) show_slice_locator: bool,
+    pub(crate) cutaway: bool,
+    pub(crate) reverse_cutaway: bool,
+    pub(crate) slice_expanded: bool,
+    pub(crate) expanded_zoom: f32,
+    pub(crate) focus_volume: bool,
 
     /// Loaded volume layers and threat selection state.
     pub(crate) library: VolumeLibrary,
@@ -49,10 +58,27 @@ pub(crate) struct UiState {
 }
 
 impl UiState {
+    /// Keep cached composite pixels in sync with shared opacity controls.
+    pub(crate) fn sync_composite_opacity(&mut self) {
+        if self.slice_view.alpha_scale != self.settings.global_opacity {
+            self.slice_view.alpha_scale = self.settings.global_opacity;
+            self.slice_dirty |= self.slice_view.composite;
+        }
+    }
+
     /// Build the initial UI state around a freshly configured camera.
     pub(crate) fn new(camera: Camera) -> Self {
         Self {
             camera,
+            viewport: egui::Rect::NOTHING,
+            fit_camera: false,
+            volume_extent: glam::Vec3::ONE,
+            show_slice_locator: true,
+            cutaway: false,
+            reverse_cutaway: false,
+            slice_expanded: false,
+            expanded_zoom: 100.0,
+            focus_volume: false,
             library: VolumeLibrary::default(),
             transfer: TransferState::default(),
             settings: RenderSettings::default(),
@@ -102,7 +128,7 @@ pub(crate) struct TransferState {
 impl Default for TransferState {
     fn default() -> Self {
         Self {
-            preset: TransferPreset::Default,
+            preset: TransferPreset::Monochrome,
             bands: transfer::default_bands(),
             bands_changed: false,
             bands_debounce_deadline: None,
@@ -123,6 +149,8 @@ pub struct RenderSettings {
     pub ambient: f32,
     pub diffuse: f32,
     pub specular: f32,
+    /// Attenuate distant samples to clarify overlapping surfaces.
+    pub depth_cue: f32,
     /// Global opacity / alpha scale applied to both the 3D and 2D composites.
     pub global_opacity: f32,
 }
@@ -133,11 +161,12 @@ impl Default for RenderSettings {
             window_center: 32768.0,
             window_width: 65536.0,
             density_threshold: 0.0,
-            quality: Quality::Medium,
-            ambient: 0.3,
-            diffuse: 0.6,
+            quality: Quality::High,
+            ambient: 0.65,
+            diffuse: 0.8,
             specular: 0.3,
-            global_opacity: 0.5,
+            depth_cue: 0.35,
+            global_opacity: 0.25,
         }
     }
 }
@@ -149,4 +178,27 @@ pub(crate) struct UiActions {
     /// Request to upload a different volume to the 3D renderer.
     pub(crate) upload_3d_index: Option<usize>,
     pub(crate) preset_changed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opacity_changes_invalidate_composites_but_not_single_slices() {
+        let mut state = UiState::new(Camera::default());
+        state.slice_dirty = false;
+        state.settings.global_opacity = 0.4;
+        state.sync_composite_opacity();
+        assert!(!state.slice_dirty);
+        assert_eq!(state.slice_view.alpha_scale, 0.4);
+        state.slice_view.composite = true;
+        state.settings.global_opacity = 0.7;
+        state.sync_composite_opacity();
+        assert!(state.slice_dirty);
+        assert_eq!(state.slice_view.alpha_scale, 0.7);
+        state.slice_dirty = false;
+        state.sync_composite_opacity();
+        assert!(!state.slice_dirty);
+    }
 }

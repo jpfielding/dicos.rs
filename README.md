@@ -63,7 +63,9 @@ inside the `dicos` crate behind the `cli` feature flag.
 A three-panel desktop application for visualizing 3D CT volumes and 2D slices
 from DICOS files. Uses `wgpu` for GPU ray-casting and `egui` for the UI.
 
-![roxel 3D Rendering](https://github.com/jpfielding/dicos.rs/releases/download/v2.0.0/roxel-lrg.gif)
+![Roxel inspection workspace with a linked 3D volume and 2D slice](docs/images/roxel-workspace.png)
+
+[Inspection views and council review](docs/reviews/roxel-ui-review.md)
 
 ```text
 +------------+------------------------+------------------------+
@@ -190,15 +192,19 @@ cargo run --bin dicosctl -p dicos --features cli -- dump --compact scan.dcs
 ### roxel
 
 ```sh
-# Launch with an empty viewport, then use File > Open to load
+# Launch with an empty viewport, then use Open file or Open folder
 cargo run -p roxel --release
 
 # Load a single DICOS file directly
 cargo run -p roxel --release -- scan.dcs
 
-# Load a directory of single-frame .dcs files as one volume
+# Load .dcs/.dcm files from a directory as separate volume layers
 cargo run -p roxel --release -- /path/to/slices/
 ```
+
+The dark inspection workspace provides automatic framing, linked slice-plane
+location, focused 3D inspection, an expanded slice inspector, and optional
+cutaway clipping. Advanced lighting and material controls open on demand.
 
 **Mouse controls:**
 
@@ -206,14 +212,16 @@ cargo run -p roxel --release -- /path/to/slices/
 |--------|--------|
 | Left-drag in 3D view | Rotate volume (arcball) |
 | Scroll wheel | Zoom in/out |
+| Shift + left-drag | Pan the 3D volume |
+| Escape | Return from focused or expanded inspection |
 
 **Transfer function presets:**
 
 | Preset | Description |
 |--------|-------------|
-| Default | Five-band material: Air (transparent), Organic (orange), Inorganic (green), Metal (blue), Dense (dark blue) |
+| Materials | Five-band material: Air (transparent), Organic (orange), Inorganic (green), Metal (blue), Dense (dark blue) |
 | Threat | Red monochrome for threat highlighting |
-| Mono | Grayscale density mapping |
+| Grayscale (startup) | Monotonic grayscale with lifted midtones |
 
 See [crates/roxel/README.md](crates/roxel/README.md) for full documentation
 including architecture, rendering pipeline, and GPU requirements.

@@ -5,17 +5,26 @@ use crate::state::UiState;
 /// Left sidebar: metadata, layers, camera presets.
 pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
     egui::SidePanel::left("sidebar")
-        .default_width(220.0)
+        .default_width(232.0)
+        .min_width(220.0)
+        .max_width(280.0)
+        .frame(super::theme::frame())
         .show(ctx, |panel| {
+            panel.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             egui::ScrollArea::vertical().show(panel, |panel| {
-                panel.heading("roxel");
-                panel.separator();
+                super::theme::section(panel, "Study library");
 
                 // File section. Open buttons are disabled while a background
                 // load is in flight (only one load may run at a time).
                 let is_loading = state.loading_file.is_some();
                 panel.add_enabled_ui(!is_loading, |panel| {
-                    if panel.button("Open file...").clicked() {
+                    if panel
+                        .add_sized(
+                            [panel.available_width(), 34.0],
+                            egui::Button::new("Open file…"),
+                        )
+                        .clicked()
+                    {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("DICOS", &["dcs", "dcm"])
                             .pick_file()
@@ -23,7 +32,13 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                             state.actions.file_to_load = Some(path);
                         }
                     }
-                    if panel.button("Open folder...").clicked() {
+                    if panel
+                        .add_sized(
+                            [panel.available_width(), 34.0],
+                            egui::Button::new("Open folder…"),
+                        )
+                        .clicked()
+                    {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             state.actions.file_to_load = Some(path);
                         }
@@ -38,35 +53,73 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                 }
 
                 if let Some(err) = &state.load_error {
-                    panel.colored_label(egui::Color32::RED, err);
+                    panel.colored_label(egui::Color32::from_rgb(246, 151, 141), err);
                 }
 
                 if let Some(path) = &state.library.loaded_path {
-                    panel.label(format!(
-                        "{}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
+                    panel
+                        .add(
+                            egui::Label::new(
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(path.display().to_string());
                 }
 
                 panel.separator();
 
                 // Metadata section.
                 if !state.library.volumes.is_empty() {
-                    panel.heading("Metadata");
-                    if let Some(layer) = state.library.volumes.first() {
+                    super::theme::section(panel, "Study details");
+                    panel.spacing_mut().item_spacing.y = 6.0;
+                    if let Some(layer) = state
+                        .library
+                        .volumes
+                        .get(state.library.active_3d_index.unwrap_or(0))
+                    {
                         let vol = &layer.volume;
                         panel.label(format!(
-                            "{}x{}x{} ({})",
+                            "{} × {} × {}  ·  {}",
                             vol.dim_x, vol.dim_y, vol.dim_z, vol.modality
                         ));
                     }
-                    panel.label(format!("{} volume(s)", state.library.volumes.len()));
-                    panel.separator();
+                    if let Some(layer) = state
+                        .library
+                        .volumes
+                        .get(state.library.active_3d_index.unwrap_or(0))
+                    {
+                        let vol = &layer.volume;
+                        panel.label(
+                            egui::RichText::new(format!(
+                                "{:.0} × {:.0} × {:.0} mm",
+                                vol.dim_x as f64 * vol.voxel_spacing[0],
+                                vol.dim_y as f64 * vol.voxel_spacing[1],
+                                vol.dim_z as f64 * vol.voxel_spacing[2]
+                            ))
+                            .small()
+                            .color(super::theme::MUTED),
+                        );
+                    }
+                    panel.label(
+                        egui::RichText::new(format!(
+                            "{} volume{}",
+                            state.library.volumes.len(),
+                            if state.library.volumes.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ))
+                        .color(super::theme::MUTED),
+                    );
+                    panel.spacing_mut().item_spacing.y = 10.0;
+                    panel.add_space(6.0);
                 }
 
                 // Layers section -- selecting a layer uploads it to both 3D and 2D.
                 if state.library.volumes.len() > 1 {
-                    panel.heading("Layers");
+                    super::theme::section(panel, "Volumes");
                     let active = state.library.active_3d_index.unwrap_or(0);
                     for i in 0..state.library.volumes.len() {
                         let is_active = i == active;
@@ -93,10 +146,14 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         .slice_view
                         .volume_index
                         .min(state.library.volumes.len() - 1);
-                    panel.heading("Threats");
-                    if panel
-                        .checkbox(&mut state.library.show_threats, "Show threat boxes")
-                        .changed()
+                    super::theme::section(panel, "Detections");
+                    if !state.library.volumes[threat_vol_idx]
+                        .volume
+                        .threats
+                        .is_empty()
+                        && panel
+                            .checkbox(&mut state.library.show_threats, "Show threat boxes")
+                            .changed()
                     {
                         state.slice_dirty = true;
                     }
@@ -106,8 +163,11 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         .threats
                         .is_empty()
                     {
-                        panel.label("No threats in selected volume");
-                        panel.separator();
+                        panel.label(
+                            egui::RichText::new("No detection annotations")
+                                .color(super::theme::MUTED),
+                        );
+                        panel.add_space(6.0);
                     } else {
                         let mut any_changed = false;
                         let mut new_selected = state.library.selected_threat;
@@ -180,26 +240,76 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                     }
                 }
 
+                if state.library.volumes.is_empty() {
+                    return;
+                }
                 // Camera presets.
-                panel.heading("View");
-                panel.horizontal(|h| {
-                    if h.button("Axial").clicked() {
-                        state.camera.set_axial();
-                    }
-                    if h.button("Coronal").clicked() {
-                        state.camera.set_coronal();
-                    }
-                    if h.button("Sagittal").clicked() {
-                        state.camera.set_sagittal();
-                    }
-                });
-
+                super::theme::section(panel, "Camera");
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(34, 46, 59))
+                    .inner_margin(3)
+                    .corner_radius(4)
+                    .show(panel, |panel| {
+                        panel.horizontal(|h| {
+                            h.spacing_mut().button_padding.x = 6.0;
+                            h.spacing_mut().item_spacing.x = 4.0;
+                            if h.selectable_label(
+                                state.camera.azimuth.abs() < 0.001
+                                    && state.camera.elevation.abs() < 0.001,
+                                "Axial",
+                            )
+                            .clicked()
+                            {
+                                state.camera.set_axial();
+                                state.fit_camera = true;
+                            }
+                            if h.selectable_label(
+                                state.camera.azimuth.abs() < 0.001
+                                    && (state.camera.elevation + std::f32::consts::FRAC_PI_2
+                                        - 0.01)
+                                        .abs()
+                                        < 0.001,
+                                "Coronal",
+                            )
+                            .clicked()
+                            {
+                                state.camera.set_coronal();
+                                state.fit_camera = true;
+                            }
+                            if h.selectable_label(
+                                (state.camera.azimuth - std::f32::consts::FRAC_PI_2).abs() < 0.001
+                                    && state.camera.elevation.abs() < 0.001,
+                                "Sagittal",
+                            )
+                            .clicked()
+                            {
+                                state.camera.set_sagittal();
+                                state.fit_camera = true;
+                            }
+                        });
+                    });
+                panel.add_enabled(
+                    !state.slice_view.composite
+                        && state.library.active_3d_index == Some(state.slice_view.volume_index),
+                    egui::Checkbox::new(&mut state.show_slice_locator, "Locate slice in 3D"),
+                );
+                panel
+                    .add_enabled(
+                        !state.slice_view.composite
+                            && state.library.active_3d_index == Some(state.slice_view.volume_index),
+                        egui::Checkbox::new(&mut state.cutaway, "Cutaway at slice"),
+                    )
+                    .on_hover_text("Hide voxels before the selected slice to reveal the interior");
+                if state.cutaway {
+                    panel.checkbox(&mut state.reverse_cutaway, "Reverse cutaway");
+                }
                 panel.separator();
-                panel.heading("Interaction Key");
-                panel.label("LMB drag: Orbit 3D");
-                panel.label("Shift + LMB drag: Pan 3D");
-                panel.label("Mouse wheel: Zoom 3D");
-                panel.label("Axial/Coronal/Sagittal: Snap view");
+                panel.collapsing("Navigation help", |panel| {
+                    panel.label("LMB drag: Orbit 3D");
+                    panel.label("Shift + LMB drag: Pan 3D");
+                    panel.label("Mouse wheel: Zoom 3D");
+                    panel.label("Axial/Coronal/Sagittal: Snap view");
+                });
             });
         });
 }

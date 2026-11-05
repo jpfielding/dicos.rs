@@ -4,7 +4,7 @@
 //! and per-frame rendering. The fragment shader performs ray marching through
 //! a 3D `RGBA16Unorm` texture with transfer function lookup and Phong lighting.
 
-use crate::camera::Camera;
+use crate::camera::{physical_extent, Camera};
 use crate::transfer::{TransferFunction, TRANSFER_SIZE};
 use crate::volume::{ThreatBox, Volume};
 use bytemuck::{Pod, Zeroable};
@@ -23,7 +23,7 @@ struct Uniforms {
     cam_right: [f32; 3],
     step_size: f32,
     cam_up: [f32; 3],
-    scale_z: f32,
+    _camera_padding: f32,
     window_min: f32,
     window_range: f32,
     alpha_scale: f32,
@@ -32,6 +32,11 @@ struct Uniforms {
     ambient_intensity: f32,
     diffuse_intensity: f32,
     specular_intensity: f32,
+    clip_plane: [f32; 4],
+    depth_cue: f32,
+    _padding: [f32; 3],
+    volume_extent: [f32; 3],
+    _extent_padding: f32,
 }
 
 /// Rendering quality preset.
@@ -46,6 +51,8 @@ pub enum Quality {
 pub struct RenderParams<'a> {
     pub camera: &'a Camera,
     pub viewport: [u32; 2],
+    pub viewport_rect: Option<[f32; 4]>,
+    pub clip_plane: Option<[f32; 4]>,
     pub threats: &'a [ThreatBox],
     pub show_threats: bool,
     pub settings: &'a crate::state::RenderSettings,
@@ -66,14 +73,14 @@ pub struct VolumeRenderer {
     transfer_sampler: wgpu::Sampler,
 
     // Volume-derived rendering parameter (not part of `RenderSettings` — set
-    // from DICOS rescale slope/intercept metadata in `upload_volume`).
+    // from DICOS rescale intercept metadata in `upload_volume`).
     pub rescale_intercept: f32,
 
-    // Volume dimensions for scale_z computation.
+    // Volume dimensions and physical world extent.
     dim_x: u32,
     dim_y: u32,
     dim_z: u32,
-    voxel_spacing: [f64; 3],
+    volume_extent: Vec3,
 }
 
 #[repr(C)]
@@ -281,20 +288,7 @@ impl VolumeRenderer {
             dim_x: 1,
             dim_y: 1,
             dim_z: 1,
-            voxel_spacing: [1.0, 1.0, 1.0],
-        }
-    }
-
-    fn compute_scale_z(&self) -> f32 {
-        // Compute Z scale from physical dimensions (voxel count * spacing).
-        let phys_x = self.dim_x as f64 * self.voxel_spacing[0];
-        let phys_y = self.dim_y as f64 * self.voxel_spacing[1];
-        let phys_z = self.dim_z as f64 * self.voxel_spacing[2];
-        let phys_xy = phys_x.max(phys_y);
-        if phys_xy > 0.0 {
-            (phys_z / phys_xy).clamp(0.1, 10.0) as f32
-        } else {
-            1.0
+            volume_extent: Vec3::ONE,
         }
     }
 
@@ -303,12 +297,12 @@ impl VolumeRenderer {
         point: Vec3,
         camera: &Camera,
         aspect: f32,
-        scale_z: f32,
+        volume_extent: Vec3,
     ) -> Option<[f32; 2]> {
         // Match the ray shader's camera model exactly:
         // ray_dir = normalize(fwd + right * ux * fov * aspect + up * uy * fov)
         // and note that shader `uy` maps to NDC with inverted Y.
-        let world_point = Vec3::new(point.x, point.y, point.z * scale_z);
+        let world_point = point * volume_extent;
         let cam_pos = camera.position();
         let to_point = world_point - cam_pos;
 
@@ -342,7 +336,7 @@ impl VolumeRenderer {
         threats: &[ThreatBox],
         camera: &Camera,
         aspect: f32,
-        scale_z: f32,
+        volume_extent: Vec3,
     ) -> Vec<LineVertex> {
         if threats.is_empty() || self.dim_x == 0 || self.dim_y == 0 || self.dim_z == 0 {
             return Vec::new();
@@ -399,11 +393,11 @@ impl VolumeRenderer {
             ];
 
             for (a, b) in EDGES {
-                let Some(pa) = self.project_threat_point(corners[a], camera, aspect, scale_z)
+                let Some(pa) = self.project_threat_point(corners[a], camera, aspect, volume_extent)
                 else {
                     continue;
                 };
-                let Some(pb) = self.project_threat_point(corners[b], camera, aspect, scale_z)
+                let Some(pb) = self.project_threat_point(corners[b], camera, aspect, volume_extent)
                 else {
                     continue;
                 };
@@ -453,7 +447,10 @@ impl VolumeRenderer {
         self.dim_z = new_dim_z;
 
         self.rescale_intercept = volume.rescale_intercept as f32;
-        self.voxel_spacing = volume.voxel_spacing;
+        self.volume_extent = physical_extent(
+            [volume.dim_x, volume.dim_y, volume.dim_z],
+            volume.voxel_spacing,
+        );
 
         let size = wgpu::Extent3d {
             width: self.dim_x,
@@ -628,8 +625,13 @@ impl VolumeRenderer {
         let [width, height] = params.viewport;
         let settings = params.settings;
 
-        let max_dim = self.dim_x.max(self.dim_y).max(self.dim_z) as f32;
-        let base_voxel_size = if max_dim > 0.0 { 1.0 / max_dim } else { 0.01 };
+        let voxel_size = self.volume_extent
+            / Vec3::new(
+                self.dim_x.max(1) as f32,
+                self.dim_y.max(1) as f32,
+                self.dim_z.max(1) as f32,
+            );
+        let base_voxel_size = voxel_size.min_element();
         let zoom_factor = 1.0
             / camera
                 .distance
@@ -642,7 +644,7 @@ impl VolumeRenderer {
         }
         .clamp(0.0005, 0.02);
 
-        let scale_z = self.compute_scale_z();
+        let volume_extent = self.volume_extent;
 
         let window_min = settings.window_center - settings.window_width * 0.5;
         let aspect = if height > 0 {
@@ -664,7 +666,7 @@ impl VolumeRenderer {
             cam_right: right.into(),
             step_size,
             cam_up: up.into(),
-            scale_z,
+            _camera_padding: 0.0,
             window_min,
             window_range: settings.window_width,
             alpha_scale: settings.global_opacity,
@@ -673,12 +675,17 @@ impl VolumeRenderer {
             ambient_intensity: settings.ambient,
             diffuse_intensity: settings.diffuse,
             specular_intensity: settings.specular,
+            clip_plane: params.clip_plane.unwrap_or([0.0, 0.0, 0.0, -1.0]),
+            depth_cue: settings.depth_cue,
+            _padding: [0.0; 3],
+            volume_extent: volume_extent.into(),
+            _extent_padding: 0.0,
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         let line_vertices = if params.show_threats {
-            self.build_threat_line_vertices(params.threats, camera, aspect, scale_z)
+            self.build_threat_line_vertices(params.threats, camera, aspect, volume_extent)
         } else {
             Vec::new()
         };
@@ -699,9 +706,9 @@ impl VolumeRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.84,
-                            g: 0.84,
-                            b: 0.84,
+                            r: 0.063,
+                            g: 0.086,
+                            b: 0.114,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -713,6 +720,9 @@ impl VolumeRenderer {
                 occlusion_query_set: None,
             });
 
+            if let Some([x, y, w, h]) = params.viewport_rect {
+                rpass.set_viewport(x, y, w, h, 0.0, 1.0);
+            }
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, bind_group, &[]);
             rpass.draw(0..3, 0..1); // Full-screen triangle.
@@ -728,5 +738,17 @@ impl VolumeRenderer {
     /// Returns true if a volume has been uploaded and the renderer is ready.
     pub fn is_ready(&self) -> bool {
         self.bind_group.is_some()
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn physical_extent_uniform_matches_shader_layout() {
+        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
+        assert_eq!(std::mem::offset_of!(Uniforms, volume_extent), 128);
+        assert_eq!(std::mem::offset_of!(Uniforms, _extent_padding), 140);
     }
 }

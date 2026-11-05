@@ -21,6 +21,8 @@ struct RoxelApp {
     app: Option<roxel::app::App>,
     /// Path to load on startup (from CLI args).
     initial_path: Option<PathBuf>,
+    screenshot: Option<PathBuf>,
+    settled_frames: u32,
 }
 
 impl RoxelApp {
@@ -33,6 +35,8 @@ impl RoxelApp {
             surface_config: None,
             app: None,
             initial_path,
+            screenshot: std::env::var_os("ROXEL_SCREENSHOT").map(PathBuf::from),
+            settled_frames: 0,
         }
     }
 
@@ -45,6 +49,21 @@ impl RoxelApp {
                 let mut app =
                     roxel::app::App::new(&window, device.clone(), queue.clone(), gpu.config.format);
 
+                if self.screenshot.is_some()
+                    && std::env::var_os("ROXEL_SCREENSHOT_EXPANDED").is_some()
+                {
+                    app.expand_slice_view();
+                }
+
+                if self.screenshot.is_some() && std::env::var_os("ROXEL_SCREENSHOT_FOCUS").is_some()
+                {
+                    app.focus_volume();
+                }
+                if self.screenshot.is_some()
+                    && std::env::var_os("ROXEL_SCREENSHOT_CUTAWAY").is_some()
+                {
+                    app.enable_cutaway();
+                }
                 // Load the initial path if provided via CLI.
                 if let Some(path) = self.initial_path.take() {
                     app.load_path(&path);
@@ -200,8 +219,9 @@ impl ApplicationHandler for RoxelApp {
         }
 
         let attrs = WindowAttributes::default()
-            .with_title("roxel - DICOS Volume Viewer")
-            .with_inner_size(winit::dpi::LogicalSize::new(1920, 1000));
+            .with_title("Roxel — Volume workspace")
+            .with_min_inner_size(winit::dpi::LogicalSize::new(1100, 720))
+            .with_inner_size(capture_window_size());
 
         let window = Arc::new(
             event_loop
@@ -256,6 +276,7 @@ impl ApplicationHandler for RoxelApp {
                         return;
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
+                        self.screenshot = None;
                         event_loop.exit();
                         return;
                     }
@@ -266,6 +287,43 @@ impl ApplicationHandler for RoxelApp {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
                 let wants_repaint = app.render(&window, &view, config.width, config.height);
+                if self.screenshot.is_some() {
+                    if app.is_loading() {
+                        self.settled_frames = 0;
+                    } else {
+                        self.settled_frames += 1;
+                    }
+                    if self.settled_frames >= 6 {
+                        let device = self.device.as_ref().unwrap();
+                        let queue = self.queue.as_ref().unwrap();
+                        let texture = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("screenshot"),
+                            size: wgpu::Extent3d {
+                                width: config.width,
+                                height: config.height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: config.format,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::COPY_SRC,
+                            view_formats: &[],
+                        });
+                        app.render(
+                            &window,
+                            &texture.create_view(&Default::default()),
+                            config.width,
+                            config.height,
+                        );
+                        save_screenshot(device, queue, &texture, self.screenshot.as_ref().unwrap());
+                        self.screenshot = None;
+                        event_loop.exit();
+                    } else {
+                        window.request_redraw();
+                    }
+                }
                 output.present();
                 if wants_repaint {
                     window.request_redraw();
@@ -285,4 +343,86 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = RoxelApp::new(initial_path);
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+/// Read back an actual application frame, including the volume and egui overlay.
+fn save_screenshot(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    path: &std::path::Path,
+) {
+    let width = texture.width();
+    let height = texture.height();
+    let stride = (width * 4).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("screenshot readback"),
+        size: stride as u64 * height as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(height),
+            },
+        },
+        texture.size(),
+    );
+    queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("GPU screenshot readback");
+    rx.recv().unwrap().expect("screenshot mapping");
+    let mapped = buffer.slice(..).get_mapped_range();
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for row in mapped.chunks(stride as usize) {
+        rgba.extend_from_slice(&row[..width as usize * 4]);
+    }
+    if matches!(
+        texture.format(),
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    ) {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(std::fs::File::create(path).expect("screenshot output")),
+        width,
+        height,
+    );
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&rgba)
+        .unwrap();
+    eprintln!("Screenshot saved: {}", path.display());
+}
+
+fn capture_window_size() -> winit::dpi::LogicalSize<u32> {
+    // Optional reproducible review viewport; ordinary launches keep the default.
+    if std::env::var_os("ROXEL_SCREENSHOT").is_some() {
+        if let Ok(value) = std::env::var("ROXEL_SCREENSHOT_SIZE") {
+            if let Some((w, h)) = value.split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                    return winit::dpi::LogicalSize::new(w.clamp(1100, 3840), h.clamp(720, 2160));
+                }
+            }
+        }
+    }
+    winit::dpi::LogicalSize::new(1440, 900)
 }

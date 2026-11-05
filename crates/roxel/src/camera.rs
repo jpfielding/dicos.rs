@@ -6,9 +6,29 @@
 
 use glam::Vec3;
 
+/// Physical volume dimensions normalized by physical X length.
+/// Invalid spacing values fall back to one unit per voxel on that axis.
+/// No aspect-ratio clamp is applied: narrow and anisotropic volumes keep
+/// their geometry rather than being stretched for display.
+pub(crate) fn physical_extent(dimensions: [usize; 3], spacing: [f64; 3]) -> Vec3 {
+    let physical = std::array::from_fn::<_, 3, _>(|axis| {
+        let spacing = if spacing[axis].is_finite() && spacing[axis] > 0.0 {
+            spacing[axis]
+        } else {
+            1.0
+        };
+        dimensions[axis].max(1) as f64 * spacing
+    });
+    Vec3::new(
+        1.0,
+        (physical[1] / physical[0]) as f32,
+        (physical[2] / physical[0]) as f32,
+    )
+}
+
 /// Arcball camera orbiting a target point.
 pub struct Camera {
-    /// Target point the camera orbits around (normalized volume coords).
+    /// Target point the camera orbits around in physical world coordinates.
     pub target: Vec3,
     /// Azimuth angle in radians (rotation around Y axis).
     pub azimuth: f32,
@@ -18,16 +38,18 @@ pub struct Camera {
     pub distance: f32,
     /// Vertical field of view factor (not degrees -- used as a ray spread).
     pub fov: f32,
+    max_distance: f32,
 }
 
 impl Default for Camera {
     fn default() -> Self {
         Self {
             target: Vec3::new(0.5, 0.5, 0.5),
-            azimuth: 0.5,    // ~29 degrees from front
-            elevation: -0.4, // slight top-down view
+            azimuth: 0.25,   // slight oblique view
+            elevation: -1.1, // inspect the open volume from above
             distance: 1.0,
             fov: 0.8,
+            max_distance: Self::MAX_DISTANCE,
         }
     }
 }
@@ -37,6 +59,28 @@ impl Camera {
     pub const MIN_DISTANCE: f32 = 0.5;
     /// Maximum allowed orbit distance (furthest zoom-out).
     pub const MAX_DISTANCE: f32 = 5.0;
+
+    /// Fit all eight volume corners into the current viewport with a 6% margin.
+    pub fn fit_bounds(&mut self, min: Vec3, max: Vec3, aspect: f32) {
+        self.target = (min + max) * 0.5;
+        let forward = self.forward();
+        let right = self.right();
+        let up = self.up();
+        let mut distance = Self::MIN_DISTANCE;
+        for x in [min.x, max.x] {
+            for y in [min.y, max.y] {
+                for z in [min.z, max.z] {
+                    let delta = Vec3::new(x, y, z) - self.target;
+                    let depth = delta.dot(forward);
+                    distance = distance
+                        .max(delta.dot(right).abs() * 1.06 / (self.fov * aspect.max(0.1)) - depth);
+                    distance = distance.max(delta.dot(up).abs() * 1.06 / self.fov - depth);
+                }
+            }
+        }
+        self.max_distance = Self::MAX_DISTANCE.max(distance * 2.0);
+        self.distance = distance.max(Self::MIN_DISTANCE);
+    }
 
     /// Compute the camera position in world space.
     pub fn position(&self) -> Vec3 {
@@ -75,7 +119,7 @@ impl Camera {
 
     /// Zoom by a multiplicative factor (>1 zooms in, <1 zooms out).
     pub fn zoom(&mut self, factor: f32) {
-        self.distance = (self.distance / factor).clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE);
+        self.distance = (self.distance / factor).clamp(Self::MIN_DISTANCE, self.max_distance);
     }
 
     /// Pan the camera target in view space using pixel deltas.
@@ -109,6 +153,73 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anisotropic_samples_form_a_physical_cube() {
+        let extent = physical_extent([100, 50, 25], [1.0, 2.0, 4.0]);
+        assert_eq!(extent, Vec3::ONE);
+        assert_eq!(
+            physical_extent([256, 128, 256], [1.0; 3]),
+            Vec3::new(1.0, 0.5, 1.0)
+        );
+        assert_eq!(
+            physical_extent([100, 200, 1], [1.0; 3]),
+            Vec3::new(1.0, 2.0, 0.01)
+        );
+    }
+
+    #[test]
+    fn physical_geometry_camera_fit_covers_all_corners_without_aspect_clamp() {
+        for (dims, spacing) in [
+            ([100, 50, 25], [1.0, 2.0, 4.0]),
+            ([256, 128, 256], [1.0; 3]),
+            ([10, 500, 100], [1.0; 3]),
+        ] {
+            let extent = physical_extent(dims, spacing);
+            for aspect in [0.5, 1.0, 2.0] {
+                let mut camera = Camera::default();
+                camera.fit_bounds(Vec3::ZERO, extent, aspect);
+                assert_eq!(camera.target, extent * 0.5);
+                let fit_distance = camera.distance;
+                camera.zoom(1.0);
+                assert_eq!(camera.distance, fit_distance);
+                for x in [0.0, extent.x] {
+                    for y in [0.0, extent.y] {
+                        for z in [0.0, extent.z] {
+                            let delta = Vec3::new(x, y, z) - camera.position();
+                            let depth = delta.dot(camera.forward());
+                            assert!(depth > 0.0);
+                            assert!(delta.dot(camera.right()).abs() < depth * camera.fov * aspect);
+                            assert!(delta.dot(camera.up()).abs() < depth * camera.fov);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_volume_corners_stay_inside_viewport() {
+        for aspect in [0.8, 1.2, 2.0] {
+            for depth in [0.1, 0.5, 1.0, 2.0] {
+                let mut camera = Camera::default();
+                camera.fit_bounds(Vec3::ZERO, Vec3::new(1.0, 1.0, depth), aspect);
+                for x in [0.0, 1.0] {
+                    for y in [0.0, 1.0] {
+                        for z in [0.0, depth] {
+                            let delta = Vec3::new(x, y, z) - camera.position();
+                            let d = delta.dot(camera.forward());
+                            assert!(d > 0.0);
+                            assert!(
+                                delta.dot(camera.right()).abs() / (d * camera.fov * aspect) < 1.0
+                            );
+                            assert!(delta.dot(camera.up()).abs() / (d * camera.fov) < 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn default_camera_looks_at_center() {

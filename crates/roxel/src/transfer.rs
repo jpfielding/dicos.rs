@@ -103,7 +103,7 @@ fn interpolate_opacity(map: &[(f32, f32)], density: f32) -> f32 {
 ///
 /// # Opacity model
 ///
-/// Final on-screen opacity is the product of four independent, multiplicative
+/// Reference-sample opacity is the product of four independent, multiplicative
 /// factors. Each answers a different question and lives in a different
 /// place, so reach for the right one rather than fighting the others:
 ///
@@ -135,6 +135,18 @@ fn interpolate_opacity(map: &[(f32, f32)], density: f32) -> f32 {
 /// gradient_boost`. Factors 1-3 apply to both the CPU composite path
 /// ([`crate::slice_view::SliceView::render_composite`]) and the GPU raycast
 /// path (`raycast.wgsl`); factor 4 is GPU-only.
+///
+/// GPU alpha is defined over one smallest physical voxel spacing:
+/// `reference_step = min(volume_extent / texture_dimensions)`. This is a
+/// resolution-relative visualization convention, not calibrated attenuation
+/// in physical units. It preserves the one-voxel convention for isotropic
+/// data and stays fixed when camera distance or quality changes.
+/// Before GPU compositing, the reference alpha is clamped to `[0, 1]` and
+/// converted with `1 - (1 - alpha).powf(segment_length / reference_step)`.
+/// The final partial ray interval uses its actual length. Thus subdividing
+/// a homogeneous interval does not increase its accumulated opacity.
+/// CPU slice composites still integrate discrete slices and are not a
+/// numerical oracle for the GPU's physically spaced ray integration.
 pub struct TransferFunction {
     /// RGBA data: `[R, G, B, A]` for each of `TRANSFER_SIZE` entries.
     pub data: Vec<[f32; 4]>,
@@ -249,8 +261,8 @@ impl TransferFunction {
 
         for (i, entry) in data.iter_mut().enumerate() {
             let t = i as f32 / (TRANSFER_SIZE - 1) as f32;
-            // Grayscale ramp: 0 -> 0.67 (170/255)
-            let gray = 0.67 * t;
+            // Lift midtones for the dark inspection workspace; opacity remains linear.
+            let gray = 0.9 * t.powf(0.65);
             let alpha = 0.5 * t;
             *entry = [gray, gray, gray, alpha];
         }
@@ -292,6 +304,41 @@ impl TransferFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CPU analytic oracle for the WGSL optical model. This checks integration
+    // against transmittance over a whole slab, not GPU execution itself.
+    #[test]
+    fn homogeneous_slab_opacity_is_independent_of_sampling_partition() {
+        let reference: f64 = 1.0 / 256.0;
+        let length: f64 = 0.073; // deliberately not divisible by sampling steps
+        for alpha in [0.0_f64, 0.003, 0.0495, 0.0743, 1.0] {
+            let expected = 1.0 - (1.0 - alpha).powf(length / reference);
+            for factor in [0.25, 0.5, 1.0, 1.5, 2.75] {
+                let step = reference * factor;
+                let mut t = 0.0;
+                let mut accumulated = 0.0;
+                while t < length {
+                    let distance = step.min(length - t);
+                    let sample_alpha = 1.0 - (1.0 - alpha).powf(distance / reference);
+                    accumulated += (1.0 - accumulated) * sample_alpha;
+                    t += distance;
+                }
+                assert!((accumulated - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn anisotropic_linear_field_recovers_physical_normal() {
+        // f(world) = n dot world: index differences equal n * voxel spacing.
+        let dimensions = glam::Vec3::new(256.0, 128.0, 256.0);
+        let extent = glam::Vec3::new(1.0, 0.51148, 1.53812);
+        let expected = glam::Vec3::new(1.0, 2.0, -3.0).normalize();
+        let index_gradient = expected * (extent / dimensions);
+        let recovered = (index_gradient * dimensions / extent).normalize();
+        assert!(recovered.abs_diff_eq(expected, 1e-6));
+        assert!(!index_gradient.normalize().abs_diff_eq(expected, 0.01));
+    }
 
     #[test]
     fn default_bands_count() {

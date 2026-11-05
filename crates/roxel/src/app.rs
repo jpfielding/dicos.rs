@@ -283,7 +283,7 @@ impl App {
         }
 
         // Sync alpha scale to 2D composite.
-        self.ui.slice_view.alpha_scale = self.ui.settings.global_opacity;
+        self.ui.sync_composite_opacity();
 
         // Update 2D slice texture if dirty.
         if self.ui.slice_dirty {

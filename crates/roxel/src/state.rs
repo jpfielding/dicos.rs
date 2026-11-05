@@ -58,6 +58,14 @@ pub(crate) struct UiState {
 }
 
 impl UiState {
+    /// Keep cached composite pixels in sync with shared opacity controls.
+    pub(crate) fn sync_composite_opacity(&mut self) {
+        if self.slice_view.alpha_scale != self.settings.global_opacity {
+            self.slice_view.alpha_scale = self.settings.global_opacity;
+            self.slice_dirty |= self.slice_view.composite;
+        }
+    }
+
     /// Build the initial UI state around a freshly configured camera.
     pub(crate) fn new(camera: Camera) -> Self {
         Self {
@@ -170,4 +178,27 @@ pub(crate) struct UiActions {
     /// Request to upload a different volume to the 3D renderer.
     pub(crate) upload_3d_index: Option<usize>,
     pub(crate) preset_changed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opacity_changes_invalidate_composites_but_not_single_slices() {
+        let mut state = UiState::new(Camera::default());
+        state.slice_dirty = false;
+        state.settings.global_opacity = 0.4;
+        state.sync_composite_opacity();
+        assert!(!state.slice_dirty);
+        assert_eq!(state.slice_view.alpha_scale, 0.4);
+        state.slice_view.composite = true;
+        state.settings.global_opacity = 0.7;
+        state.sync_composite_opacity();
+        assert!(state.slice_dirty);
+        assert_eq!(state.slice_view.alpha_scale, 0.7);
+        state.slice_dirty = false;
+        state.sync_composite_opacity();
+        assert!(!state.slice_dirty);
+    }
 }

@@ -4,7 +4,7 @@ Date: 2026-11-05. PR: [UI polish overhaul](https://github.com/jpfielding/dicos.r
 
 ## Scope and evidence
 
-Three independent reviewers covered visual design, codec correctness, and the DICOS API. Each also inspected actual Roxel screenshots and assigned its own visual score. Reviewers were not given the acceptance score. Visual review remains in progress; the latest approved screenshot set and scores will be recorded here when complete.
+Three independent reviewers covered visual design, codec correctness, and the DICOS API. Each also inspected actual Roxel screenshots and assigned its own visual score. Reviewers were not given the acceptance score. The final v23 screenshot set received individual design-quality scores of 9.1/10 (design reviewer), 9.0/10 (codec reviewer), and 9.0/10 (API reviewer). All three directly inspected the six captures below. Reviewers also proposed or implemented bounded changes; these are independent visual judgments, not a claim of wholly independent implementation certification.
 
 The screenshots are readbacks of the native application’s GPU rendering, including its egui interface and loaded repository fixtures. They are not mockups or edited image composites. The README image is the same workspace capture included in the review set. Reproduction commands and capture options are in the [viewer README](../../crates/roxel/README.md#reproducible-screenshots).
 
@@ -16,7 +16,7 @@ The screenshots are readbacks of the native application’s GPU rendering, inclu
 - A linked voxel-center slice plane, reversible cutaway, retained-side annotation and zoom-aware physical scale bar.
 - Windowing controls that use useful study ranges while retaining wider numeric entry.
 - Corrected sampling-distance opacity, physical lighting normals, and consistent rescale-intercept handling in automatic windows, slices, projections and 3D.
-- Material edits survive palette/layer changes; newly selected volumes initialize their own window values.
+- Material edits survive palette/layer changes; newly selected volumes initialize their own window values. Opacity changes invalidate cached composite slices.
 - Regression coverage for physical geometry, camera fitting, uniform layout, transfer preservation, nonzero intercepts, long identifiers, focus layout changes, modal navigation and Escape priority.
 
 ## What the images do and do not prove
@@ -40,4 +40,10 @@ The [codec review](codec-review.md) and [DICOS API review](dicos-api-review.md) 
 - [Minimum-size cutaway](../images/roxel-cutaway.png)
 - [Empty state](../images/roxel-empty.png)
 
-Validation: `cargo test --workspace --all-features` passed before the final visual refinements. After those refinements, `cargo test -p roxel` passed 71 tests, `cargo clippy -p roxel --all-targets -- -D warnings` passed, and formatting/whitespace checks passed. The screenshots above were recaptured after the final camera-fit correction and visual pass.
+Validation: after the final changes, `cargo test --workspace --all-features` passed 576 tests across unit, integration and documentation suites, including 72 Roxel tests. `cargo test -p roxel` also passed, `cargo clippy -p roxel --all-targets -- -D warnings` passed, and formatting/whitespace checks passed. The screenshots above were recaptured after the final camera-fit correction and visual pass.
+
+## Final council assessment
+
+The design reviewer described the result as a cohesive, polished workstation. The codec reviewer found that imagery leads and controls form readable groups, with no material clipping, overlap, alignment or composition defects. The API reviewer found a substantially clearer interface and no outstanding material integration regression in the reviewed paths after the physical-fit and composite-cache fixes.
+
+Remaining suggestions are minor: more explicit quality-selector labelling, consistent enlargement terminology, and slightly stronger secondary-label contrast. Translucent overlap and voxel contours remain a display/data tradeoff; they were not hidden by altering source data. Native OS usability remains unverified, as described above.

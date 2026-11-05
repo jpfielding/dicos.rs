@@ -13,7 +13,7 @@ struct Uniforms {
     cam_right: vec3<f32>,
     step_size: f32,
     cam_up: vec3<f32>,
-    scale_z: f32,
+    _camera_padding: f32,
     window_min: f32,
     window_range: f32,
     alpha_scale: f32,
@@ -24,6 +24,11 @@ struct Uniforms {
     specular_intensity: f32,
     clip_plane: vec4<f32>,
     depth_cue: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
+    volume_extent: vec3<f32>,
+    _extent_padding: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -49,9 +54,9 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-// Ray-box intersection for a box from (0,0,0) to (1,1,scale_z).
+// Ray-box intersection in normalized physical coordinates.
 fn intersect_box(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
-    let box_max = vec3<f32>(1.0, 1.0, u.scale_z);
+    let box_max = u.volume_extent;
     let inv_dir = 1.0 / dir;
 
     let t0 = (vec3<f32>(0.0) - origin) * inv_dir;
@@ -87,23 +92,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let light_main = normalize(vec3<f32>(0.5, 0.7, 1.0));
     let light_fill = normalize(vec3<f32>(-0.3, 0.2, 0.8));
 
+    // Transfer alpha is defined over one smallest physical voxel spacing.
+    // Neither quality nor camera distance changes this reference distance.
+    let dimensions = vec3<f32>(textureDimensions(volume_tex));
+    let voxel_step = u.volume_extent / dimensions;
+    let reference_step = min(voxel_step.x, min(voxel_step.y, voxel_step.z));
+
     // March through volume.
     var accum = vec4<f32>(0.0);
     var t = t_range.x;
     let max_steps = 4096u;
+    // Preserve full ray coverage for unusually elongated volumes. The extra
+    // interval leaves room for floating-point accumulation at the far face.
+    let step_size = max(u.step_size, (t_range.y - t_range.x) / 4095.0);
 
     for (var step = 0u; step < max_steps; step++) {
         if t >= t_range.y || accum.a > 0.98 {
             break;
         }
 
+        let segment_length = min(step_size, t_range.y - t);
         let pos = u.cam_pos + ray_dir * t;
 
         // Normalize to [0,1] texture coordinates.
-        let tex_coord = vec3<f32>(pos.x, pos.y, pos.z / u.scale_z);
+        let tex_coord = pos / u.volume_extent;
 
         if dot(tex_coord, u.clip_plane.xyz) < u.clip_plane.w {
-            t += u.step_size;
+            t += step_size;
             continue;
         }
 
@@ -120,7 +135,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Density threshold clipping.
         if normalized <= u.density_threshold {
-            t += u.step_size;
+            t += step_size;
             continue;
         }
 
@@ -130,7 +145,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var alpha = tf_sample.a * u.alpha_scale;
 
         if alpha < 0.001 {
-            t += u.step_size;
+            t += step_size;
             continue;
         }
 
@@ -144,7 +159,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let grad_mag = length(gradient);
         // RGBA16 gradients retain meaningful surface normals far below 0.01.
         if grad_mag > 0.0001 {
-            let normal = gradient / grad_mag;
+            // Packed differences are per voxel index, not per world distance.
+            // Preserve grad_mag for the existing opacity heuristic.
+            let physical_gradient = gradient * dimensions / u.volume_extent;
+            let normal = normalize(physical_gradient);
 
             // Phong lighting.
             let n_dot_l1 = max(dot(normal, light_main), 0.0);
@@ -175,6 +193,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let ray_depth = clamp((t - t_range.x) / max(t_range.y - t_range.x, 0.0001), 0.0, 1.0);
         color *= 1.0 - u.depth_cue * ray_depth;
 
+        // Beer-Lambert correction: subdividing a homogeneous interval must
+        // not change its optical thickness. Include the partial final step.
+        alpha = 1.0 - pow(1.0 - clamp(alpha, 0.0, 1.0), segment_length / reference_step);
+
         // Front-to-back blending.
         let src_alpha = alpha * (1.0 - accum.a);
         accum = vec4<f32>(
@@ -182,7 +204,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             accum.a + src_alpha,
         );
 
-        t += u.step_size;
+        t += step_size;
     }
 
     // Blend with background.

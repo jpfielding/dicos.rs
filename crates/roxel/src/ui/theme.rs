@@ -2,7 +2,7 @@
 use egui::{Color32, FontId, RichText, Stroke, TextStyle};
 pub const BG: Color32 = Color32::from_rgb(16, 22, 29);
 pub const PANEL: Color32 = Color32::from_rgb(23, 31, 40);
-pub const MUTED: Color32 = Color32::from_rgb(174, 189, 203);
+pub const MUTED: Color32 = Color32::from_rgb(184, 196, 208);
 pub const ACCENT: Color32 = Color32::from_rgb(105, 211, 191);
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -45,7 +45,7 @@ pub fn apply(ctx: &egui::Context) {
 }
 pub fn section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(8.0);
-    ui.label(RichText::new(text).size(11.0).color(MUTED).strong());
+    ui.label(RichText::new(text).size(12.0).color(MUTED).strong());
     ui.add_space(2.0);
 }
 pub fn frame() -> egui::Frame {
@@ -64,7 +64,19 @@ pub fn slider(
             egui::Label::new(egui::RichText::new(label).color(MUTED)),
         );
         ui.spacing_mut().interact_size.y = 20.0;
-        ui.add(egui::Slider::new(value, range))
+        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).clamp(48.0, 110.0);
+        let slider = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
+        let number = ui.add_sized(
+            [48.0, 26.0],
+            egui::DragValue::new(value)
+                .speed(if range.end() - range.start() > 10.0 {
+                    1.0
+                } else {
+                    0.01
+                })
+                .range(range),
+        );
+        slider | number
     })
     .inner
 }
@@ -120,6 +132,7 @@ pub fn window_slider(
             egui::Label::new(egui::RichText::new(label).color(MUTED)),
         );
         ui.spacing_mut().interact_size.y = 20.0;
+        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).clamp(48.0, 110.0);
         let slider = ui.add(
             egui::Slider::new(value, range)
                 .show_value(false)
@@ -130,8 +143,24 @@ pub fn window_slider(
         } else {
             -65535.0..=65535.0
         };
-        let number = ui.add(egui::DragValue::new(value).speed(1.0).range(limit));
+        let number = ui.add_sized(
+            [48.0, 26.0],
+            egui::DragValue::new(value).speed(1.0).range(limit),
+        );
         slider | number
     })
     .inner
+}
+
+/// A quiet shared surface for mutually exclusive display choices.
+pub fn segments(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(BG)
+        .corner_radius(4)
+        .inner_margin(3)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding = egui::vec2(6.0, 5.0);
+            ui.horizontal(contents);
+        });
 }

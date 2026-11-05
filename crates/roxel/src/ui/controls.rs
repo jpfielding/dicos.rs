@@ -21,9 +21,8 @@ pub(crate) fn draw_bottom_controls(ctx: &egui::Context, state: &mut UiState) {
                 .show(panel, |panel| {
                     panel.columns(2, |cols| {
                         // Column 1: Rendering quality and window/level.
-                        super::theme::section(&mut cols[0], "3D WINDOWING & APPEARANCE");
-                        cols[0].horizontal(|h| {
-                            h.label("Quality:");
+                        super::theme::section(&mut cols[0], "3D windowing & appearance");
+                        super::theme::segments(&mut cols[0], |h| {
                             if h.selectable_label(state.settings.quality == Quality::Fast, "Fast")
                                 .clicked()
                             {
@@ -63,8 +62,8 @@ pub(crate) fn draw_bottom_controls(ctx: &egui::Context, state: &mut UiState) {
                         );
 
                         // Column 2: Transfer function and material bands.
-                        super::theme::section(&mut cols[1], "DISPLAY PALETTE");
-                        cols[1].horizontal(|h| {
+                        super::theme::section(&mut cols[1], "Display palette");
+                        super::theme::segments(&mut cols[1], |h| {
                             if h.selectable_label(
                                 state.transfer.preset == TransferPreset::Default,
                                 "Materials",
@@ -206,17 +205,23 @@ pub(crate) fn draw_bottom_controls(ctx: &egui::Context, state: &mut UiState) {
                                 &mut state.settings.density_threshold,
                                 0.0..=1.0,
                             );
-                            ui.add(
-                                egui::Slider::new(&mut state.settings.ambient, 0.0..=1.0)
-                                    .text("Ambient"),
+                            super::theme::slider(
+                                ui,
+                                "Ambient",
+                                &mut state.settings.ambient,
+                                0.0..=1.0,
                             );
-                            ui.add(
-                                egui::Slider::new(&mut state.settings.diffuse, 0.0..=1.0)
-                                    .text("Diffuse"),
+                            super::theme::slider(
+                                ui,
+                                "Diffuse",
+                                &mut state.settings.diffuse,
+                                0.0..=1.0,
                             );
-                            ui.add(
-                                egui::Slider::new(&mut state.settings.specular, 0.0..=1.0)
-                                    .text("Specular"),
+                            super::theme::slider(
+                                ui,
+                                "Specular",
+                                &mut state.settings.specular,
+                                0.0..=1.0,
                             );
                         });
                     });
@@ -230,70 +235,123 @@ pub(crate) fn draw_focus_controls(ctx: &egui::Context, state: &mut UiState) {
         super::theme::window_ranges(state, state.library.active_3d_index.unwrap_or(0));
     egui::TopBottomPanel::bottom("focus_appearance")
         .frame(super::theme::frame())
-        .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                super::theme::window_slider(
-                    ui,
-                    "Center",
-                    &mut state.settings.window_center,
-                    center_range,
-                );
-                super::theme::window_slider(
-                    ui,
-                    "Width",
-                    &mut state.settings.window_width,
-                    width_range,
-                );
-                super::theme::slider(ui, "Opacity", &mut state.settings.global_opacity, 0.0..=1.0);
-                egui::ComboBox::from_id_salt("focus_palette")
-                    .selected_text(match state.transfer.preset {
-                        TransferPreset::Default => "Materials",
-                        TransferPreset::Threat => "Threat",
-                        TransferPreset::Monochrome => "Grayscale",
-                    })
-                    .show_ui(ui, |ui| {
-                        for (preset, label) in [
-                            (TransferPreset::Default, "Materials"),
-                            (TransferPreset::Threat, "Threat"),
-                            (TransferPreset::Monochrome, "Grayscale"),
-                        ] {
-                            if ui
-                                .selectable_value(&mut state.transfer.preset, preset, label)
-                                .changed()
-                            {
-                                state.actions.preset_changed = true;
-                            }
+        .show(ctx, |outer| {
+            let dock_width = outer.available_width().min(1040.0);
+            outer.horizontal(|outer| {
+                outer.add_space(((outer.available_width() - dock_width) * 0.5).max(0.0));
+                outer.allocate_ui_with_layout(
+                    egui::vec2(dock_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            super::theme::window_slider(
+                                ui,
+                                "Center",
+                                &mut state.settings.window_center,
+                                center_range,
+                            );
+                            super::theme::window_slider(
+                                ui,
+                                "Width",
+                                &mut state.settings.window_width,
+                                width_range,
+                            );
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            super::theme::slider(
+                                ui,
+                                "Opacity",
+                                &mut state.settings.global_opacity,
+                                0.0..=1.0,
+                            );
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            egui::ComboBox::from_id_salt("focus_palette")
+                                .selected_text(match state.transfer.preset {
+                                    TransferPreset::Default => "Materials",
+                                    TransferPreset::Threat => "Threat",
+                                    TransferPreset::Monochrome => "Grayscale",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for (preset, label) in [
+                                        (TransferPreset::Default, "Materials"),
+                                        (TransferPreset::Threat, "Threat"),
+                                        (TransferPreset::Monochrome, "Grayscale"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut state.transfer.preset,
+                                                preset,
+                                                label,
+                                            )
+                                            .changed()
+                                        {
+                                            state.actions.preset_changed = true;
+                                        }
+                                    }
+                                });
+                            ui.menu_button("Lighting", |ui| {
+                                super::theme::slider(
+                                    ui,
+                                    "Depth cue",
+                                    &mut state.settings.depth_cue,
+                                    0.0..=1.0,
+                                );
+                                super::theme::slider(
+                                    ui,
+                                    "Ambient",
+                                    &mut state.settings.ambient,
+                                    0.0..=1.0,
+                                );
+                                super::theme::slider(
+                                    ui,
+                                    "Diffuse",
+                                    &mut state.settings.diffuse,
+                                    0.0..=1.0,
+                                );
+                                super::theme::slider(
+                                    ui,
+                                    "Specular",
+                                    &mut state.settings.specular,
+                                    0.0..=1.0,
+                                );
+                            });
+                        });
+
+                        if state.cutaway && !state.slice_view.composite {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut state.reverse_cutaway, "Reverse cutaway");
+                                ui.add_space(16.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+                                ui.label("Slice");
+                                ui.spacing_mut().interact_size.y = 20.0;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut state.slice_view.slice_index,
+                                            0..=state.slice_view.max_slices.saturating_sub(1),
+                                        )
+                                        .custom_formatter(|v, _| format!("{}", v as usize + 1))
+                                        .custom_parser(
+                                            |s| {
+                                                s.parse::<usize>()
+                                                    .ok()
+                                                    .and_then(|v| v.checked_sub(1))
+                                                    .map(|v| v as f64)
+                                            },
+                                        ),
+                                    )
+                                    .changed()
+                                {
+                                    state.slice_dirty = true;
+                                }
+                            });
                         }
-                    });
-                if state.cutaway && !state.slice_view.composite {
-                    ui.horizontal(|ui| {
-                        ui.label("Slice");
-                        if ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut state.slice_view.slice_index,
-                                    0..=state.slice_view.max_slices.saturating_sub(1),
-                                )
-                                .custom_formatter(|v, _| format!("{}", v as usize + 1))
-                                .custom_parser(|s| {
-                                    s.parse::<usize>()
-                                        .ok()
-                                        .and_then(|v| v.checked_sub(1))
-                                        .map(|v| v as f64)
-                                }),
-                            )
-                            .changed()
-                        {
-                            state.slice_dirty = true;
-                        }
-                    });
-                }
-                ui.menu_button("Lighting", |ui| {
-                    super::theme::slider(ui, "Depth cue", &mut state.settings.depth_cue, 0.0..=1.0);
-                    super::theme::slider(ui, "Ambient", &mut state.settings.ambient, 0.0..=1.0);
-                    super::theme::slider(ui, "Diffuse", &mut state.settings.diffuse, 0.0..=1.0);
-                    super::theme::slider(ui, "Specular", &mut state.settings.specular, 0.0..=1.0);
-                });
+                    },
+                );
             });
         });
 }

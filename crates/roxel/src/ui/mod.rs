@@ -22,9 +22,12 @@ use crate::transfer::ColorBand;
 
 /// Draw the full three-panel UI.
 pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
+    let focus_before_layout = state.focus_volume;
     if state.focus_volume
         && !state.slice_expanded
-        && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        && !egui::Popup::is_any_open(ctx)
+        && ctx.memory(|m| m.focused().is_none())
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         state.focus_volume = false;
         state.fit_camera = true;
@@ -35,12 +38,6 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
             ui.horizontal(|ui| {
                 theme::mark(ui, 26.0);
                 ui.label(egui::RichText::new("roxel").size(23.0).strong());
-                ui.add_space(16.0);
-                ui.label(
-                    egui::RichText::new("VOLUME WORKSPACE")
-                        .size(11.0)
-                        .color(theme::MUTED),
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let name = state
                         .library
@@ -91,8 +88,7 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
         .frame(theme::frame())
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("3D Volume").strong());
-                ui.label(egui::RichText::new("/  Spatial inspection").color(theme::MUTED));
+                ui.label(egui::RichText::new("3D volume").size(16.0).strong());
                 if !state.library.volumes.is_empty() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -126,7 +122,14 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
                 }
             });
         });
-    state.viewport = ctx.available_rect();
+    let next_viewport = ctx.available_rect();
+    if state.viewport.size() != next_viewport.size() {
+        state.fit_camera = true;
+    }
+    state.viewport = next_viewport;
+    if state.focus_volume != focus_before_layout {
+        ctx.request_repaint();
+    }
     draw_slice_locator(ctx, state);
     if !state.library.volumes.is_empty() {
         let painter = ctx.layer_painter(egui::LayerId::new(
@@ -258,23 +261,46 @@ fn draw_slice_locator(ctx: &egui::Context, state: &UiState) {
             egui::Id::new("slice_locator"),
         ))
         .with_clip_rect(rect);
-    let label_pos = projected[0] + egui::vec2(6.0, -8.0);
-    let label_rect =
-        egui::Rect::from_min_size(label_pos - egui::vec2(4.0, 18.0), egui::vec2(70.0, 22.0));
-    painter.rect_filled(label_rect, 4, theme::BG.gamma_multiply(0.92));
-    painter.text(
-        label_pos,
-        egui::Align2::LEFT_BOTTOM,
-        "Slice plane",
-        egui::FontId::proportional(11.0),
-        theme::ACCENT,
-    );
+    let retained_axis = match state.slice_view.orientation {
+        crate::slice_view::Orientation::Axial => "Z",
+        crate::slice_view::Orientation::Coronal => "Y",
+        crate::slice_view::Orientation::Sagittal => "X",
+    };
+    let plane_label = if state.cutaway {
+        format!(
+            "Cut plane · keeping {}{}",
+            if state.reverse_cutaway { "−" } else { "+" },
+            retained_axis
+        )
+    } else {
+        "Slice plane".into()
+    };
     for i in 0..4 {
         painter.line_segment(
             [projected[i], projected[(i + 1) % 4]],
             egui::Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.65)),
         );
     }
+    let galley =
+        painter.layout_no_wrap(plane_label, egui::FontId::proportional(11.0), theme::ACCENT);
+    let label_size = galley.size() + egui::vec2(12.0, 8.0);
+    let anchor = projected[0];
+    let mut label_pos = anchor + egui::vec2(8.0, 8.0);
+    label_pos.x = label_pos.x.clamp(
+        rect.left() + 8.0,
+        (rect.right() - label_size.x - 8.0).max(rect.left() + 8.0),
+    );
+    label_pos.y = label_pos.y.clamp(
+        rect.top() + 8.0,
+        (rect.bottom() - label_size.y - 36.0).max(rect.top() + 8.0),
+    );
+    let label_rect = egui::Rect::from_min_size(label_pos, label_size);
+    painter.line_segment(
+        [anchor, label_rect.left_center()],
+        egui::Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.65)),
+    );
+    painter.rect_filled(label_rect, 4, theme::BG.gamma_multiply(0.96));
+    painter.galley(label_pos + egui::vec2(6.0, 4.0), galley, theme::ACCENT);
     painter.text(
         rect.right_bottom() + egui::vec2(-16.0, -20.0),
         egui::Align2::RIGHT_BOTTOM,
@@ -417,5 +443,44 @@ mod tests {
         assert!(state.viewport.width() >= 450.0, "{:?}", state.viewport);
         assert!(state.viewport.height() >= 250.0, "{:?}", state.viewport);
         assert!(state.viewport.right() <= 1100.0);
+        let workspace_size = state.viewport.size();
+        let output = frame(&ctx, &mut state, vec![]);
+        let pos = text_center(&output.shapes, "Focus volume");
+        for pressed in [true, false] {
+            frame(
+                &ctx,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(state.focus_volume);
+        state.fit_camera = false; // Simulate app consuming this frame's fit.
+        frame(&ctx, &mut state, vec![]);
+        assert!(state.viewport.width() > workspace_size.x);
+        assert!(
+            state.fit_camera,
+            "New focus viewport must request its own fit"
+        );
+        egui::Popup::open_id(&ctx, egui::Id::new("test_popup"));
+        frame(
+            &ctx,
+            &mut state,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(state.focus_volume, "Escape must give the popup priority");
     }
 }

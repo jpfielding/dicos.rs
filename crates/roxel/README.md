@@ -31,7 +31,7 @@ New studies open with an oblique, automatically fitted 3D view and a mid-coronal
 2D slice. Grayscale, High sampling quality, and 25% global opacity are the
 inspection defaults. Grayscale lifts midtones using `0.9 * normalized^0.65`;
 its alpha remains linear. Lighting includes an adjustable depth cue that dims
-more distant samples. These are display transforms, not changes to voxel data.
+more distant samples. These are display transforms, not changes to voxel data. Auto windowing, slices and 3D use the same rescale-intercept domain. Signed samples and non-unit rescale slopes remain unsupported; see the API review.
 
 | Action | Result |
 |---|---|
@@ -48,7 +48,7 @@ more distant samples. These are display transforms, not changes to voxel data.
 The axis triad shows **volume X/Y/Z**, not patient anatomical directions. The
 slice locator and cutaway apply only when 2D and 3D display the same volume and
 the 2D view is a single slice. Cutaway retains the half-volume at or after the
-selected slice along the selected array axis; it does not edit or export data.
+selected slice along the selected array axis. **Reverse cutaway** retains the opposite half; the plane label names the retained axis direction. It does not edit or export data.
 Annotation boxes describe their original positions and are not cut away.
 
 ## Slice inspection
@@ -64,7 +64,7 @@ entry permits a wider range. Values are not labelled as calibrated HU.
 buttons, an editable slice number, a wide navigation slider, windowing and zoom.
 Drag the enlarged image to pan when zoomed; **Fit image** restores 100% fit.
 **Back to workspace**, Escape, or clicking the backdrop closes the inspector.
-Nearest-neighbor image sampling preserves the visible source pixels.
+Nearest-neighbor image sampling preserves the visible source pixels. Both views preserve physical aspect ratios from voxel spacing; slice captions report the physical field of view. The expanded inspector keeps the study identifier visible and includes a physical scale bar that follows zoom.
 
 ## Appearance
 
@@ -76,7 +76,7 @@ Nearest-neighbor image sampling preserves the visible source pixels.
 
 **Lighting & density** reveals ambient, diffuse, specular, depth cue and density
 cutoff. Material bands are hidden until requested. Quality selects Fast,
-Balanced or High ray-march sampling. High costs more GPU work; choose Balanced
+Balanced or High ray-march sampling. Opacity is corrected for the physical distance represented by each ray sample, so changing sampling quality does not intentionally change optical thickness. Extremely long rays use a coarser step to preserve full-volume coverage within the step budget. High costs more GPU work; choose Balanced
 or Fast on slower hardware. No performance benchmark is implied by the labels.
 
 Detected annotations are listed separately from display palettes. Absence of

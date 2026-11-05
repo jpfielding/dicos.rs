@@ -12,7 +12,7 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
         .show(ctx, |panel| {
             panel.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             egui::ScrollArea::vertical().show(panel, |panel| {
-                super::theme::section(panel, "STUDY LIBRARY");
+                super::theme::section(panel, "Study library");
 
                 // File section. Open buttons are disabled while a background
                 // load is in flight (only one load may run at a time).
@@ -71,13 +71,35 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
 
                 // Metadata section.
                 if !state.library.volumes.is_empty() {
-                    super::theme::section(panel, "STUDY DETAILS");
-                    if let Some(layer) = state.library.volumes.first() {
+                    super::theme::section(panel, "Study details");
+                    panel.spacing_mut().item_spacing.y = 6.0;
+                    if let Some(layer) = state
+                        .library
+                        .volumes
+                        .get(state.library.active_3d_index.unwrap_or(0))
+                    {
                         let vol = &layer.volume;
                         panel.label(format!(
                             "{} × {} × {}  ·  {}",
                             vol.dim_x, vol.dim_y, vol.dim_z, vol.modality
                         ));
+                    }
+                    if let Some(layer) = state
+                        .library
+                        .volumes
+                        .get(state.library.active_3d_index.unwrap_or(0))
+                    {
+                        let vol = &layer.volume;
+                        panel.label(
+                            egui::RichText::new(format!(
+                                "{:.0} × {:.0} × {:.0} mm",
+                                vol.dim_x as f64 * vol.voxel_spacing[0],
+                                vol.dim_y as f64 * vol.voxel_spacing[1],
+                                vol.dim_z as f64 * vol.voxel_spacing[2]
+                            ))
+                            .small()
+                            .color(super::theme::MUTED),
+                        );
                     }
                     panel.label(
                         egui::RichText::new(format!(
@@ -91,12 +113,13 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         ))
                         .color(super::theme::MUTED),
                     );
-                    panel.separator();
+                    panel.spacing_mut().item_spacing.y = 10.0;
+                    panel.add_space(6.0);
                 }
 
                 // Layers section -- selecting a layer uploads it to both 3D and 2D.
                 if state.library.volumes.len() > 1 {
-                    super::theme::section(panel, "VOLUMES");
+                    super::theme::section(panel, "Volumes");
                     let active = state.library.active_3d_index.unwrap_or(0);
                     for i in 0..state.library.volumes.len() {
                         let is_active = i == active;
@@ -123,7 +146,7 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         .slice_view
                         .volume_index
                         .min(state.library.volumes.len() - 1);
-                    super::theme::section(panel, "DETECTIONS");
+                    super::theme::section(panel, "Detections");
                     if !state.library.volumes[threat_vol_idx]
                         .volume
                         .threats
@@ -140,8 +163,11 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         .threats
                         .is_empty()
                     {
-                        panel.label("No detection annotations");
-                        panel.separator();
+                        panel.label(
+                            egui::RichText::new("No detection annotations")
+                                .color(super::theme::MUTED),
+                        );
+                        panel.add_space(6.0);
                     } else {
                         let mut any_changed = false;
                         let mut new_selected = state.library.selected_threat;
@@ -218,7 +244,7 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                     return;
                 }
                 // Camera presets.
-                super::theme::section(panel, "CAMERA");
+                super::theme::section(panel, "Camera");
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(34, 46, 59))
                     .inner_margin(3)
@@ -274,6 +300,9 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         egui::Checkbox::new(&mut state.cutaway, "Cutaway at slice"),
                     )
                     .on_hover_text("Hide voxels before the selected slice to reveal the interior");
+                if state.cutaway {
+                    panel.checkbox(&mut state.reverse_cutaway, "Reverse cutaway");
+                }
                 panel.separator();
                 panel.collapsing("Navigation help", |panel| {
                     panel.label("LMB drag: Orbit 3D");

@@ -228,10 +228,9 @@ impl App {
                 .active_3d_index
                 .and_then(|i| self.ui.library.volumes.get(i))
             {
-                let scale = camera_target(&layer.volume, [1.0, 1.0, 1.0]).z;
-                self.ui.camera.fit_bounds(
-                    glam::Vec3::ZERO,
-                    glam::Vec3::new(1.0, 1.0, scale),
+                fit_camera_to_volume(
+                    &mut self.ui.camera,
+                    &layer.volume,
                     self.ui.viewport.width() / self.ui.viewport.height().max(1.0),
                 );
             }
@@ -250,7 +249,7 @@ impl App {
             // Preset switches are applied immediately; cancel any pending
             // debounced band update from previous interactions.
             self.ui.transfer.bands_debounce_deadline = None;
-            let tf = TransferFunction::from_preset(self.ui.transfer.preset);
+            let tf = current_transfer(&self.ui.transfer);
             self.renderer
                 .upload_transfer_function(&self.device, &self.queue, &tf);
             self.ui.slice_view.transfer_func = Some(tf.data);
@@ -348,7 +347,11 @@ impl App {
                         .library
                         .volumes
                         .get(self.ui.slice_view.volume_index)
-                        .map(|layer| self.ui.slice_view.clip_plane(&layer.volume))
+                        .map(|layer| {
+                            self.ui
+                                .slice_view
+                                .clip_plane(&layer.volume, self.ui.reverse_cutaway)
+                        })
                 } else {
                     None
                 },
@@ -508,7 +511,7 @@ impl App {
         self.ui.settings.window_width = vol.window_width as f32;
 
         // Pass the current transfer function to the 2D composite renderer.
-        let tf = TransferFunction::from_preset(self.ui.transfer.preset);
+        let tf = current_transfer(&self.ui.transfer);
         self.ui.slice_view.transfer_func = Some(tf.data);
         self.ui.slice_view.alpha_scale = self.ui.settings.global_opacity;
 
@@ -521,13 +524,15 @@ impl App {
     fn upload_volume_to_gpu(&mut self, idx: usize) {
         if let Some(layer) = self.ui.library.volumes.get(idx) {
             let vol = &layer.volume;
+            self.ui.settings.window_center = vol.window_center as f32;
+            self.ui.settings.window_width = vol.window_width as f32;
             let com = vol.center_of_mass();
             self.ui.camera.target = camera_target(vol, com);
             self.ui.volume_extent = camera_target(vol, [1.0, 1.0, 1.0]);
 
             self.renderer.upload_volume(&self.device, &self.queue, vol);
 
-            let tf = TransferFunction::from_preset(self.ui.transfer.preset);
+            let tf = current_transfer(&self.ui.transfer);
             self.renderer
                 .upload_transfer_function(&self.device, &self.queue, &tf);
 
@@ -542,13 +547,15 @@ impl App {
     fn upload_volume_to_gpu_precomputed(&mut self, idx: usize, packed: &[u16], com: [f32; 3]) {
         if let Some(layer) = self.ui.library.volumes.get(idx) {
             let vol = &layer.volume;
+            self.ui.settings.window_center = vol.window_center as f32;
+            self.ui.settings.window_width = vol.window_width as f32;
             self.ui.camera.target = camera_target(vol, com);
             self.ui.volume_extent = camera_target(vol, [1.0, 1.0, 1.0]);
 
             self.renderer
                 .upload_volume_packed(&self.device, &self.queue, vol, packed);
 
-            let tf = TransferFunction::from_preset(self.ui.transfer.preset);
+            let tf = current_transfer(&self.ui.transfer);
             self.renderer
                 .upload_transfer_function(&self.device, &self.queue, &tf);
 
@@ -619,14 +626,69 @@ pub(crate) fn merge_unique_threats(dst: &mut Vec<ThreatBox>, src: Vec<ThreatBox>
     added
 }
 
-/// The renderer stretches normalized Z by the volume's physical aspect ratio.
-/// Orbit about the same space so non-cubic studies stay centered.
+/// Map a normalized volume point into the renderer's physical world space.
 fn camera_target(vol: &Volume, com: [f32; 3]) -> glam::Vec3 {
-    let xy = (vol.dim_x as f64 * vol.voxel_spacing[0]).max(vol.dim_y as f64 * vol.voxel_spacing[1]);
-    let scale = if xy > 0.0 {
-        (vol.dim_z as f64 * vol.voxel_spacing[2] / xy).clamp(0.1, 10.0) as f32
+    glam::Vec3::from(com)
+        * crate::camera::physical_extent([vol.dim_x, vol.dim_y, vol.dim_z], vol.voxel_spacing)
+}
+
+/// Keep automatic framing consistent with physical geometry in every axis.
+fn fit_camera_to_volume(camera: &mut Camera, volume: &Volume, aspect: f32) {
+    camera.fit_bounds(glam::Vec3::ZERO, camera_target(volume, [1.0; 3]), aspect);
+}
+
+/// The Materials preset uses retained user edits, including after layer switches.
+fn current_transfer(state: &crate::state::TransferState) -> TransferFunction {
+    if state.preset == TransferPreset::Default {
+        TransferFunction::from_bands(&state.bands)
     } else {
-        1.0
-    };
-    glam::Vec3::new(com[0], com[1], com[2] * scale)
+        TransferFunction::from_preset(state.preset)
+    }
+}
+
+#[cfg(test)]
+mod transfer_state_tests {
+    use super::*;
+
+    #[test]
+    fn app_fit_uses_physical_y_extent_and_center() {
+        let vol = Volume {
+            data: vec![],
+            dim_x: 256,
+            dim_y: 128,
+            dim_z: 256,
+            window_center: 0.0,
+            window_width: 1.0,
+            rescale_intercept: 0.0,
+            modality: "CT".into(),
+            voxel_spacing: [1.7421875, 1.7821531, 2.6796875],
+            threats: vec![],
+        };
+        let mut camera = Camera::default();
+        fit_camera_to_volume(&mut camera, &vol, 1.5);
+        let extent = camera_target(&vol, [1.0; 3]);
+        assert_eq!(camera.target, extent * 0.5);
+        assert!((camera.target.y - 0.25573722).abs() < 0.00001);
+    }
+
+    #[test]
+    fn returning_to_materials_preserves_edited_bands() {
+        let mut state = crate::state::TransferState {
+            preset: TransferPreset::Default,
+            ..Default::default()
+        };
+        state.bands[2].color = [255, 0, 255];
+        let edited = current_transfer(&state).data;
+        assert_ne!(
+            edited,
+            TransferFunction::from_preset(TransferPreset::Default).data
+        );
+        state.preset = TransferPreset::Monochrome;
+        assert_eq!(
+            current_transfer(&state).data,
+            TransferFunction::from_preset(TransferPreset::Monochrome).data
+        );
+        state.preset = TransferPreset::Default;
+        assert_eq!(current_transfer(&state).data, edited);
+    }
 }

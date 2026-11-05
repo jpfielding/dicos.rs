@@ -103,7 +103,7 @@ impl Volume {
         let p01 = samples[samples.len() / 100] as f64;
         let p99 = samples[samples.len() * 99 / 100] as f64;
         let width = (p99 - p01).max(1.0);
-        self.window_center = p01 + width * 0.5;
+        self.window_center = p01 + width * 0.5 + self.rescale_intercept;
         self.window_width = width;
     }
 
@@ -214,6 +214,16 @@ mod tests {
             voxel_spacing: [1.0, 1.0, 1.0],
             threats: Vec::new(),
         }
+    }
+
+    #[test]
+    fn automatic_window_uses_the_same_rescaled_domain_as_rendering() {
+        let mut vol = test_volume(10);
+        vol.data = (0..1000).collect();
+        vol.rescale_intercept = -1024.0;
+        vol.compute_window_from_data();
+        assert_eq!(vol.window_center, -524.0);
+        assert_eq!(vol.window_width, 980.0);
     }
 
     #[test]

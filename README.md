@@ -65,6 +65,8 @@ from DICOS files. Uses `wgpu` for GPU ray-casting and `egui` for the UI.
 
 ![Roxel inspection workspace with a linked 3D volume and 2D slice](docs/images/roxel-workspace.png)
 
+[Inspection views and council review](docs/reviews/roxel-ui-review.md)
+
 ```text
 +------------+------------------------+------------------------+
 | Sidebar    |   3D Volume View       |   2D Slice View        |

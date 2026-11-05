@@ -2,7 +2,7 @@
 
 Source locations refer to baseline commit `606331df3b6ccd1ada8a17bc8962bb9d4b2bc11d`; viewer line numbers may move in the UI overhaul.
 
-Date: 2026-11-05. Scope: public DICOS parsing/writing, pixel extraction, frame boundaries, metadata, and Roxel ingestion. These findings are preserved separately from the UI changes; no correctness fixes are included in this report.
+Date: 2026-11-05. Scope: public DICOS parsing/writing, pixel extraction, frame boundaries, metadata, and Roxel ingestion. These findings describe the reviewed baseline. The UI overhaul fixes finding 6 for unsigned, unit-slope data; the other API/ingestion findings remain open.
 
 ## Validation and limits
 
@@ -57,13 +57,15 @@ Confirmed reproduction: a 1x1, 8-bit dataset with padded bytes `[10,0]` parses a
 
 Change: distinguish sample bytes from element padding using the expected pixel count and supported sample format. Remove only the metadata-justified trailing pad byte, and continue rejecting genuinely excess data. Confidence: high for parser behavior.
 
-### 6. P1: 2D and 3D apply different intensity transforms
+### 6. P1: 2D and 3D apply different intensity transforms — fixed for supported unsigned, unit-slope data
 
 Source evidence: `crates/roxel/src/slice_view.rs:141-142` applies window/level directly to raw samples. `crates/roxel/src/raycast.wgsl:110` adds `rescale_intercept` before windowing. `crates/roxel/src/volume/dataset.rs:398-401` reads that intercept from the dataset.
 
 For a nonzero intercept and the same window settings, these paths calculate different normalized intensities for the same stored voxel. A hand example with raw=1000, intercept=-1000, WC=0 and WW=400 gives a saturated value in the raw 2D path but a mid-window normalized intensity in the 3D path, before transfer-function and lighting effects.
 
 Change: define one stored-sample-to-display-value transform and use it consistently in slices, projection/composite paths, window calculations, and 3D rendering. Validate with a synthetic nonzero-intercept dataset. Confidence: high from source; no GUI/GPU execution of this example.
+
+Update: slices and composites now add the same intercept as the 3D shader, and automatic percentile windows use that rescaled domain. Regression tests cover a nonzero intercept in slice/projection and automatic windowing. This does not resolve signed samples or rescale slope (finding 7).
 
 ### 7. P1: Signed pixel representation and rescale slope are not handled or rejected
 

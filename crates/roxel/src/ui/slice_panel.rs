@@ -13,24 +13,17 @@ pub(crate) fn draw_right_panel(ctx: &egui::Context, state: &mut UiState) {
         .default_width(336.0)
         .frame(super::theme::frame())
         .min_width(310.0)
-        .max_width(440.0)
+        .max_width((ctx.available_rect().width() - 500.0).clamp(310.0, 440.0))
         .show(ctx, |panel| {
             panel.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(if state.slice_view.composite {
-                        "2D Projection"
+                        "2D projection"
                     } else {
-                        "2D Slice"
+                        "2D slice"
                     })
+                    .size(16.0)
                     .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(if state.slice_view.composite {
-                        "/  Composite"
-                    } else {
-                        "/  Cross-section"
-                    })
-                    .color(super::theme::MUTED),
                 );
             });
             panel.separator();
@@ -39,7 +32,12 @@ pub(crate) fn draw_right_panel(ctx: &egui::Context, state: &mut UiState) {
             if let Some(tex) = &state.slice_texture {
                 let available = panel.available_size();
                 let controls_height = 430.0;
-                let tex_size = tex.size_vec2();
+                let tex_size = state
+                    .library
+                    .volumes
+                    .get(state.slice_view.volume_index)
+                    .map(|layer| state.slice_view.physical_slice_size(&layer.volume))
+                    .unwrap_or(tex.size_vec2());
                 let viewport_h = (available.y - controls_height)
                     .max(100.0)
                     .min((available.x / tex_size.x * tex_size.y + 32.0).max(160.0));
@@ -71,10 +69,10 @@ pub(crate) fn draw_right_panel(ctx: &egui::Context, state: &mut UiState) {
                     });
                 panel.label(
                     egui::RichText::new(format!(
-                        "{}  ·  {} × {} pixels",
+                        "{}  ·  {:.0} × {:.0} mm",
                         state.slice_view.orientation.label(),
-                        tex.size()[0],
-                        tex.size()[1]
+                        tex_size.x,
+                        tex_size.y
                     ))
                     .small()
                     .color(super::theme::MUTED),
@@ -96,7 +94,7 @@ pub(crate) fn draw_right_panel(ctx: &egui::Context, state: &mut UiState) {
 
             panel.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("INSPECTOR")
+                    egui::RichText::new("Inspector")
                         .size(11.0)
                         .color(super::theme::MUTED),
                 );
@@ -291,18 +289,27 @@ pub(crate) fn draw_expanded(ctx: &egui::Context, state: &mut UiState) {
                     if ui.button("Fit image").clicked() { state.expanded_zoom=100.0; }
                 });
             });
+            let study = state.library.loaded_path.as_ref().and_then(|path| path.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            ui.add(egui::Label::new(egui::RichText::new(&study).size(12.0).color(super::theme::MUTED)).truncate()).on_hover_text(&study);
             let name = state.library.volumes.get(state.slice_view.volume_index).map(|layer| layer.name.as_str()).unwrap_or("Loading");
-            ui.label(egui::RichText::new(format!("{}  /  {}  /  {}", name, state.slice_view.orientation.label(), if state.slice_view.composite { "Composite projection" } else { "Cross-section" })).color(super::theme::MUTED));
+            let physical_size = state.library.volumes.get(state.slice_view.volume_index)
+                .map(|layer| state.slice_view.physical_slice_size(&layer.volume));
+            let fov = physical_size.map(|mm| format!(" · {:.0} × {:.0} mm", mm.x, mm.y)).unwrap_or_default();
+            let details = format!("{} / {} / {}{}", name, state.slice_view.orientation.label(),
+                if state.slice_view.composite { "Composite projection" } else { "Cross-section" }, fov);
+            ui.add(egui::Label::new(egui::RichText::new(details).color(super::theme::MUTED)).truncate()).on_hover_text(name);
             if let Some(texture) = &state.slice_texture {
-                let available = egui::vec2(size.x, (size.y-190.0).max(100.0));
-                let scale = (available.x / texture.size_vec2().x).min(available.y / texture.size_vec2().y);
-                let image_size = texture.size_vec2() * scale * (state.expanded_zoom / 100.0);
+                let available = egui::vec2(size.x, (size.y-218.0).max(100.0));
+                let physical_size = state.library.volumes.get(state.slice_view.volume_index).map(|layer| state.slice_view.physical_slice_size(&layer.volume)).unwrap_or(texture.size_vec2());
+                let scale = (available.x / physical_size.x).min(available.y / physical_size.y);
+                let image_size = physical_size * scale * (state.expanded_zoom / 100.0);
                 egui::Frame::new().fill(super::theme::BG).corner_radius(4).show(ui, |ui| {
-                    egui::ScrollArea::both().id_salt("expanded_image_pan").auto_shrink([false,false]).max_height(available.y).show(ui, |ui| {
+                    let scroll = egui::ScrollArea::both().id_salt("expanded_image_pan").auto_shrink([false,false]).max_height(available.y).show(ui, |ui| {
                         ui.set_min_size(available);
                         ui.add_space(((available.y-image_size.y)*0.5).max(0.0));
-                        ui.horizontal(|ui| { ui.add_space(((available.x-image_size.x)*0.5).max(0.0)); ui.image(egui::load::SizedTexture::new(texture.id(), image_size)); });
+                        ui.horizontal(|ui| { ui.add_space(((available.x-image_size.x)*0.5).max(0.0)); ui.image(egui::load::SizedTexture::new(texture.id(), image_size)).rect }).inner
                     });
+                    draw_scale_bar(ui, scroll.inner.intersect(scroll.inner_rect), scroll.inner_rect, scale * state.expanded_zoom / 100.0);
                 });
             }
             if !state.slice_view.composite {
@@ -329,4 +336,50 @@ pub(crate) fn draw_expanded(ctx: &egui::Context, state: &mut UiState) {
     if close || response.should_close() {
         state.slice_expanded = false;
     }
+}
+
+/// A fixed viewport overlay whose physical length follows image zoom.
+fn draw_scale_bar(ui: &egui::Ui, image_rect: egui::Rect, rect: egui::Rect, pixels_per_mm: f32) {
+    if !pixels_per_mm.is_finite() || pixels_per_mm <= 0.0 {
+        return;
+    }
+    let target_mm = 100.0 / pixels_per_mm;
+    let base = 10.0_f32.powf(target_mm.log10().floor());
+    let mm = [5.0, 2.0, 1.0]
+        .into_iter()
+        .find(|n| base * n <= target_mm)
+        .unwrap_or(1.0)
+        * base;
+    let bar_width = mm * pixels_per_mm;
+    let outside = image_rect.left() - rect.left() >= bar_width + 32.0;
+    let start = egui::pos2(
+        if outside {
+            image_rect.left() - bar_width - 16.0
+        } else {
+            image_rect.left() + 20.0
+        },
+        image_rect.bottom() - 20.0,
+    );
+    let end = start + egui::vec2(mm * pixels_per_mm, 0.0);
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(
+        egui::Rect::from_min_max(start - egui::vec2(8.0, 27.0), end + egui::vec2(8.0, 8.0)),
+        4.0,
+        egui::Color32::from_black_alpha(210),
+    );
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+    painter.line_segment([start, end], stroke);
+    for pos in [start, end] {
+        painter.line_segment(
+            [pos - egui::vec2(0.0, 3.0), pos + egui::vec2(0.0, 3.0)],
+            stroke,
+        );
+    }
+    painter.text(
+        start - egui::vec2(0.0, 7.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{mm:.1} mm"),
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
 }

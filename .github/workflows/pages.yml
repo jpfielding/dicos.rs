@@ -5,7 +5,9 @@ name: Pages
 
 on:
   push:
-    branches: [main]
+    # feat/roxel-web: temporary, so the demo can be tested on real Pages before
+    # merge (the github-pages environment also allows it). Remove before merging.
+    branches: [main, feat/roxel-web]
   workflow_dispatch:
 
 permissions:
@@ -63,8 +65,8 @@ jobs:
           path: crates/roxel/dist
 
   deploy:
-    # Deploy only from main; workflow_dispatch on a branch just builds.
-    if: github.ref == 'refs/heads/main'
+    # Deploy from main (and, temporarily, feat/roxel-web); other refs only build.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/roxel-web'
     needs: build
     runs-on: ubuntu-latest
     environment:

@@ -196,13 +196,15 @@ impl App {
         response.repaint || needs_repaint
     }
 
+    /// Draw one frame. Returns how long until the next frame is needed:
+    /// `Duration::ZERO` for immediately, `Duration::MAX` for "only on input".
     pub fn render(
         &mut self,
         window: &winit::window::Window,
         surface_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-    ) -> bool {
+    ) -> Duration {
         // Hand any bytes delivered by the browser (file picker / fetch) to the loader.
         #[cfg(target_arch = "wasm32")]
         for item in crate::web::take() {
@@ -429,10 +431,20 @@ impl App {
         // Keep the frame loop pumping while a background load is in flight so
         // we continue polling (and animating the spinner) without user input.
         if self.loader.loading().is_some() {
-            self.egui_ctx.request_repaint();
+            return Duration::ZERO;
         }
 
-        self.egui_ctx.has_requested_repaint()
+        // Honor egui's requested delay instead of `has_requested_repaint()`,
+        // which is also true for *delayed* requests and made the caller redraw
+        // every frame (a full ray-cast) while idle.
+        let mut delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        if let Some(deadline) = self.ui.transfer.bands_debounce_deadline {
+            delay = delay.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        delay
     }
 
     /// Request a background load of a file or directory. Called from main for

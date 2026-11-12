@@ -11,9 +11,10 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
+use web_time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 /// Events sent to the event loop from async tasks.
@@ -35,6 +36,8 @@ struct RoxelApp {
     queue: Option<Arc<wgpu::Queue>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
     app: Option<roxel::app::App>,
+    /// When egui asked for a delayed repaint (debounce, animation), if any.
+    repaint_at: Option<Instant>,
     /// Path to load on startup (from CLI args).
     #[cfg(not(target_arch = "wasm32"))]
     initial_path: Option<PathBuf>,
@@ -57,6 +60,7 @@ impl RoxelApp {
             queue: None,
             surface_config: None,
             app: None,
+            repaint_at: None,
             initial_path,
             screenshot: std::env::var_os("ROXEL_SCREENSHOT").map(PathBuf::from),
             settled_frames: 0,
@@ -72,6 +76,7 @@ impl RoxelApp {
             queue: None,
             surface_config: None,
             app: None,
+            repaint_at: None,
             proxy,
         }
     }
@@ -349,8 +354,11 @@ impl ApplicationHandler<AppEvent> for RoxelApp {
             None => return,
         };
 
+        // egui-winit reports `repaint` for RedrawRequested itself; acting on it
+        // made every frame request the next, rendering flat out while idle.
+        // The frame's own repaint decision comes from `App::render`.
         if let Some(app) = &mut self.app {
-            if app.handle_event(&window, &event) {
+            if !matches!(event, WindowEvent::RedrawRequested) && app.handle_event(&window, &event) {
                 window.request_redraw();
             }
         }
@@ -398,7 +406,7 @@ impl ApplicationHandler<AppEvent> for RoxelApp {
                 let view = output
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
-                let wants_repaint = app.render(&window, &view, config.width, config.height);
+                let repaint_delay = app.render(&window, &view, config.width, config.height);
                 #[cfg(not(target_arch = "wasm32"))]
                 if self.screenshot.is_some() {
                     if app.is_loading() {
@@ -443,11 +451,31 @@ impl ApplicationHandler<AppEvent> for RoxelApp {
                     }
                 }
                 output.present();
-                if wants_repaint {
+                if repaint_delay.is_zero() {
+                    self.repaint_at = None;
                     window.request_redraw();
+                } else {
+                    // `Duration::MAX` (idle) overflows: wait for input instead.
+                    self.repaint_at = Instant::now().checked_add(repaint_delay);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Fire a delayed repaint once its deadline passes; otherwise sleep until
+    /// the deadline or the next event, without busy-looping.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.repaint_at {
+            Some(at) if Instant::now() >= at => {
+                self.repaint_at = None;
+                event_loop.set_control_flow(ControlFlow::Wait);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }

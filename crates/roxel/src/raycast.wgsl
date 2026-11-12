@@ -25,8 +25,10 @@ struct Uniforms {
     clip_plane: vec4<f32>,
     depth_cue: f32,
     rescale_slope: f32,
-    signed_pixels: f32,
-    _padding2: f32,
+    // Stored sample = texel.r * density_scale + density_offset. Set per
+    // texture format / signedness by the renderer (see density_decode).
+    density_scale: f32,
+    density_offset: f32,
     volume_extent: vec3<f32>,
     _extent_padding: f32,
 }
@@ -126,13 +128,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let sample = textureSampleLevel(volume_tex, volume_sampler, tex_coord, 0.0);
         let raw_density = sample.r;
 
-        // Window/level normalization. Match Volume::modality_value:
-        // interpret bits as i16 when signed, then stored * slope + intercept.
-        let raw_bits = raw_density * 65535.0;
-        var stored = raw_bits;
-        if u.signed_pixels != 0.0 && raw_bits >= 32768.0 {
-            stored = raw_bits - 65536.0;
-        }
+        // Window/level normalization. Match Volume::modality_value. The
+        // density channel is monotonic in the stored value (signed data is
+        // uploaded offset-binary or as a float), so the linear filter blends
+        // real values and a plain affine decode recovers the stored sample.
+        let stored = raw_density * u.density_scale + u.density_offset;
         let density = stored * u.rescale_slope + u.rescale_intercept;
         let normalized = clamp(
             (density - u.window_min) / u.window_range,

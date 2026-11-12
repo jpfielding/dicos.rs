@@ -35,8 +35,8 @@ struct Uniforms {
     clip_plane: [f32; 4],
     depth_cue: f32,
     rescale_slope: f32,
-    signed_pixels: f32,
-    _padding: f32,
+    density_scale: f32,
+    density_offset: f32,
     volume_extent: [f32; 3],
     _extent_padding: f32,
 }
@@ -94,6 +94,38 @@ pub struct VolumeRenderer {
 struct LineVertex {
     pos: [f32; 2],
     color: [f32; 4],
+}
+
+/// Convert packed `u16` texels to texture bytes; see [`VolumeRenderer::volume_texels`].
+fn volume_texels(
+    format: wgpu::TextureFormat,
+    signed_pixels: bool,
+    packed: &[u16],
+) -> std::borrow::Cow<'_, [u8]> {
+    if format == wgpu::TextureFormat::Rgba16Unorm {
+        return std::borrow::Cow::Borrowed(bytemuck::cast_slice(packed));
+    }
+    let mut out = Vec::with_capacity(packed.len() * 2);
+    for (i, &v) in packed.iter().enumerate() {
+        let f = if signed_pixels && i % 4 == 0 {
+            // Density is offset-binary (see Volume::pack_for_gpu).
+            f32::from(v) - 32768.0
+        } else {
+            f32::from(v) / 65535.0
+        };
+        out.extend_from_slice(&half::f16::from_f32(f).to_le_bytes());
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Shader decode `(scale, offset)` so `texel.r * scale + offset` is the
+/// stored sample, matching [`volume_texels`] and [`Volume::pack_for_gpu`].
+fn density_decode(format: wgpu::TextureFormat, signed_pixels: bool) -> (f32, f32) {
+    match (format == wgpu::TextureFormat::Rgba16Unorm, signed_pixels) {
+        (_, false) => (65535.0, 0.0),
+        (true, true) => (65535.0, -32768.0),
+        (false, true) => (1.0, 0.0),
+    }
 }
 
 impl VolumeRenderer {
@@ -537,16 +569,11 @@ impl VolumeRenderer {
     /// Convert packed `u16` texels to the bytes of the volume texture format.
     ///
     /// `Rgba16Unorm` takes the packed values as-is. `Rgba16Float` (devices
-    /// without 16-bit norm support, e.g. WebGPU) gets `v / 65535` as f16.
+    /// without 16-bit norm support, e.g. WebGPU) gets `v / 65535` as f16,
+    /// except the density of signed volumes, which is uploaded as the stored
+    /// value itself (exact up to +/-2048, far finer than `v / 65535` near 0).
     fn volume_texels<'a>(&self, packed: &'a [u16]) -> std::borrow::Cow<'a, [u8]> {
-        if self.volume_format == wgpu::TextureFormat::Rgba16Unorm {
-            return std::borrow::Cow::Borrowed(bytemuck::cast_slice(packed));
-        }
-        let mut out = Vec::with_capacity(packed.len() * 2);
-        for &v in packed {
-            out.extend_from_slice(&half::f16::from_f32(f32::from(v) / 65535.0).to_le_bytes());
-        }
-        std::borrow::Cow::Owned(out)
+        volume_texels(self.volume_format, self.signed_pixels, packed)
     }
 
     /// Upload a transfer function to a 1D GPU texture.
@@ -695,6 +722,8 @@ impl VolumeRenderer {
         let right = camera.right();
         let up = camera.up();
 
+        let (density_scale, density_offset) =
+            density_decode(self.volume_format, self.signed_pixels);
         let uniforms = Uniforms {
             cam_pos: pos.into(),
             fov: camera.fov,
@@ -715,8 +744,8 @@ impl VolumeRenderer {
             clip_plane: params.clip_plane.unwrap_or([0.0, 0.0, 0.0, -1.0]),
             depth_cue: settings.depth_cue,
             rescale_slope: self.rescale_slope,
-            signed_pixels: if self.signed_pixels { 1.0 } else { 0.0 },
-            _padding: 0.0,
+            density_scale,
+            density_offset,
             volume_extent: volume_extent.into(),
             _extent_padding: 0.0,
         };
@@ -789,5 +818,41 @@ mod geometry_tests {
         assert_eq!(std::mem::size_of::<Uniforms>(), 144);
         assert_eq!(std::mem::offset_of!(Uniforms, volume_extent), 128);
         assert_eq!(std::mem::offset_of!(Uniforms, _extent_padding), 140);
+    }
+
+    fn decode_density(format: wgpu::TextureFormat, signed: bool, packed: &[u16]) -> f32 {
+        let bytes = volume_texels(format, signed, packed);
+        let (scale, offset) = density_decode(format, signed);
+        let texel = if format == wgpu::TextureFormat::Rgba16Unorm {
+            f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0
+        } else {
+            half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32()
+        };
+        texel * scale + offset
+    }
+
+    /// Upload + shader decode recovers the stored sample for every format and
+    /// signedness, including the Rgba16Float (WebGPU) fallback.
+    #[test]
+    fn density_upload_and_decode_round_trip() {
+        use wgpu::TextureFormat::{Rgba16Float, Rgba16Unorm};
+        for stored in [-32768i16, -1000, -17, -1, 0, 1, 40, 2047] {
+            let packed = [(stored as u16) ^ 0x8000, 0, 0, 0];
+            let got = decode_density(Rgba16Unorm, true, &packed);
+            assert!(
+                (got - f32::from(stored)).abs() < 0.01,
+                "unorm {stored}: {got}"
+            );
+            let got = decode_density(Rgba16Float, true, &packed);
+            assert_eq!(got, f32::from(stored), "f16 {stored}");
+        }
+        for stored in [0u16, 1, 40000, 65535] {
+            let packed = [stored, 0, 0, 0];
+            let got = decode_density(Rgba16Unorm, false, &packed);
+            assert!(
+                (got - f32::from(stored)).abs() < 0.01,
+                "unorm {stored}: {got}"
+            );
+        }
     }
 }

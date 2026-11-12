@@ -187,15 +187,24 @@ pub fn load_dicos_bytes(bytes: &[u8]) -> Result<Volume, DicosError> {
 /// 4. `filename_fallback` — position in alphabetically sorted file list.
 #[cfg(not(target_arch = "wasm32"))]
 fn slice_sort_key(ds: &Dataset, filename_fallback: f64) -> f64 {
-    // Try ImagePositionPatient Z component (backslash-separated DS: "x\y\z").
-    if let Some(s) = ds.get_string(tag::IMAGE_POSITION_PATIENT) {
-        let parts: Vec<&str> = s.trim().split('\\').collect();
-        if parts.len() >= 3 {
-            if let Ok(z) = parts[2].trim().parse::<f64>() {
+    // Try ImagePositionPatient Z component. After a real parse, multi-valued
+    // DS is stored as Value::Strings, and get_string only returns the first
+    // component. Use get_strs (the same pattern as PIXEL_SPACING) and also
+    // split a single backslash-separated string so in-memory unsplit values
+    // still work.
+    if let Some(parts) = ds.get_strs(tag::IMAGE_POSITION_PATIENT) {
+        let comps: Vec<&str> = parts
+            .iter()
+            .flat_map(|p| p.split('\\'))
+            .map(|s| s.trim())
+            .collect();
+        if comps.len() >= 3 {
+            if let Ok(z) = comps[2].parse::<f64>() {
                 return z;
             }
         }
     }
+
     // Try SliceLocation.
     if let Some(s) = ds.get_string(tag::SLICE_LOCATION) {
         if let Ok(v) = s.trim().parse::<f64>() {
@@ -610,6 +619,46 @@ mod tests {
         let key_pos = slice_sort_key(&ds_pos, 1.0);
 
         assert!(key_neg < key_pos, "Z=-10 should sort before Z=10");
+    }
+
+    /// Review finding 4: sort after a real write/parse, which splits IPP
+    /// into Value::Strings so get_string is only the first component.
+    #[test]
+    fn slice_sort_key_reads_parsed_image_position_patient() {
+        fn parse_ds(ds: &Dataset) -> Dataset {
+            let mut buf = Vec::new();
+            dicos::write(&mut buf, ds).expect("write should succeed");
+            dicos::reader::parse(std::io::Cursor::new(buf)).expect("parse should succeed")
+        }
+
+        let parsed_neg = parse_ds(&ds_with_z(-10.0));
+        let parsed_pos = parse_ds(&ds_with_z(10.0));
+
+        // The accessor mismatch the review described: get_string is "0.0".
+        assert_eq!(
+            parsed_neg.get_string(tag::IMAGE_POSITION_PATIENT),
+            Some("0.0")
+        );
+        let strs = parsed_neg
+            .get_strs(tag::IMAGE_POSITION_PATIENT)
+            .expect("IPP should be present");
+        assert_eq!(strs.len(), 3);
+        assert_eq!(strs[2].trim(), "-10");
+
+        let key_neg = slice_sort_key(&parsed_neg, 0.0);
+        let key_pos = slice_sort_key(&parsed_pos, 1.0);
+        assert!(
+            (key_neg - (-10.0)).abs() < 1e-6,
+            "expected Z=-10 after parse, got {key_neg}"
+        );
+        assert!(
+            (key_pos - 10.0).abs() < 1e-6,
+            "expected Z=10 after parse, got {key_pos}"
+        );
+        assert!(
+            key_neg < key_pos,
+            "Z=-10 should sort before Z=10 after parse"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -63,6 +63,29 @@ pub fn write_part10<W: Write>(writer: &mut W, ds: &Dataset) -> Result<u64, Dicos
             Value::Str(transfer::EXPLICIT_VR_LITTLE_ENDIAN.to_string()),
         ));
     }
+
+    // The body is always written Explicit VR Little Endian. If the dataset
+    // advertised Implicit VR Little Endian, rewrite that UID so it matches
+    // what we actually emit (the same UID used when it is missing).
+    // Compressed transfer syntaxes are left alone: they describe the pixel
+    // data, not the element VR encoding.
+    for elem in &mut meta_elements {
+        if elem.tag != tag::TRANSFER_SYNTAX_UID {
+            continue;
+        }
+        let implicit = elem
+            .value
+            .as_str()
+            .is_some_and(|uid| uid.trim() == transfer::IMPLICIT_VR_LITTLE_ENDIAN);
+        if implicit {
+            *elem = Element::new(
+                tag::TRANSFER_SYNTAX_UID,
+                Vr::UI,
+                Value::Str(transfer::EXPLICIT_VR_LITTLE_ENDIAN.to_string()),
+            );
+        }
+    }
+
     meta_elements.sort_by_key(|elem| elem.tag);
 
     // Encode all metadata except group length to compute (0002,0000).
@@ -87,7 +110,12 @@ pub fn write_part10<W: Write>(writer: &mut W, ds: &Dataset) -> Result<u64, Dicos
     // 4. Write all non-group-0002 elements in tag order.
     for elem in ds.iter() {
         if elem.tag.group != 0x0002 {
-            write_element(&mut cw, elem)?;
+            let bits = if elem.tag == tag::PIXEL_DATA {
+                ds.bits_allocated()
+            } else {
+                None
+            };
+            write_element_with_bits(&mut cw, elem, bits)?;
         }
     }
 
@@ -96,6 +124,15 @@ pub fn write_part10<W: Write>(writer: &mut W, ds: &Dataset) -> Result<u64, Dicos
 
 /// Writes a single element in Explicit VR Little Endian.
 fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> {
+    write_element_with_bits(w, elem, None)
+}
+
+/// Writes a single element, using `bits_allocated` when encoding native pixels.
+fn write_element_with_bits<W: Write>(
+    w: &mut W,
+    elem: &Element,
+    bits_allocated: Option<u16>,
+) -> Result<(), DicosError> {
     // Tag
     w.write_u16::<LittleEndian>(elem.tag.group)?;
     w.write_u16::<LittleEndian>(elem.tag.element)?;
@@ -105,7 +142,7 @@ fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> 
     w.write_all(&vr_bytes)?;
 
     // Encode value
-    let (val_bytes, is_undefined_length) = encode_value(&elem.value, elem.vr)?;
+    let (val_bytes, is_undefined_length) = encode_value(&elem.value, elem.vr, bits_allocated)?;
 
     // Length
     if elem.vr.is_long_vr() {
@@ -148,7 +185,11 @@ fn write_element<W: Write>(w: &mut W, elem: &Element) -> Result<(), DicosError> 
 }
 
 /// Encodes a `Value` into bytes. Returns `(bytes, is_undefined_length)`.
-fn encode_value(value: &Value, vr: Vr) -> Result<(Vec<u8>, bool), DicosError> {
+fn encode_value(
+    value: &Value,
+    vr: Vr,
+    bits_allocated: Option<u16>,
+) -> Result<(Vec<u8>, bool), DicosError> {
     match value {
         Value::Str(s) => {
             let mut b = s.as_bytes().to_vec();
@@ -220,9 +261,12 @@ fn encode_value(value: &Value, vr: Vr) -> Result<(Vec<u8>, bool), DicosError> {
         }
 
         Value::PixelData(pd) => match pd {
-            PixelData::Native { frames } => Ok((encode_native_pixel_data(frames), false)),
-            PixelData::Encapsulated { frames, offsets } => {
-                let b = encode_encapsulated_pixel_data(frames, offsets)?;
+            PixelData::Native { frames } => {
+                let b = encode_native_pixel_data(frames, bits_allocated)?;
+                Ok((b, false))
+            }
+            PixelData::Encapsulated { frames, .. } => {
+                let b = encode_encapsulated_pixel_data(frames)?;
                 Ok((b, true)) // Encapsulated uses undefined length
             }
         },
@@ -265,8 +309,46 @@ fn encode_sequence(datasets: &[Dataset]) -> Result<Vec<u8>, DicosError> {
     Ok(buf)
 }
 
-/// Encodes native (uncompressed) pixel data.
-fn encode_native_pixel_data(frames: &[Vec<u16>]) -> Vec<u8> {
+/// Encodes native (uncompressed) pixel data using `BitsAllocated`.
+///
+/// 8-bit samples are written as one byte each (values must fit in 0..=255)
+/// and padded to an even length as required by DICOM. 16-bit samples (the
+/// default when BitsAllocated is absent) are written little-endian. Other
+/// widths are rejected because the in-memory representation is `u16`.
+fn encode_native_pixel_data(
+    frames: &[Vec<u16>],
+    bits_allocated: Option<u16>,
+) -> Result<Vec<u8>, DicosError> {
+    match bits_allocated.unwrap_or(16) {
+        8 => encode_native_8bit(frames),
+        16 => Ok(encode_native_16bit(frames)),
+        other => Err(DicosError::Validation(format!(
+            "unsupported BitsAllocated {other} for native pixel data (supported: 8 and 16)"
+        ))),
+    }
+}
+
+fn encode_native_8bit(frames: &[Vec<u16>]) -> Result<Vec<u8>, DicosError> {
+    let total_pixels: usize = frames.iter().map(Vec::len).sum();
+    let mut buf = Vec::with_capacity(total_pixels + 1);
+    for frame in frames {
+        for &pixel in frame {
+            let byte = u8::try_from(pixel).map_err(|_| {
+                DicosError::Validation(format!(
+                    "native sample {pixel} does not fit in 8-bit pixel data"
+                ))
+            })?;
+            buf.push(byte);
+        }
+    }
+    // DICOM Value Length must be even.
+    if buf.len() % 2 == 1 {
+        buf.push(0);
+    }
+    Ok(buf)
+}
+
+fn encode_native_16bit(frames: &[Vec<u16>]) -> Vec<u8> {
     let total_pixels: usize = frames.iter().map(Vec::len).sum();
     let mut buf = Vec::with_capacity(total_pixels * 2);
     for frame in frames {
@@ -286,36 +368,56 @@ fn encode_native_pixel_data(frames: &[Vec<u16>]) -> Vec<u8> {
     buf
 }
 
-/// Encodes encapsulated (compressed) pixel data with BOT and frame items.
-fn encode_encapsulated_pixel_data(
-    frames: &[Vec<u8>],
-    offsets: &[u32],
-) -> Result<Vec<u8>, DicosError> {
+/// Encodes encapsulated (compressed) pixel data with a BOT rebuilt from the
+/// items actually written (one item per assembled frame, including padding).
+fn encode_encapsulated_pixel_data(frames: &[Vec<u8>]) -> Result<Vec<u8>, DicosError> {
+    let mut items = Vec::new();
+    let mut offsets = Vec::with_capacity(frames.len());
+    let mut offset: u32 = 0;
+
+    for frame in frames {
+        offsets.push(offset);
+
+        // Item lengths must be even; a trailing 0 pad is part of the item.
+        let pad = usize::from(frame.len() % 2 == 1);
+        let body_len = frame.len() + pad;
+        let body_len_u32 = u32::try_from(body_len).map_err(|_| {
+            DicosError::Validation(format!(
+                "compressed frame too large ({} bytes, max {})",
+                body_len,
+                u32::MAX
+            ))
+        })?;
+        let item_size = body_len_u32
+            .checked_add(8)
+            .ok_or_else(|| DicosError::Validation("compressed frame too large".into()))?;
+
+        items.write_u16::<LittleEndian>(0xFFFE)?;
+        items.write_u16::<LittleEndian>(0xE000)?;
+        items.write_u32::<LittleEndian>(body_len_u32)?;
+        items.write_all(frame)?;
+        if pad == 1 {
+            items.write_all(&[0])?;
+        }
+
+        offset = offset.checked_add(item_size).ok_or_else(|| {
+            DicosError::Validation("encapsulated pixel data offsets overflow u32".into())
+        })?;
+    }
+
     let mut buf = Vec::new();
 
-    // Basic Offset Table item
+    // Basic Offset Table item, one entry per emitted frame.
     buf.write_u16::<LittleEndian>(0xFFFE)?; // Item tag
     buf.write_u16::<LittleEndian>(0xE000)?;
     let bot_len = u32::try_from(offsets.len() * 4)
         .map_err(|_| DicosError::Validation("Basic Offset Table too large".into()))?;
     buf.write_u32::<LittleEndian>(bot_len)?;
-    for offset in offsets {
-        buf.write_u32::<LittleEndian>(*offset)?;
+    for o in &offsets {
+        buf.write_u32::<LittleEndian>(*o)?;
     }
 
-    // Frame items
-    for frame in frames {
-        buf.write_u16::<LittleEndian>(0xFFFE)?;
-        buf.write_u16::<LittleEndian>(0xE000)?;
-        buf.write_u32::<LittleEndian>(u32::try_from(frame.len()).map_err(|_| {
-            DicosError::Validation(format!(
-                "compressed frame too large ({} bytes, max {})",
-                frame.len(),
-                u32::MAX
-            ))
-        })?)?;
-        buf.write_all(frame)?;
-    }
+    buf.write_all(&items)?;
 
     // Sequence Delimitation Item
     buf.write_u16::<LittleEndian>(0xFFFE)?;
@@ -575,6 +677,199 @@ mod tests {
                 );
             }
             other => panic!("expected PixelData, got {other:?}"),
+        }
+    }
+
+    // --- Review findings 1–3 (and 5, which is needed for odd 8-bit writes) ---
+
+    /// Finding 3: 8-bit native samples must not be widened to 16-bit on write.
+    /// The review probe writes raw OB bytes, parses to Native, then writes again.
+    #[test]
+    fn roundtrip_8bit_native_pixels() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 2);
+        ds.put_u16(tag::BITS_ALLOCATED, Vr::US, 8);
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OB,
+            Value::Bytes(vec![10, 20]),
+        ));
+
+        let first = roundtrip(&ds);
+        assert_eq!(
+            first.pixel_data(),
+            Some(&PixelData::Native {
+                frames: vec![vec![10, 20]]
+            })
+        );
+        assert_eq!(first.bits_allocated(), Some(8));
+
+        let second = roundtrip(&first);
+        assert_eq!(first.pixel_data(), second.pixel_data());
+        assert_eq!(second.bits_allocated(), Some(8));
+    }
+
+    /// Finding 3: 16-bit Native frames still round-trip unchanged.
+    #[test]
+    fn roundtrip_16bit_native_pixel_data_enum() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 2);
+        ds.put_u16(tag::COLUMNS, Vr::US, 2);
+        ds.put_u16(tag::BITS_ALLOCATED, Vr::US, 16);
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OW,
+            Value::PixelData(PixelData::native(vec![vec![100, 200, 300, 400]])),
+        ));
+
+        let rt = roundtrip(&ds);
+        assert_eq!(
+            rt.pixel_data(),
+            Some(&PixelData::Native {
+                frames: vec![vec![100, 200, 300, 400]]
+            })
+        );
+    }
+
+    /// Finding 5: an odd-sized 8-bit image is padded on write; the pad is
+    /// not treated as a voxel on the next parse.
+    #[test]
+    fn roundtrip_8bit_odd_length_strips_padding() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 1);
+        ds.put_u16(tag::BITS_ALLOCATED, Vr::US, 8);
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OB,
+            Value::Bytes(vec![10, 0]),
+        ));
+
+        let first = roundtrip(&ds);
+        assert_eq!(
+            first.pixel_data(),
+            Some(&PixelData::Native {
+                frames: vec![vec![10]]
+            })
+        );
+
+        let second = roundtrip(&first);
+        assert_eq!(first.pixel_data(), second.pixel_data());
+    }
+
+    #[test]
+    fn write_8bit_rejects_samples_that_do_not_fit() {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, 1);
+        ds.put_u16(tag::BITS_ALLOCATED, Vr::US, 8);
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OW,
+            Value::PixelData(PixelData::native(vec![vec![256]])),
+        ));
+
+        let mut buf = Vec::new();
+        let err = write(&mut buf, &ds).expect_err("8-bit overflow should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("256") && msg.contains("8-bit"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Finding 2: writing a dataset tagged Implicit VR Little Endian must
+    /// still produce a file the reader can parse. The UID is normalized to
+    /// Explicit VR Little Endian, matching the missing-UID path.
+    #[test]
+    fn implicit_vr_write_normalizes_to_explicit_and_roundtrips() {
+        let mut ds = Dataset::new();
+        ds.put_string(
+            tag::TRANSFER_SYNTAX_UID,
+            Vr::UI,
+            transfer::IMPLICIT_VR_LITTLE_ENDIAN,
+        );
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+
+        let rt = roundtrip(&ds);
+        assert_eq!(
+            rt.get_string(tag::TRANSFER_SYNTAX_UID),
+            Some(transfer::EXPLICIT_VR_LITTLE_ENDIAN)
+        );
+        assert_eq!(rt.rows(), Some(1));
+    }
+
+    /// Finding 2: compressed UIDs describe the pixel data and must be kept.
+    #[test]
+    fn compressed_transfer_syntax_is_preserved() {
+        let mut ds = Dataset::new();
+        ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, transfer::JPEG_LS_LOSSLESS);
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+
+        let rt = roundtrip(&ds);
+        assert_eq!(
+            rt.get_string(tag::TRANSFER_SYNTAX_UID),
+            Some(transfer::JPEG_LS_LOSSLESS)
+        );
+        assert_eq!(rt.rows(), Some(1));
+    }
+
+    /// Finding 1: after fragments have been assembled into frames, a stale
+    /// BOT must not be copied on write. The review probe starts from
+    /// frames `[[1,2,3,4],[5,6]]` with leftover offsets `[0, 20]`.
+    #[test]
+    fn multi_fragment_roundtrip_recomputes_bot() {
+        let mut ds = Dataset::new();
+        ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, transfer::JPEG_LS_LOSSLESS);
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OB,
+            Value::PixelData(PixelData::encapsulated(
+                vec![vec![1, 2, 3, 4], vec![5, 6]],
+                vec![0, 20],
+            )),
+        ));
+
+        let rt = roundtrip(&ds);
+        match rt.pixel_data() {
+            Some(PixelData::Encapsulated { frames, offsets }) => {
+                assert_eq!(frames, &vec![vec![1, 2, 3, 4], vec![5, 6]]);
+                // Frame 0 is 4 bytes, so the item is 8 (header) + 4 = 12.
+                assert_eq!(offsets, &vec![0, 12]);
+            }
+            other => panic!("expected encapsulated pixel data, got {other:?}"),
+        }
+
+        // A second cycle must be stable.
+        let again = roundtrip(&rt);
+        assert_eq!(rt.pixel_data(), again.pixel_data());
+    }
+
+    /// Finding 1: odd-length fragments are padded, and that pad is included
+    /// in the recomputed offsets so frames stay separate.
+    #[test]
+    fn encapsulated_odd_length_frame_pads_and_keeps_boundaries() {
+        let mut ds = Dataset::new();
+        ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, transfer::JPEG_LS_LOSSLESS);
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OB,
+            Value::PixelData(PixelData::encapsulated(
+                vec![vec![1, 2, 3], vec![4, 5]],
+                vec![0, 99],
+            )),
+        ));
+
+        let rt = roundtrip(&ds);
+        match rt.pixel_data() {
+            Some(PixelData::Encapsulated { frames, offsets }) => {
+                // The odd first frame is padded; the even second frame is not.
+                assert_eq!(frames, &vec![vec![1, 2, 3, 0], vec![4, 5]]);
+                // Padded body is 4 bytes, so the item is 8 + 4 = 12.
+                assert_eq!(offsets, &vec![0, 12]);
+            }
+            other => panic!("expected encapsulated pixel data, got {other:?}"),
         }
     }
 }

@@ -1000,7 +1000,7 @@ fn normalize_native_pixel_data(ds: &mut Dataset) -> Vec<ParseWarning> {
     // 8-bit images store one sample per byte; anything else (and the default)
     // uses 16-bit little-endian pairing. When BitsAllocated is absent we cannot
     // be sure of the width, so we keep 16-bit pairing but warn.
-    let all_pixels: Vec<u16> = if bits_allocated == Some(8) {
+    let mut all_pixels: Vec<u16> = if bits_allocated == Some(8) {
         // 8-bit samples: each byte is one pixel, widened into the u16 buffer.
         raw_bytes.iter().map(|&b| u16::from(b)).collect()
     } else {
@@ -1021,6 +1021,13 @@ fn normalize_native_pixel_data(ds: &mut Dataset) -> Vec<ParseWarning> {
     };
 
     let expected = frame_pixels.saturating_mul(num_frames.max(1));
+
+    // DICOM Value Length must be even. A single trailing pad byte on an
+    // odd-sized 8-bit image is not a voxel; drop only that justified pad
+    // and keep rejecting genuinely excess data.
+    if bits_allocated == Some(8) && expected % 2 == 1 && all_pixels.len() == expected + 1 {
+        all_pixels.pop();
+    }
     let frames: Vec<Vec<u16>> = if num_frames > 1 && all_pixels.len() == frame_pixels * num_frames {
         all_pixels
             .chunks(frame_pixels)

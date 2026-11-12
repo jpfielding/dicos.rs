@@ -21,6 +21,7 @@ use crate::camera::Camera;
 use crate::loader::{LoadOutcome, LoadSource, LoadedLayer, VolumeLoader};
 use crate::renderer::{RenderParams, VolumeRenderer};
 use crate::state::UiState;
+use crate::touch::{Gesture, Phase, TouchTracker};
 use crate::transfer::{TransferFunction, TransferPreset};
 use crate::volume::{self, ThreatBox, Volume};
 
@@ -58,6 +59,8 @@ pub struct App {
     last_mouse_pos: Option<(f32, f32)>,
     shift_down: bool,
     pointer_pos: egui::Pos2,
+    /// Finger gestures on the 3D viewport (orbit, pinch zoom, two-finger pan).
+    touches: TouchTracker,
 }
 
 impl App {
@@ -105,6 +108,7 @@ impl App {
             last_mouse_pos: None,
             shift_down: false,
             pointer_pos: egui::Pos2::ZERO,
+            touches: TouchTracker::default(),
         }
     }
 
@@ -134,6 +138,9 @@ impl App {
             | WindowEvent::Focused(false) => {
                 self.dragging = false;
                 self.last_mouse_pos = None;
+                if matches!(event, WindowEvent::Focused(false)) {
+                    self.touches = TouchTracker::default();
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.shift_down = modifiers.state().shift_key();
@@ -141,6 +148,11 @@ impl App {
             _ => {}
         }
         let response = self.egui_state.on_window_event(window, event);
+        if let WindowEvent::Touch(touch) = event {
+            if self.handle_touch(touch) {
+                return true;
+            }
+        }
         if response.consumed || self.ui.slice_expanded {
             return true;
         }
@@ -194,6 +206,38 @@ impl App {
         };
 
         response.repaint || needs_repaint
+    }
+
+    /// Map finger gestures on the 3D viewport to camera moves. Returns true when
+    /// the camera moved and a repaint is needed.
+    ///
+    /// egui's own pointer emulation has not seen the touch position yet when
+    /// `consumed` is computed, so the viewport rectangle (which never overlaps a
+    /// panel) decides whether a gesture belongs to the camera.
+    fn handle_touch(&mut self, touch: &winit::event::Touch) -> bool {
+        if self.ui.slice_expanded || !self.renderer.is_ready() {
+            return false;
+        }
+        let scale = self.egui_ctx.pixels_per_point();
+        let pos = [touch.location.x as f32, touch.location.y as f32];
+        let inside = self
+            .ui
+            .viewport
+            .contains(egui::pos2(pos[0] / scale, pos[1] / scale));
+        let phase = match touch.phase {
+            winit::event::TouchPhase::Started => Phase::Started,
+            winit::event::TouchPhase::Moved => Phase::Moved,
+            winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => Phase::Ended,
+        };
+        let gestures = self.touches.update(touch.id, phase, pos, inside);
+        for gesture in &gestures {
+            match *gesture {
+                Gesture::Orbit { dx, dy } => self.ui.camera.rotate(dx * 0.005, -dy * 0.005),
+                Gesture::Pan { dx, dy } => self.ui.camera.pan_pixels(dx, dy),
+                Gesture::Zoom(factor) => self.ui.camera.zoom(factor),
+            }
+        }
+        !gestures.is_empty()
     }
 
     /// Draw one frame. Returns how long until the next frame is needed:

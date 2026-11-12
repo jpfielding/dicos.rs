@@ -18,6 +18,7 @@ use crate::loader::LoadSource;
 use crate::renderer::Quality;
 use crate::slice_view::SliceView;
 use crate::transfer::{self, ColorBand, TransferPreset};
+use crate::ui::layout::{Layout, PhoneTab};
 
 use std::path::PathBuf;
 use web_time::Instant;
@@ -34,6 +35,14 @@ pub(crate) struct UiState {
     pub(crate) slice_expanded: bool,
     pub(crate) expanded_zoom: f32,
     pub(crate) focus_volume: bool,
+    /// Layout chosen from the available logical size (refreshed every frame).
+    pub(crate) layout: Layout,
+    /// Compact layouts: the tab shown in the sheet / side panel.
+    pub(crate) phone_tab: PhoneTab,
+    /// Portrait layout: whether the sheet above the tab bar is open.
+    pub(crate) sheet_open: bool,
+    /// Compact focus mode: whether the display adjustments sheet is open.
+    pub(crate) focus_adjust_open: bool,
 
     /// Loaded volume layers and threat selection state.
     pub(crate) library: VolumeLibrary,
@@ -80,6 +89,10 @@ impl UiState {
             slice_expanded: false,
             expanded_zoom: 100.0,
             focus_volume: false,
+            layout: Layout::Desktop,
+            phone_tab: PhoneTab::Slice,
+            sheet_open: true,
+            focus_adjust_open: false,
             library: VolumeLibrary::default(),
             transfer: TransferState::default(),
             settings: RenderSettings::default(),

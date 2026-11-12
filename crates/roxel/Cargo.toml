@@ -20,7 +20,7 @@ dicos = { workspace = true, features = ["all-codecs"] }
 thiserror.workspace = true
 log.workspace = true
 glam.workspace = true
-half = { version = "2", features = ["bytemuck"] }
+half = "2"
 web-time = "1"
 
 # GPU

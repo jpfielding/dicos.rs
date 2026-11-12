@@ -68,6 +68,8 @@ pub struct VolumeRenderer {
     line_vertex_buffer: wgpu::Buffer,
     line_vertex_capacity: usize,
     volume_texture: Option<wgpu::Texture>,
+    /// `Rgba16Unorm` when the device supports it, otherwise `Rgba16Float`.
+    volume_format: wgpu::TextureFormat,
     transfer_texture: Option<wgpu::Texture>,
     volume_sampler: wgpu::Sampler,
     transfer_sampler: wgpu::Sampler,
@@ -93,6 +95,15 @@ struct LineVertex {
 impl VolumeRenderer {
     /// Create a new renderer with the given device and output texture format.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let volume_format = if device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
+            wgpu::TextureFormat::Rgba16Unorm
+        } else {
+            wgpu::TextureFormat::Rgba16Float
+        };
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raycast_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("raycast.wgsl").into()),
@@ -281,6 +292,7 @@ impl VolumeRenderer {
             line_vertex_buffer,
             line_vertex_capacity,
             volume_texture: None,
+            volume_format,
             transfer_texture: None,
             volume_sampler,
             transfer_sampler,
@@ -458,6 +470,8 @@ impl VolumeRenderer {
             depth_or_array_layers: self.dim_z,
         };
 
+        let texels = self.volume_texels(packed);
+
         if can_reuse {
             let texture = self
                 .volume_texture
@@ -470,7 +484,7 @@ impl VolumeRenderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                bytemuck::cast_slice(packed),
+                &texels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.dim_x * 4 * 2), // 4 u16 channels
@@ -487,7 +501,7 @@ impl VolumeRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba16Unorm,
+            format: self.volume_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -499,7 +513,7 @@ impl VolumeRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(packed),
+            &texels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(self.dim_x * 4 * 2), // 4 u16 channels
@@ -510,6 +524,21 @@ impl VolumeRenderer {
 
         self.volume_texture = Some(texture);
         self.rebuild_bind_group(device);
+    }
+
+    /// Convert packed `u16` texels to the bytes of the volume texture format.
+    ///
+    /// `Rgba16Unorm` takes the packed values as-is. `Rgba16Float` (devices
+    /// without 16-bit norm support, e.g. WebGPU) gets `v / 65535` as f16.
+    fn volume_texels<'a>(&self, packed: &'a [u16]) -> std::borrow::Cow<'a, [u8]> {
+        if self.volume_format == wgpu::TextureFormat::Rgba16Unorm {
+            return std::borrow::Cow::Borrowed(bytemuck::cast_slice(packed));
+        }
+        let mut out = Vec::with_capacity(packed.len() * 2);
+        for &v in packed {
+            out.extend_from_slice(&half::f16::from_f32(f32::from(v) / 65535.0).to_le_bytes());
+        }
+        std::borrow::Cow::Owned(out)
     }
 
     /// Upload a transfer function to a 1D GPU texture.

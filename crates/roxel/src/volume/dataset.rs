@@ -103,6 +103,14 @@ fn parse_le_u16s(raw: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+/// Parse a single DS / numeric tag, including a multi-valued first component.
+fn parse_ds_f64(ds: &Dataset, t: dicos::tag::Tag) -> Option<f64> {
+    ds.get_strs(t)
+        .and_then(|vals| vals.first().and_then(|s| s.trim().parse().ok()))
+        .or_else(|| ds.get_string(t).and_then(|s| s.trim().parse().ok()))
+        .or_else(|| ds.get_f64(t))
+}
+
 pub(super) fn parse_numbers(value: &Value) -> Vec<f64> {
     match value {
         Value::Str(s) => s
@@ -338,6 +346,8 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
         window_center: first.window_center,
         window_width: first.window_width,
         rescale_intercept: first.rescale_intercept,
+        rescale_slope: first.rescale_slope,
+        signed_pixels: first.signed_pixels,
         modality: first.modality,
         voxel_spacing: first.voxel_spacing,
         threats: first.threats,
@@ -411,10 +421,38 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         })
         .unwrap_or(65536.0);
 
-    let rescale_intercept = ds
-        .get_string(tag::RESCALE_INTERCEPT)
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(0.0);
+    let rescale_intercept = parse_ds_f64(ds, tag::RESCALE_INTERCEPT).unwrap_or(0.0);
+    let rescale_slope = parse_ds_f64(ds, tag::RESCALE_SLOPE).unwrap_or(1.0);
+    if !rescale_slope.is_finite() {
+        return Err(DicosError::InvalidValue {
+            group: tag::RESCALE_SLOPE.group,
+            element: tag::RESCALE_SLOPE.element,
+            reason: format!("RescaleSlope must be a finite number, got {rescale_slope}"),
+        });
+    }
+
+    let pixel_representation = ds.pixel_representation().unwrap_or(0);
+    if pixel_representation != 0 && pixel_representation != 1 {
+        return Err(DicosError::InvalidValue {
+            group: tag::PIXEL_REPRESENTATION.group,
+            element: tag::PIXEL_REPRESENTATION.element,
+            reason: format!(
+                "PixelRepresentation {pixel_representation} is unsupported (expected 0 unsigned or 1 signed)"
+            ),
+        });
+    }
+    let signed_pixels = pixel_representation == 1;
+    let bits_allocated = ds.bits_allocated().unwrap_or(16);
+    if signed_pixels && bits_allocated != 8 && bits_allocated != 16 {
+        return Err(DicosError::InvalidValue {
+            group: tag::BITS_ALLOCATED.group,
+            element: tag::BITS_ALLOCATED.element,
+            reason: format!(
+                "signed pixel data with BitsAllocated={bits_allocated} is unsupported (expected 8 or 16)"
+            ),
+        });
+    }
+
     let modality = ds.modality().to_string();
 
     // Extract pixel data.
@@ -519,6 +557,14 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         }
     }
 
+    // Sign-extend 8-bit signed samples so the rest of the viewer can treat
+    // stored bits as i16 (0xFF becomes -1, not 255).
+    if signed_pixels && bits_allocated == 8 {
+        for sample in &mut all_pixels {
+            *sample = *sample as u8 as i8 as i16 as u16;
+        }
+    }
+
     let mut vol = Volume {
         data: all_pixels,
         dim_x,
@@ -527,6 +573,8 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
         window_center,
         window_width,
         rescale_intercept,
+        rescale_slope,
+        signed_pixels,
         modality,
         voxel_spacing,
         threats: parse_threats(ds, [dim_x, dim_y, dim_z]),
@@ -738,6 +786,102 @@ mod tests {
         assert!(
             matches!(result, Err(dicos::error::DicosError::InvalidFile(_))),
             "expected InvalidFile for missing pixel data, got {result:?}"
+        );
+    }
+
+    fn dataset_with_pixels(
+        pixels: &[u16],
+        bits: u16,
+        signed: bool,
+        slope: &str,
+        intercept: &str,
+    ) -> Dataset {
+        let mut ds = Dataset::new();
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+        ds.put_u16(tag::COLUMNS, Vr::US, pixels.len() as u16);
+        ds.put_u16(tag::BITS_ALLOCATED, Vr::US, bits);
+        ds.put_u16(
+            tag::PIXEL_REPRESENTATION,
+            Vr::US,
+            if signed { 1 } else { 0 },
+        );
+        ds.put_string(tag::RESCALE_SLOPE, Vr::DS, slope);
+        ds.put_string(tag::RESCALE_INTERCEPT, Vr::DS, intercept);
+        ds.put_string(tag::MODALITY, Vr::CS, "CT");
+        let mut bytes = Vec::new();
+        if bits == 8 {
+            for &p in pixels {
+                bytes.push(p as u8);
+            }
+            if bytes.len() % 2 == 1 {
+                bytes.push(0);
+            }
+        } else {
+            for &p in pixels {
+                bytes.extend_from_slice(&p.to_le_bytes());
+            }
+        }
+        ds.insert(Element::new(tag::PIXEL_DATA, Vr::OW, Value::Bytes(bytes)));
+        ds
+    }
+
+    fn volume_after_parse(ds: &Dataset) -> Volume {
+        let mut buf = Vec::new();
+        dicos::write(&mut buf, ds).expect("write should succeed");
+        load_dicos_bytes(&buf).expect("load should succeed")
+    }
+
+    /// Finding 7: a stored -1 (0xFFFF) with PixelRepresentation=1 is -1, not 65535.
+    #[test]
+    fn signed_pixels_after_parse_are_i16() {
+        let ds = dataset_with_pixels(&[(-1i16) as u16], 16, true, "1", "0");
+        let vol = volume_after_parse(&ds);
+        assert!(vol.signed_pixels);
+        assert_eq!(vol.rescale_slope, 1.0);
+        assert_eq!(vol.modality_value(vol.data[0]), -1.0);
+    }
+
+    /// Finding 7: RescaleSlope is applied with the intercept.
+    #[test]
+    fn rescale_slope_applied_after_parse() {
+        let ds = dataset_with_pixels(&[1000], 16, false, "2", "-1000");
+        let vol = volume_after_parse(&ds);
+        assert!(!vol.signed_pixels);
+        assert_eq!(vol.rescale_slope, 2.0);
+        assert_eq!(vol.rescale_intercept, -1000.0);
+        assert_eq!(vol.modality_value(vol.data[0]), 1000.0);
+    }
+
+    /// Finding 7: 8-bit signed 0xFF is sign-extended to -1.
+    /// Uses in-memory Native frames, which is what the loader sees after
+    /// a correctly decoded 8-bit parse.
+    #[test]
+    fn signed_8bit_is_sign_extended() {
+        let mut ds = dataset_with_pixels(&[0x00FF], 8, true, "1", "0");
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OW,
+            Value::PixelData(dicos::types::PixelData::native(vec![vec![255]])),
+        ));
+        let vol = volume_from_dataset(&ds).expect("8-bit signed volume should load");
+        assert!(vol.signed_pixels);
+        assert_eq!(vol.data[0], (-1i16) as u16);
+        assert_eq!(vol.modality_value(vol.data[0]), -1.0);
+    }
+
+    #[test]
+    fn unsupported_pixel_representation_is_rejected() {
+        let mut ds = dataset_with_pixels(&[1], 16, false, "1", "0");
+        ds.put_u16(tag::PIXEL_REPRESENTATION, Vr::US, 2);
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(
+                result,
+                Err(dicos::error::DicosError::InvalidValue { group, element, .. })
+                    if group == tag::PIXEL_REPRESENTATION.group
+                        && element == tag::PIXEL_REPRESENTATION.element
+            ),
+            "expected InvalidValue for PixelRepresentation, got {result:?}"
         );
     }
 }

@@ -24,8 +24,8 @@ struct Uniforms {
     specular_intensity: f32,
     clip_plane: vec4<f32>,
     depth_cue: f32,
-    _padding0: f32,
-    _padding1: f32,
+    rescale_slope: f32,
+    signed_pixels: f32,
     _padding2: f32,
     volume_extent: vec3<f32>,
     _extent_padding: f32,
@@ -126,10 +126,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let sample = textureSampleLevel(volume_tex, volume_sampler, tex_coord, 0.0);
         let raw_density = sample.r;
 
-        // Window/level normalization.
-        let density = raw_density * 65535.0;
+        // Window/level normalization. Match Volume::modality_value:
+        // interpret bits as i16 when signed, then stored * slope + intercept.
+        let raw_bits = raw_density * 65535.0;
+        var stored = raw_bits;
+        if u.signed_pixels != 0.0 && raw_bits >= 32768.0 {
+            stored = raw_bits - 65536.0;
+        }
+        let density = stored * u.rescale_slope + u.rescale_intercept;
         let normalized = clamp(
-            (density + u.rescale_intercept - u.window_min) / u.window_range,
+            (density - u.window_min) / u.window_range,
             0.0, 1.0
         );
 

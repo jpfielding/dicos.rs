@@ -27,6 +27,10 @@ pub struct Volume {
     pub window_width: f64,
     /// DICOM rescale intercept.
     pub rescale_intercept: f64,
+    /// DICOM rescale slope. Defaults to 1.0 when the tag is absent.
+    pub rescale_slope: f64,
+    /// True when PixelRepresentation is 1 (signed two's-complement samples).
+    pub signed_pixels: bool,
     /// Modality string (e.g. "CT", "DX").
     pub modality: String,
     /// Voxel spacing in mm (X, Y, Z). Defaults to (1.0, 1.0, 1.0).
@@ -36,6 +40,21 @@ pub struct Volume {
 }
 
 impl Volume {
+    /// Interpret a stored sample as a signed or unsigned integer.
+    pub fn stored_sample(&self, raw: u16) -> f64 {
+        if self.signed_pixels {
+            f64::from(raw as i16)
+        } else {
+            f64::from(raw)
+        }
+    }
+
+    /// Convert a stored sample to a modality (display) value:
+    /// `stored * RescaleSlope + RescaleIntercept`.
+    pub fn modality_value(&self, raw: u16) -> f64 {
+        self.stored_sample(raw) * self.rescale_slope + self.rescale_intercept
+    }
+
     /// Compute the density-weighted center of mass in normalized [0,1] coordinates.
     ///
     /// Single linear pass: computes min/max for threshold, then accumulates
@@ -45,13 +64,14 @@ impl Volume {
             return [0.5, 0.5, 0.5];
         }
 
-        let mut min_val = u16::MAX;
-        let mut max_val = u16::MIN;
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
         for &v in &self.data {
-            min_val = min_val.min(v);
-            max_val = max_val.max(v);
+            let val = self.stored_sample(v);
+            min_val = min_val.min(val);
+            max_val = max_val.max(val);
         }
-        let threshold = min_val as f64 + (max_val as f64 - min_val as f64) * 0.1;
+        let threshold = min_val + (max_val - min_val) * 0.1;
 
         let dx = self.dim_x;
         let dxy = self.dim_x * self.dim_y;
@@ -61,7 +81,7 @@ impl Volume {
         let mut total_weight = 0.0f64;
 
         for (i, &v) in self.data.iter().enumerate() {
-            let val = v as f64;
+            let val = self.stored_sample(v);
             if val > threshold {
                 let z = i / dxy;
                 let rem = i % dxy;
@@ -93,19 +113,24 @@ impl Volume {
         if self.data.is_empty() {
             return;
         }
-        let min_val = *self.data.iter().min().unwrap_or(&0) as f64;
-        let max_val = *self.data.iter().max().unwrap_or(&0) as f64;
-        if max_val <= min_val {
+        // Simple percentile: sample up to 100k voxels for speed.
+        // Percentiles are taken in the modality (slope + intercept) domain
+        // so the resulting window matches slice and 3D rendering.
+        let step = (self.data.len() / 100_000).max(1);
+        let mut samples: Vec<f64> = self
+            .data
+            .iter()
+            .step_by(step)
+            .map(|&v| self.modality_value(v))
+            .collect();
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p01 = samples[samples.len() / 100];
+        let p99 = samples[samples.len() * 99 / 100];
+        if p99 <= p01 {
             return;
         }
-        // Simple percentile: sample up to 100k voxels for speed.
-        let step = (self.data.len() / 100_000).max(1);
-        let mut samples: Vec<u16> = self.data.iter().step_by(step).copied().collect();
-        samples.sort_unstable();
-        let p01 = samples[samples.len() / 100] as f64;
-        let p99 = samples[samples.len() * 99 / 100] as f64;
         let width = (p99 - p01).max(1.0);
-        self.window_center = p01 + width * 0.5 + self.rescale_intercept;
+        self.window_center = p01 + width * 0.5;
         self.window_width = width;
     }
 
@@ -127,6 +152,10 @@ impl Volume {
         let stride_y = dx;
         let stride_z = dx * dy;
         let data = &self.data;
+        // Gradients use the signed stored value so a sample of -1 is not
+        // treated as 65535. The density channel keeps the raw bits for the
+        // shader, which applies the same signed interpretation and rescale.
+        let stored = |i: usize| self.stored_sample(data[i]) as f32;
 
         for z in 0..dz {
             let z_base = z * stride_z;
@@ -137,50 +166,46 @@ impl Volume {
                 for x in 0..dx {
                     let idx = yz_base + x;
                     let pi = idx * 4;
-                    let center = data[idx] as f32;
+                    let center = stored(idx);
 
                     let gx = if x == 0 || x == dx - 1 {
-                        let left = if x > 0 { data[idx - 1] as f32 } else { center };
-                        let right = if x < dx - 1 {
-                            data[idx + 1] as f32
-                        } else {
-                            center
-                        };
+                        let left = if x > 0 { stored(idx - 1) } else { center };
+                        let right = if x < dx - 1 { stored(idx + 1) } else { center };
                         (right - left) * 0.5
                     } else {
-                        (data[idx + 1] as f32 - data[idx - 1] as f32) * 0.5
+                        (stored(idx + 1) - stored(idx - 1)) * 0.5
                     };
 
                     let gy = if y_is_edge {
                         let below = if y > 0 {
-                            data[idx - stride_y] as f32
+                            stored(idx - stride_y)
                         } else {
                             center
                         };
                         let above = if y < dy - 1 {
-                            data[idx + stride_y] as f32
+                            stored(idx + stride_y)
                         } else {
                             center
                         };
                         (above - below) * 0.5
                     } else {
-                        (data[idx + stride_y] as f32 - data[idx - stride_y] as f32) * 0.5
+                        (stored(idx + stride_y) - stored(idx - stride_y)) * 0.5
                     };
 
                     let gz = if z_is_edge {
                         let back = if z > 0 {
-                            data[idx - stride_z] as f32
+                            stored(idx - stride_z)
                         } else {
                             center
                         };
                         let front = if z < dz - 1 {
-                            data[idx + stride_z] as f32
+                            stored(idx + stride_z)
                         } else {
                             center
                         };
                         (front - back) * 0.5
                     } else {
-                        (data[idx + stride_z] as f32 - data[idx - stride_z] as f32) * 0.5
+                        (stored(idx + stride_z) - stored(idx - stride_z)) * 0.5
                     };
 
                     packed[pi] = data[idx];
@@ -212,6 +237,8 @@ mod tests {
             window_center: 32768.0,
             window_width: 65536.0,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             modality: "CT".into(),
             voxel_spacing: [1.0, 1.0, 1.0],
             threats: Vec::new(),
@@ -247,6 +274,8 @@ mod tests {
             window_center: 0.0,
             window_width: 1.0,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             modality: String::new(),
             voxel_spacing: [1.0, 1.0, 1.0],
             threats: Vec::new(),
@@ -280,5 +309,46 @@ mod tests {
         assert!(packed[idx + 1].abs_diff(32768) <= 1);
         assert!(packed[idx + 2].abs_diff(32768) <= 1);
         assert!(packed[idx + 3].abs_diff(32768) <= 1);
+    }
+
+    #[test]
+    fn modality_value_interprets_signed_bits() {
+        let mut vol = test_volume(1);
+        vol.signed_pixels = true;
+        vol.rescale_slope = 1.0;
+        vol.rescale_intercept = 0.0;
+        assert_eq!(vol.modality_value((-1i16) as u16), -1.0);
+        vol.signed_pixels = false;
+        assert_eq!(vol.modality_value((-1i16) as u16), 65535.0);
+    }
+
+    #[test]
+    fn automatic_window_applies_slope() {
+        let mut vol = test_volume(10);
+        vol.data = (0..1000).collect();
+        vol.rescale_slope = 2.0;
+        vol.rescale_intercept = -1024.0;
+        vol.compute_window_from_data();
+        // p01 = 10*2-1024 = -1004, p99 = 990*2-1024 = 956, width = 1960
+        assert_eq!(vol.window_center, -24.0);
+        assert_eq!(vol.window_width, 1960.0);
+    }
+
+    #[test]
+    fn packed_gradient_uses_signed_samples() {
+        // A 3x1x1 line: -2, 0, 2 as i16. The central gradient should be
+        // (2 - (-2)) / 2 = 2, not a wrap from 65534.
+        let mut vol = test_volume(1);
+        vol.dim_x = 3;
+        vol.dim_y = 1;
+        vol.dim_z = 1;
+        vol.data = vec![(-2i16) as u16, 0, 2];
+        vol.signed_pixels = true;
+        let packed = vol.pack_for_gpu();
+        // Center voxel is index 1; channel 1 is gradient x, packed as unorm
+        // (value / 65535 + 0.5).
+        let gx = packed[5];
+        let expected = ((2.0_f32 / 65535.0 + 0.5) * 65535.0).round() as u16;
+        assert_eq!(gx, expected);
     }
 }

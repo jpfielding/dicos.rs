@@ -166,7 +166,8 @@ impl SliceView {
 
     /// Render a single slice as a grayscale `egui::ColorImage`.
     ///
-    /// Applies rescale intercept and window/level to map uint16 voxel values to 0-255 grayscale.
+    /// Applies signed interpretation, rescale slope/intercept, and window/level
+    /// to map stored voxel values to 0-255 grayscale.
     pub fn render_slice(&self, vol: &Volume) -> egui::ColorImage {
         let (w, h) = Self::slice_dims(vol, self.orientation);
         if w == 0 || h == 0 {
@@ -184,9 +185,10 @@ impl SliceView {
         let mut pixels = Vec::with_capacity(w * h);
         for v in 0..h {
             for u in 0..w {
-                let raw = Self::sample(vol, self.orientation, u, v, self.slice_index) as f32;
-                let gray = ((raw + vol.rescale_intercept as f32 - low) * inv_width)
-                    .clamp(0.0, 255.0) as u8;
+                let raw =
+                    vol.modality_value(Self::sample(vol, self.orientation, u, v, self.slice_index))
+                        as f32;
+                let gray = ((raw - low) * inv_width).clamp(0.0, 255.0) as u8;
                 pixels.push(egui::Color32::from_gray(gray));
             }
         }
@@ -227,8 +229,7 @@ impl SliceView {
                 break;
             }
 
-            let density =
-                Self::sample(vol, orientation, u, v, s) as f32 + vol.rescale_intercept as f32;
+            let density = vol.modality_value(Self::sample(vol, orientation, u, v, s)) as f32;
 
             // Window/level normalization.
             if density <= w_min {
@@ -431,6 +432,29 @@ mod tests {
     }
 
     #[test]
+    fn signed_pixels_and_slope_match_slice_and_projection_window() {
+        let mut vol = test_volume();
+        vol.dim_x = 1;
+        vol.dim_y = 1;
+        vol.dim_z = 1;
+        vol.data = vec![(-1i16) as u16];
+        vol.signed_pixels = true;
+        vol.rescale_slope = 2.0;
+        vol.rescale_intercept = 1.0;
+        // modality = -1 * 2 + 1 = -1
+        assert_eq!(vol.modality_value(vol.data[0]), -1.0);
+
+        // WC=-1, WW=2: low=-2, (-1 - (-2)) / 2 * 255 = 127.5 -> 127
+        let view = SliceView {
+            window_center: -1.0,
+            window_width: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(view.render_slice(&vol).pixels[0].r(), 127);
+        assert_eq!(view.render_composite(&vol).pixels[0].r(), 127);
+    }
+
+    #[test]
     fn reverse_cutaway_keeps_opposite_half_and_physical_slice_preserves_aspect() {
         let mut vol = test_volume();
         vol.dim_y = 2;
@@ -498,6 +522,8 @@ mod tests {
             window_center: 1000.0,
             window_width: 2000.0,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             modality: "CT".into(),
             voxel_spacing: [1.0, 1.0, 1.0],
             threats: Vec::new(),
@@ -685,6 +711,8 @@ mod tests {
             window_center: 20000.0,
             window_width: 40000.0,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             modality: "CT".into(),
             voxel_spacing: [1.0, 1.0, 1.0],
             threats: Vec::new(),

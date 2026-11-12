@@ -700,6 +700,8 @@ mod transfer_state_tests {
             window_center: 0.0,
             window_width: 1.0,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             modality: "CT".into(),
             voxel_spacing: [1.7421875, 1.7821531, 2.6796875],
             threats: vec![],

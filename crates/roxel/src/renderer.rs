@@ -34,7 +34,9 @@ struct Uniforms {
     specular_intensity: f32,
     clip_plane: [f32; 4],
     depth_cue: f32,
-    _padding: [f32; 3],
+    rescale_slope: f32,
+    signed_pixels: f32,
+    _padding: f32,
     volume_extent: [f32; 3],
     _extent_padding: f32,
 }
@@ -74,9 +76,11 @@ pub struct VolumeRenderer {
     volume_sampler: wgpu::Sampler,
     transfer_sampler: wgpu::Sampler,
 
-    // Volume-derived rendering parameter (not part of `RenderSettings` — set
-    // from DICOS rescale intercept metadata in `upload_volume`).
+    // Volume-derived rendering parameters (not part of `RenderSettings` —
+    // set from DICOS rescale metadata in `upload_volume`).
     pub rescale_intercept: f32,
+    pub rescale_slope: f32,
+    pub signed_pixels: bool,
 
     // Volume dimensions and physical world extent.
     dim_x: u32,
@@ -297,6 +301,8 @@ impl VolumeRenderer {
             volume_sampler,
             transfer_sampler,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             dim_x: 1,
             dim_y: 1,
             dim_z: 1,
@@ -459,6 +465,8 @@ impl VolumeRenderer {
         self.dim_z = new_dim_z;
 
         self.rescale_intercept = volume.rescale_intercept as f32;
+        self.rescale_slope = volume.rescale_slope as f32;
+        self.signed_pixels = volume.signed_pixels;
         self.volume_extent = physical_extent(
             [volume.dim_x, volume.dim_y, volume.dim_z],
             volume.voxel_spacing,
@@ -706,7 +714,9 @@ impl VolumeRenderer {
             specular_intensity: settings.specular,
             clip_plane: params.clip_plane.unwrap_or([0.0, 0.0, 0.0, -1.0]),
             depth_cue: settings.depth_cue,
-            _padding: [0.0; 3],
+            rescale_slope: self.rescale_slope,
+            signed_pixels: if self.signed_pixels { 1.0 } else { 0.0 },
+            _padding: 0.0,
             volume_extent: volume_extent.into(),
             _extent_padding: 0.0,
         };

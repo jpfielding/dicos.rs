@@ -44,6 +44,12 @@
 
 ## 2. Work breakdown (in order, one commit each)
 
+### Step 0: Devcontainer build support (`.devcontainer/Dockerfile`, `.devcontainer/devcontainer.json`)
+- rustup install adds `-t wasm32-unknown-unknown`.
+- Install Trunk from the pinned release binary (`TRUNK_VERSION=0.22.1`, `trunk-$(uname -m)-unknown-linux-musl.tar.gz`), verified against the release's `.sha256` file. The `.sha256` file holds the bare hash with no filename, so it is checked with `echo "<hash>  <asset>" | sha256sum -c -`. Trunk downloads the `wasm-bindgen` and `wasm-opt` versions it needs on first use, into `~/.cache/trunk`.
+- `devcontainer.json`: forward port 8080 for `trunk serve`.
+- **Done when:** `podman build --target user .devcontainer` succeeds, and inside the image `trunk --version` and `rustup target list --installed` show Trunk and the wasm target.
+
 ### Step 1: Dependency gating (`crates/roxel/Cargo.toml`, workspace `Cargo.toml`)
 - Workspace: set `egui-winit = { version = "0.33", default-features = false }`. In roxel, turn the native defaults back on for non-wasm targets:
   ```toml
@@ -64,7 +70,7 @@
 - Add `half = { version = "2", features = ["bytemuck"] }` for all targets, since it's used by the runtime format fallback.
 - Add `web-time = "1"` for all targets.
 - `rfd`: keep it for all targets. Its async API works on wasm, but the `FileDialog` sync calls and `pick_folder` must be `cfg`-gated.
-- **Check:** confirm whether `getrandom` (0.2 or 0.3) is pulled in for wasm: `cargo tree -p roxel -i getrandom --target wasm32-unknown-unknown`. If it is, enable `js` (0.2) or `wasm_js` plus `--cfg getrandom_backend="wasm_js"` (0.3).
+- **Check (done 2026-11-11):** `cargo tree -p roxel -i getrandom@{0.3.4,0.4.2} --target wasm32-unknown-unknown -e normal` prints nothing, so `getrandom` is **not** in roxel's wasm graph and needs no feature work. Re-check after adding the wasm deps.
 - **Done when:** `cargo check -p roxel --target wasm32-unknown-unknown` gets past dependency compilation and shows only roxel-source errors, and `cargo check -p roxel` (native) still passes.
 
 ### Step 2: Portability fixes that change nothing natively
@@ -131,7 +137,7 @@ This is the biggest structural change. In winit 0.30 on the web, `resumed()` can
   - Triggers: `push` to `main` and `workflow_dispatch`.
   - Permissions: `pages: write`, `id-token: write`, `contents: read`.
   - Concurrency: group `pages`, `cancel-in-progress: true`.
-  - Steps: checkout → toolchain + wasm target → `Swatinem/rust-cache` → install Trunk (`jetli/trunk-action` or `cargo binstall trunk`, pinned version) → `cd crates/roxel && trunk build --release` → copy `testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512/{ct,tdr}.dcs` into `crates/roxel/dist/samples/fishtank-knife/` → `actions/upload-pages-artifact` (path `crates/roxel/dist`) → `actions/deploy-pages`.
+  - Steps: checkout → toolchain + wasm target → `Swatinem/rust-cache` → install Trunk (`jetli/trunk-action` or `cargo binstall trunk`, pinned to the **same** `TRUNK_VERSION` as `.devcontainer/Dockerfile`, so the container and CI build the same way) → `cd crates/roxel && trunk build --release` → copy `testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512/{ct,tdr}.dcs` into `crates/roxel/dist/samples/fishtank-knife/` → `actions/upload-pages-artifact` (path `crates/roxel/dist`) → `actions/deploy-pages`.
 - **Owner action, which Claude can't do:** in GitHub, go to Settings → Pages → Source and choose **GitHub Actions**.
 
 ### Step 8: Docs
@@ -153,6 +159,7 @@ This is the biggest structural change. In winit 0.30 on the web, `resumed()` can
 | `crates/roxel/src/slice_view.rs` | rayon gated by `cfg` |
 | `crates/roxel/src/ui/sidebar.rs`, `ui/mod.rs` | async picker and "Load sample" on the web |
 | `crates/roxel/index.html`, `Trunk.toml` | new |
+| `.devcontainer/Dockerfile`, `devcontainer.json` | wasm target, pinned Trunk, port 8080 |
 | `.github/workflows/ci.yml` | `wasm-check` job |
 | `.github/workflows/pages.yml` | new |
 | README | web demo section |
@@ -174,6 +181,7 @@ Leave everything else alone, especially the `dicos` and codec crates, which alre
 
 ## 5. Verification checklist (all items must pass before the PR is opened)
 
+- [ ] **Devcontainer:** inside the rebuilt image, `cd crates/roxel && trunk build --release` succeeds
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features` (native, `-D warnings`)
 - [ ] `cargo clippy -p roxel --target wasm32-unknown-unknown -- -D warnings`

@@ -38,7 +38,21 @@ RUN mkdir -p ${SDK_HOME}
 ARG RUST_VERSION=1.95.0
 ENV PATH ${HOME}/.cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        bash -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal -c rustfmt,clippy
+        bash -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal -c rustfmt,clippy \
+            -t wasm32-unknown-unknown
+
+# trunk — bundles the roxel web build (crates/roxel/index.html); it fetches the
+# wasm-bindgen/wasm-opt versions matching Cargo.lock on first use (~/.cache/trunk).
+ARG TRUNK_VERSION=0.22.1
+RUN set -eux && \
+    export ASSET="trunk-$(uname -m)-unknown-linux-musl.tar.gz" && \
+    export BASE="https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}" && \
+    cd /tmp && \
+    curl -fsSLO "${BASE}/${ASSET}" && \
+    echo "$(curl -fsSL "${BASE}/${ASSET}.sha256")  ${ASSET}" | sha256sum -c - && \
+    tar xzf "${ASSET}" -C "${HOME}/bin" trunk && \
+    rm "${ASSET}" && \
+    trunk --version
 
 # starship — config lives outside ~/.config because that dir is bind-mounted from the host
 RUN set -eux && \

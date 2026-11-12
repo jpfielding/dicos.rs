@@ -13,13 +13,25 @@ pub(crate) fn draw_band_range_slider(ui: &mut egui::Ui, bands: &mut [ColorBand])
     let max_density = bands.last().map(|b| b.threshold as f32).unwrap_or(30000.0);
     let max_density = max_density.max(1.0);
 
-    let desired_size = egui::vec2(ui.available_width().max(180.0), 78.0);
+    let touch = super::theme::is_touch(ui);
+    // Handles are bigger and the strip taller where a finger does the dragging.
+    let handle_radius = if touch { 11.0 } else { 6.0 };
+    let desired_size = egui::vec2(
+        ui.available_width().max(180.0),
+        if touch { 96.0 } else { 84.0 },
+    );
     let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
 
     let track_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 8.0, rect.bottom() - 28.0),
-        egui::pos2(rect.right() - 8.0, rect.bottom() - 16.0),
+        egui::pos2(
+            rect.left() + handle_radius + 2.0,
+            rect.bottom() - if touch { 44.0 } else { 38.0 },
+        ),
+        egui::pos2(
+            rect.right() - handle_radius - 2.0,
+            rect.bottom() - if touch { 28.0 } else { 26.0 },
+        ),
     );
 
     let to_x =
@@ -111,12 +123,12 @@ pub(crate) fn draw_band_range_slider(ui: &mut egui::Ui, bands: &mut [ColorBand])
         painter.rect_filled(seg_rect, 2.0, color);
 
         let seg_width = ex - sx;
-        if seg_width > 28.0 {
+        if seg_width > 36.0 {
             painter.text(
-                egui::pos2((sx + ex) * 0.5, track_rect.bottom() + 6.0),
+                egui::pos2((sx + ex) * 0.5, track_rect.bottom() + handle_radius + 1.0),
                 egui::Align2::CENTER_TOP,
                 bands[i].name,
-                egui::FontId::proportional(10.0),
+                egui::FontId::proportional(12.0),
                 ui.visuals().text_color(),
             );
         }
@@ -132,13 +144,17 @@ pub(crate) fn draw_band_range_slider(ui: &mut egui::Ui, bands: &mut [ColorBand])
             ui.visuals().widgets.inactive.fg_stroke.color
         };
 
-        painter.circle_filled(center, 6.0, ui.visuals().extreme_bg_color);
-        painter.circle_stroke(center, 6.0, egui::Stroke::new(1.5_f32, stroke_color));
+        painter.circle_filled(center, handle_radius, ui.visuals().extreme_bg_color);
+        painter.circle_stroke(
+            center,
+            handle_radius,
+            egui::Stroke::new(1.5_f32, stroke_color),
+        );
         painter.text(
-            egui::pos2(hx, track_rect.top() - 4.0),
+            egui::pos2(hx, track_rect.top() - handle_radius + 1.0),
             egui::Align2::CENTER_BOTTOM,
             format!("{}", band.threshold),
-            egui::FontId::monospace(10.0),
+            egui::FontId::monospace(11.0),
             ui.visuals().text_color(),
         );
     }

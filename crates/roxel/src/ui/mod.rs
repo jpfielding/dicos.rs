@@ -1,127 +1,86 @@
 //! egui UI drawing.
 //!
-//! The three-panel layout is split across sibling modules, one per panel, plus
-//! the custom band-range slider widget:
+//! The layout adapts to the available logical size (see [`layout`]):
 //!
-//! - [`sidebar`] — left sidebar (metadata, layers, threats, camera presets).
-//! - [`slice_panel`] — right panel (2D slice view and its controls).
-//! - [`controls`] — bottom panel (3D rendering controls).
-//! - [`band_slider`] — the custom transfer-band range slider widget.
+//! - Desktop: three areas, each a view or the study with its own controls.
+//!   - [`sidebar`] — left: the study (open, details, volumes, detections).
+//!   - [`controls`] — centre: the 3D view's header and its controls shelf.
+//!   - [`slice_panel`] — right: the 2D slice and its controls.
+//! - Phone portrait / landscape: the same content behind a tab bar ([`phone`]).
+//!
+//! "Focus volume" and "Focus slice" are one pattern: the view takes the whole
+//! workspace in place, keeps its own controls, and "Exit focus" (or Esc)
+//! returns.
+//!
+//! [`band_slider`] is the custom transfer-band range slider widget.
 //!
 //! Each draw function takes `&mut UiState` so it can mutate viewer state without
 //! borrowing the whole [`App`](crate::app::App).
 
 mod band_slider;
 mod controls;
+#[cfg(test)]
+mod fit_tests;
+pub(crate) mod layout;
+mod phone;
 mod sidebar;
 mod slice_panel;
 pub(crate) mod theme;
 
 use crate::state::UiState;
 use crate::transfer::ColorBand;
+use layout::Layout;
 
-/// Draw the full three-panel UI.
+/// Narrowest the 3D view's column may get before the 2D panel stops growing.
+const CENTER_MIN_WIDTH: f32 = 532.0;
+
+/// How to drive the view on screen, in the input the person is using. Shown
+/// once, in the desktop status bar.
+fn navigation_text(state: &UiState, touch: bool) -> &'static str {
+    if state.slice_expanded {
+        return if touch {
+            "Drag to pan  ·  Pinch to zoom"
+        } else {
+            "Drag to pan  ·  Ctrl + scroll to zoom  ·  Esc to exit focus"
+        };
+    }
+    match (touch, state.focus_volume) {
+        (true, _) => "Drag to orbit  ·  Pinch to zoom  ·  Two fingers to pan",
+        (false, false) => "Drag to orbit  ·  Shift + drag to pan  ·  Scroll to zoom",
+        (false, true) => {
+            "Drag to orbit  ·  Shift + drag to pan  ·  Scroll to zoom  ·  Esc to exit focus"
+        }
+    }
+}
+
+/// Draw the full UI for the current window size.
 pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
+    let layout = Layout::from_size(ctx.content_rect().size());
+    if layout != state.layout {
+        theme::set_layout(ctx, layout);
+        state.layout = layout;
+    }
     let focus_before_layout = state.focus_volume;
-    if state.focus_volume
-        && !state.slice_expanded
+    // Esc leaves focus, unless a popup or a text field wants the key.
+    if (state.focus_volume || state.slice_expanded)
         && !egui::Popup::is_any_open(ctx)
         && ctx.memory(|m| m.focused().is_none())
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
-        state.focus_volume = false;
+        if state.slice_expanded {
+            state.slice_expanded = false;
+        } else {
+            state.focus_volume = false;
+        }
         state.fit_camera = true;
     }
-    egui::TopBottomPanel::top("app_bar")
-        .frame(theme::frame())
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                theme::mark(ui, 26.0);
-                ui.label(egui::RichText::new("roxel").size(23.0).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let name = state
-                        .library
-                        .loaded_path
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "DICOS / INSPECT".into());
-                    ui.add_sized(
-                        [ui.available_width().min(480.0), 26.0],
-                        egui::Label::new(egui::RichText::new(&name).size(12.0).color(theme::MUTED))
-                            .truncate(),
-                    )
-                    .on_hover_text(name);
-                });
-            });
-        });
-    egui::TopBottomPanel::bottom("status_bar")
-        .frame(egui::Frame::new().fill(theme::BG).inner_margin(10))
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(if state.loading_file.is_some() {
-                        "Loading volume…"
-                    } else if state.library.volumes.is_empty() {
-                        "Ready to open a study"
-                    } else if state.focus_volume {
-                        "Drag to orbit  ·  Shift + drag to pan  ·  Scroll to zoom  ·  Esc to return"
-                    } else {
-                        "Drag to orbit  ·  Shift + drag to pan  ·  Scroll to zoom"
-                    })
-                    .size(12.0)
-                    .color(theme::MUTED),
-                );
-            });
-        });
-    if !state.focus_volume {
-        sidebar::draw_left_sidebar(ctx, state);
+    if layout == Layout::Desktop {
+        draw_desktop_panels(ctx, state);
+    } else {
+        phone::draw(ctx, state);
     }
-    if !state.library.volumes.is_empty() && !state.focus_volume {
-        slice_panel::draw_right_panel(ctx, state);
-        controls::draw_bottom_controls(ctx, state);
-    }
-    if state.focus_volume && !state.library.volumes.is_empty() {
-        controls::draw_focus_controls(ctx, state);
-    }
-    egui::TopBottomPanel::top("volume_header")
-        .frame(theme::frame())
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("3D volume").size(16.0).strong());
-                if !state.library.volumes.is_empty() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(if state.focus_volume {
-                                "Exit focus"
-                            } else {
-                                "Focus volume"
-                            })
-                            .clicked()
-                        {
-                            state.focus_volume = !state.focus_volume;
-                            state.fit_camera = true;
-                        }
-                        if state.focus_volume {
-                            ui.checkbox(&mut state.show_slice_locator, "Slice plane");
-                            ui.add_enabled(
-                                !state.slice_view.composite
-                                    && state.library.active_3d_index
-                                        == Some(state.slice_view.volume_index),
-                                egui::Checkbox::new(&mut state.cutaway, "Cutaway"),
-                            );
-                        }
-                        if ui
-                            .button("Fit volume")
-                            .on_hover_text("Center and fit the complete volume")
-                            .clicked()
-                        {
-                            state.fit_camera = true;
-                        }
-                    });
-                }
-            });
-        });
+    // The central area left by the panels. The 3D volume renders there
+    // whenever `UiState::volume_visible`.
     let next_viewport = ctx.available_rect();
     if state.viewport.size() != next_viewport.size() {
         state.fit_camera = true;
@@ -130,98 +89,210 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
     if state.focus_volume != focus_before_layout {
         ctx.request_repaint();
     }
-    draw_slice_locator(ctx, state);
-    if !state.library.volumes.is_empty() {
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
-            egui::Id::new("orientation"),
-        ));
-        let origin = state.viewport.left_bottom() + egui::vec2(48.0, -48.0);
-        for (axis, label, color) in [
-            (glam::Vec3::X, "X", egui::Color32::from_rgb(231, 145, 135)),
-            (glam::Vec3::Y, "Y", theme::ACCENT),
-            (glam::Vec3::Z, "Z", egui::Color32::from_rgb(143, 177, 225)),
-        ] {
-            let end = origin
-                + egui::vec2(axis.dot(state.camera.right()), axis.dot(state.camera.up())) * 26.0;
-            painter.line_segment([origin, end], egui::Stroke::new(1.5_f32, color));
-            painter.text(
-                end + (end - origin).normalized() * 9.0,
-                egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::proportional(11.0),
-                color,
-            );
-        }
+    if state.volume_visible() {
+        draw_slice_plane(ctx, state);
+        draw_orientation_gizmo(ctx, state);
+    } else if state.library.volumes.is_empty() && !state.slice_expanded {
+        draw_empty_state(ctx, state);
     }
-    if state.library.volumes.is_empty() {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG))
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space((ui.available_height() * 0.32).max(20.0));
-                    theme::mark(ui, 64.0);
-                    ui.add_space(16.0);
-                    ui.heading("A clearer view inside.");
-                    ui.label(
-                        egui::RichText::new("Open a DICOS study to explore its volume and slices.")
-                            .color(theme::MUTED),
-                    );
-                    ui.add_space(16.0);
-                    let open_file = ui
-                        .add_enabled(
-                            state.loading_file.is_none(),
-                            egui::Button::new(
-                                egui::RichText::new("Open DICOS file…").color(theme::BG),
-                            )
-                            .fill(theme::ACCENT)
-                            .min_size(egui::vec2(150.0, 38.0)),
-                        )
-                        .clicked();
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if open_file {
-                        state.actions.file_to_load = rfd::FileDialog::new()
-                            .add_filter("DICOS", &["dcs", "dcm"])
-                            .pick_file()
-                            .map(crate::loader::LoadSource::Path);
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        if open_file {
-                            crate::web::pick_files();
-                        }
-                        ui.add_space(8.0);
-                        if ui
-                            .add_enabled(
-                                state.loading_file.is_none(),
-                                egui::Button::new("Load sample").min_size(egui::vec2(150.0, 38.0)),
-                            )
-                            .clicked()
-                        {
-                            crate::web::load_sample();
-                        }
-                    }
-                    ui.label(
-                        egui::RichText::new(if cfg!(target_arch = "wasm32") {
-                            ".dcs and .dcm files  ·  Select a CT with its threat report"
-                        } else {
-                            ".dcs and .dcm files  ·  Multi-volume folders"
-                        })
-                        .small()
-                        .color(theme::MUTED),
-                    );
-                });
-            });
-    }
-    slice_panel::draw_expanded(ctx, state);
 }
 
-/// Returns true when a slider value is "committed" -- either the drag ended,
-/// the value changed without dragging (click / keyboard), or the text field
-/// lost focus.  Use this to debounce expensive operations (CPU re-renders)
-/// so they only fire once instead of every frame during a drag.
-pub(crate) fn slider_committed(r: &egui::Response) -> bool {
-    r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged())
+/// App bar: mark, name, and the open study with both ends of its name kept.
+pub(super) fn app_bar(ctx: &egui::Context, state: &mut UiState) {
+    let compact = state.layout.is_compact();
+    let frame = egui::Frame::new()
+        .fill(theme::PANEL)
+        .inner_margin(egui::Margin::symmetric(16, if compact { 6 } else { 8 }));
+    egui::TopBottomPanel::top("app_bar")
+        .frame(frame)
+        .show(ctx, |ui| {
+            // Set before the row is laid out: the row takes its height from it.
+            ui.spacing_mut().interact_size.y = 28.0;
+            ui.horizontal(|ui| {
+                theme::mark(ui, if compact { 22.0 } else { 24.0 });
+                ui.label(
+                    egui::RichText::new("roxel")
+                        .size(if compact { 19.0 } else { 21.0 })
+                        .color(theme::HEADING),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Nothing to name before a study is open: the first-use
+                    // card already says so.
+                    let Some(path) = state.library.loaded_path.as_ref() else {
+                        return;
+                    };
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let font = egui::FontId::proportional(13.0);
+                    let room = (ui.available_width() - 16.0).clamp(40.0, 520.0);
+                    let shown = theme::elide_middle(ui.painter(), &name, font.clone(), room);
+                    let label = ui.label(egui::RichText::new(shown).font(font).color(theme::MUTED));
+                    label.on_hover_text(path.display().to_string());
+                });
+            });
+        });
+}
+
+/// Width of the 2D panel: about a third of the window, so the slice is large,
+/// but never at the cost of the 3D view's column.
+fn slice_panel_width(window: f32) -> f32 {
+    let most = (window - sidebar::SIDEBAR_WIDTH - CENTER_MIN_WIDTH).max(336.0);
+    (window * 0.36).clamp(336.0, most.min(520.0))
+}
+
+fn draw_desktop_panels(ctx: &egui::Context, state: &mut UiState) {
+    app_bar(ctx, state);
+    let loaded = !state.library.volumes.is_empty();
+    if !loaded && !state.slice_expanded {
+        // First use: the centre card is the whole interface.
+        return;
+    }
+    let touch = ctx.input(|i| i.has_touch_screen());
+    egui::TopBottomPanel::bottom("status_bar")
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG)
+                .inner_margin(egui::Margin::symmetric(16, 5)),
+        )
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(navigation_text(state, touch))
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        });
+    if state.slice_expanded {
+        slice_panel::draw_focus(ctx, state);
+        return;
+    }
+    if !state.focus_volume {
+        sidebar::draw_left_sidebar(ctx, state);
+        let width = slice_panel_width(ctx.content_rect().width());
+        slice_panel::draw_right_panel(ctx, state, width);
+    }
+    controls::draw_volume_header(ctx, state);
+    controls::draw_shelf(ctx, state);
+}
+
+/// X / Y / Z axes in the view's lower-left corner; the "View along" buttons
+/// are named for them.
+fn draw_orientation_gizmo(ctx: &egui::Context, state: &UiState) {
+    let rect = state.viewport;
+    if rect.width() < 120.0 || rect.height() < 120.0 {
+        return;
+    }
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("orientation"),
+        ))
+        .with_clip_rect(rect);
+    let origin = rect.left_bottom() + egui::vec2(40.0, -40.0);
+    for (axis, label, color) in [
+        (glam::Vec3::X, "X", egui::Color32::from_rgb(231, 145, 135)),
+        (glam::Vec3::Y, "Y", theme::ACCENT),
+        (glam::Vec3::Z, "Z", egui::Color32::from_rgb(143, 177, 225)),
+    ] {
+        let direction = egui::vec2(axis.dot(state.camera.right()), axis.dot(state.camera.up()));
+        let end = origin + direction * 20.0;
+        painter.line_segment([origin, end], egui::Stroke::new(1.5_f32, color));
+        // An axis pointing at the viewer has no direction on screen.
+        let out = if direction.length() > 0.05 {
+            direction.normalized()
+        } else {
+            egui::vec2(0.0, -1.0)
+        };
+        // Keep the letters clear of the origin even for a foreshortened axis.
+        painter.text(
+            origin + out * (direction.length() * 20.0 + 9.0).max(17.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            color,
+        );
+    }
+}
+
+/// First-use state: say what this is and offer the one action.
+fn draw_empty_state(ctx: &egui::Context, state: &mut UiState) {
+    let layout = state.layout;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(theme::BG).inner_margin(24))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if layout == Layout::PhoneLandscape {
+                        // Too short to stack: message left, actions right.
+                        ui.add_space(((ui.available_height() - 190.0) * 0.5).max(4.0));
+                        ui.columns(2, |cols| {
+                            cols[0].vertical_centered(|ui| empty_intro(ui, true));
+                            cols[1].vertical_centered(|ui| {
+                                ui.set_max_width(ui.available_width().min(320.0));
+                                ui.add_space(30.0);
+                                empty_actions(ui, state);
+                            });
+                        });
+                    } else {
+                        ui.vertical_centered(|ui| {
+                            let compact = layout.is_compact();
+                            ui.set_max_width(ui.available_width().min(if compact {
+                                340.0
+                            } else {
+                                280.0
+                            }));
+                            ui.add_space(
+                                (ui.available_height() * if compact { 0.2 } else { 0.26 })
+                                    .max(16.0),
+                            );
+                            empty_intro(ui, compact);
+                            ui.add_space(20.0);
+                            empty_actions(ui, state);
+                        });
+                    }
+                });
+        });
+}
+
+fn empty_intro(ui: &mut egui::Ui, compact: bool) {
+    theme::mark(ui, if compact { 56.0 } else { 64.0 });
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new("Open a DICOS study")
+            .size(22.0)
+            .color(theme::HEADING),
+    );
+    ui.add_space(4.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new("See a CT scan as a 3D volume and as 2D slices.")
+                .color(theme::MUTED),
+        )
+        .wrap(),
+    );
+}
+
+/// The open actions, load progress and accepted formats.
+fn empty_actions(ui: &mut egui::Ui, state: &mut UiState) {
+    sidebar::open_buttons(ui, state, true);
+    ui.add_space(4.0);
+    sidebar::load_status(ui, state);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(if cfg!(target_arch = "wasm32") {
+                "DICOS .dcs or .dcm files. Add the threat report to see detections."
+            } else if state.layout.is_compact() {
+                "DICOS .dcs or .dcm files."
+            } else {
+                "DICOS .dcs or .dcm files, or a study folder."
+            })
+            .small()
+            .color(theme::MUTED),
+        )
+        .wrap(),
+    );
 }
 
 pub(crate) fn band_color(band: &ColorBand) -> egui::Color32 {
@@ -248,93 +319,70 @@ pub(crate) fn clamp_band_thresholds(bands: &mut [ColorBand]) {
     }
 }
 
-/// Project the selected voxel-center plane with the same camera model as WGSL.
+/// Outline the selected slice in the 3D view (projected with the same camera
+/// model as the WGSL) and name it in the view's corner, off the object.
 /// Never imply correspondence between different selected volume layers.
-fn draw_slice_locator(ctx: &egui::Context, state: &UiState) {
-    if !state.show_slice_locator
-        || state.slice_view.composite
-        || state.library.active_3d_index != Some(state.slice_view.volume_index)
-    {
+fn draw_slice_plane(ctx: &egui::Context, state: &UiState) {
+    if !sidebar::slice_tools_available(state) || !(state.show_slice_locator || state.cutaway) {
         return;
     }
     let Some(layer) = state.library.volumes.get(state.slice_view.volume_index) else {
         return;
     };
-    let points = state.slice_view.plane_corners(&layer.volume);
-    let camera = &state.camera;
     let rect = state.viewport;
-    let aspect = rect.width() / rect.height().max(1.0);
-    let mut projected = Vec::with_capacity(4);
-    for point in points {
-        let delta = glam::Vec3::from(point) * state.volume_extent - camera.position();
-        let depth = delta.dot(camera.forward());
-        if depth <= 0.0 {
-            return;
-        }
-        let uv = egui::vec2(
-            delta.dot(camera.right()) / (depth * camera.fov * aspect),
-            delta.dot(camera.up()) / (depth * camera.fov),
-        );
-        projected.push(rect.center() + uv * rect.size() * 0.5);
-    }
     let painter = ctx
         .layer_painter(egui::LayerId::new(
             egui::Order::Background,
-            egui::Id::new("slice_locator"),
+            egui::Id::new("slice_plane"),
         ))
         .with_clip_rect(rect);
-    let retained_axis = match state.slice_view.orientation {
-        crate::slice_view::Orientation::Axial => "Z",
-        crate::slice_view::Orientation::Coronal => "Y",
-        crate::slice_view::Orientation::Sagittal => "X",
+    let stroke = egui::Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.7));
+    if state.show_slice_locator {
+        let camera = &state.camera;
+        let aspect = rect.width() / rect.height().max(1.0);
+        let mut projected = Vec::with_capacity(4);
+        for point in state.slice_view.plane_corners(&layer.volume) {
+            let delta = glam::Vec3::from(point) * state.volume_extent - camera.position();
+            let depth = delta.dot(camera.forward());
+            if depth <= 0.0 {
+                projected.clear();
+                break;
+            }
+            let uv = egui::vec2(
+                delta.dot(camera.right()) / (depth * camera.fov * aspect),
+                delta.dot(camera.up()) / (depth * camera.fov),
+            );
+            projected.push(rect.center() + uv * rect.size() * 0.5);
+        }
+        if projected.len() == 4 {
+            for i in 0..4 {
+                painter.line_segment([projected[i], projected[(i + 1) % 4]], stroke);
+            }
+        }
+    }
+    // One readout in the corner says what the outline (or the cut) is.
+    let what = match (state.cutaway, state.reverse_cutaway) {
+        (false, _) => "Slice plane",
+        (true, false) => "Cutaway",
+        (true, true) => "Cutaway, reversed",
     };
-    let plane_label = if state.cutaway {
-        format!(
-            "Cut plane · keeping {}{}",
-            if state.reverse_cutaway { "−" } else { "+" },
-            retained_axis
-        )
-    } else {
-        "Slice plane".into()
-    };
-    for i in 0..4 {
+    let text = format!(
+        "{what}  ·  {} {} / {}",
+        state.slice_view.orientation.label(),
+        state.slice_view.slice_index + 1,
+        state.slice_view.max_slices
+    );
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.5), theme::ACCENT);
+    let pos = rect.right_bottom() - galley.size() - egui::vec2(16.0, 14.0);
+    if state.show_slice_locator {
+        // A swatch of the outline's line ties the words to the drawing.
+        let y = pos.y + galley.size().y * 0.5;
         painter.line_segment(
-            [projected[i], projected[(i + 1) % 4]],
-            egui::Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.65)),
+            [egui::pos2(pos.x - 26.0, y), egui::pos2(pos.x - 8.0, y)],
+            egui::Stroke::new(1.5_f32, theme::ACCENT),
         );
     }
-    let galley =
-        painter.layout_no_wrap(plane_label, egui::FontId::proportional(11.0), theme::ACCENT);
-    let label_size = galley.size() + egui::vec2(12.0, 8.0);
-    let anchor = projected[0];
-    let mut label_pos = anchor + egui::vec2(8.0, 8.0);
-    label_pos.x = label_pos.x.clamp(
-        rect.left() + 8.0,
-        (rect.right() - label_size.x - 8.0).max(rect.left() + 8.0),
-    );
-    label_pos.y = label_pos.y.clamp(
-        rect.top() + 8.0,
-        (rect.bottom() - label_size.y - 36.0).max(rect.top() + 8.0),
-    );
-    let label_rect = egui::Rect::from_min_size(label_pos, label_size);
-    painter.line_segment(
-        [anchor, label_rect.left_center()],
-        egui::Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.65)),
-    );
-    painter.rect_filled(label_rect, 4, theme::BG.gamma_multiply(0.96));
-    painter.galley(label_pos + egui::vec2(6.0, 4.0), galley, theme::ACCENT);
-    painter.text(
-        rect.right_bottom() + egui::vec2(-16.0, -20.0),
-        egui::Align2::RIGHT_BOTTOM,
-        format!(
-            "{} slice {} / {}",
-            state.slice_view.orientation.label(),
-            state.slice_view.slice_index + 1,
-            state.slice_view.max_slices
-        ),
-        egui::FontId::proportional(12.0),
-        theme::ACCENT,
-    );
+    painter.galley(pos, galley, theme::ACCENT);
 }
 
 #[cfg(test)]
@@ -506,5 +554,159 @@ mod tests {
             }],
         );
         assert!(state.focus_volume, "Escape must give the popup priority");
+    }
+    fn phone_frame(
+        ctx: &egui::Context,
+        state: &mut UiState,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| draw_ui(ctx, state),
+        )
+    }
+
+    fn loaded_state() -> UiState {
+        let mut state = UiState::new(crate::camera::Camera::default());
+        state.library.loaded_path = Some(std::path::PathBuf::from("study"));
+        state.library.volumes.push(crate::app::VolumeLayer {
+            name: "ct".into(),
+            volume: crate::volume::Volume {
+                data: vec![0; 8],
+                dim_x: 2,
+                dim_y: 2,
+                dim_z: 2,
+                window_center: 100.0,
+                window_width: 200.0,
+                rescale_intercept: 0.0,
+                modality: "CT".into(),
+                voxel_spacing: [1.0; 3],
+                threats: vec![],
+            },
+        });
+        state.library.active_3d_index = Some(0);
+        state
+    }
+
+    fn tap(ctx: &egui::Context, state: &mut UiState, size: egui::Vec2, label: &str) {
+        let output = phone_frame(ctx, state, size, vec![]);
+        let pos = text_center(&output.shapes, label);
+        for pressed in [true, false] {
+            phone_frame(
+                ctx,
+                state,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn phone_layouts_leave_the_volume_room_and_tabs_switch() {
+        for (size, layout) in [
+            (egui::vec2(393.0, 852.0), layout::Layout::PhonePortrait),
+            (egui::vec2(852.0, 393.0), layout::Layout::PhoneLandscape),
+        ] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut state = loaded_state();
+            for _ in 0..3 {
+                phone_frame(&ctx, &mut state, size, vec![]);
+            }
+            assert_eq!(state.layout, layout);
+            assert!(
+                state.viewport.right() <= size.x + 0.5,
+                "{:?}",
+                state.viewport
+            );
+            assert!(
+                state.viewport.bottom() <= size.y + 0.5,
+                "{:?}",
+                state.viewport
+            );
+            assert!(
+                state.viewport.width() >= 300.0,
+                "{layout:?} {:?}",
+                state.viewport
+            );
+            assert!(
+                state.viewport.height() >= 240.0,
+                "{layout:?} {:?}",
+                state.viewport
+            );
+
+            // Every tab draws, and tapping a tab selects it.
+            for (label, tab) in [
+                ("Study", layout::PhoneTab::Study),
+                ("Detections", layout::PhoneTab::Detections),
+                ("3D view", layout::PhoneTab::View3d),
+                ("2D slice", layout::PhoneTab::Slice),
+            ] {
+                tap(&ctx, &mut state, size, label);
+                assert_eq!(state.phone_tab, tab, "{layout:?}");
+                for _ in 0..2 {
+                    phone_frame(&ctx, &mut state, size, vec![]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn portrait_tab_bar_collapses_and_reopens_the_sheet() {
+        let size = egui::vec2(393.0, 852.0);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut state = loaded_state();
+        for _ in 0..3 {
+            phone_frame(&ctx, &mut state, size, vec![]);
+        }
+        let with_sheet = state.viewport.height();
+        tap(&ctx, &mut state, size, "2D slice");
+        for _ in 0..2 {
+            phone_frame(&ctx, &mut state, size, vec![]);
+        }
+        assert!(
+            !state.sheet_open,
+            "tapping the open tab collapses the sheet"
+        );
+        assert!(state.viewport.height() > with_sheet + 150.0);
+        tap(&ctx, &mut state, size, "3D view");
+        assert!(state.sheet_open);
+        assert_eq!(state.phone_tab, layout::PhoneTab::View3d);
+    }
+
+    #[test]
+    fn phone_focus_and_expanded_views_draw() {
+        for size in [egui::vec2(393.0, 852.0), egui::vec2(852.0, 393.0)] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut state = loaded_state();
+            state.focus_volume = true;
+            state.cutaway = true;
+            for _ in 0..3 {
+                phone_frame(&ctx, &mut state, size, vec![]);
+            }
+            assert!(state.viewport.height() >= 240.0, "{:?}", state.viewport);
+            tap(&ctx, &mut state, size, "Adjust display");
+            assert!(state.focus_adjust_open);
+            state.focus_volume = false;
+            state.slice_expanded = true;
+            for _ in 0..3 {
+                phone_frame(&ctx, &mut state, size, vec![]);
+            }
+        }
     }
 }

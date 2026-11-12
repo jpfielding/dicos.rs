@@ -58,10 +58,18 @@ trunk serve --release --no-autoreload       # http://127.0.0.1:8080
 
 ## Inspect a study
 
-The library sits on the left, the 3D view in the center, and the slice inspector
-on the right. Rendering controls sit below the 3D view. Sidebars and the controls
-shelf can be resized; long study names truncate with the full identifier on hover.
-The minimum window size is 1100 × 720 logical pixels.
+The study panel sits on the left, the 3D view in the center, and the slice
+inspector on the right. Rendering controls sit below the 3D view. Long study names
+are shortened in the middle in the app bar and shown in full in the study panel.
+The native minimum window size is 1100 × 720 logical pixels.
+
+Narrow or short viewports (for example a phone browser) switch to a touch layout:
+a bottom tab bar with **Study**, **Detections**, **2D slice** and **3D view**. The
+selected view fills the main area and its controls sit in a paged sheet, below it
+in portrait and beside it in landscape. Tap the selected view's tab to hide or
+show the sheet. Every drag gesture has a button alternative (orbit/pan arrows,
+zoom −/+, slice −/+). The layout follows the available logical size, not the
+platform; it has not yet been tested on a physical iPhone.
 
 New studies open with an oblique, automatically fitted 3D view and a mid-coronal
 2D slice. Grayscale, High sampling quality, and 25% global opacity are the
@@ -74,17 +82,17 @@ more distant samples. These are display transforms, not changes to voxel data. A
 | Left-drag in the 3D viewport | Orbit |
 | Shift + left-drag | Pan |
 | Scroll in the 3D viewport | Zoom |
-| Axial / Coronal / Sagittal | Snap and fit the camera |
-| Fit volume | Recenter and frame the complete volume |
-| Focus volume | Enlarge the volume; keep windowing, opacity, palette and lighting available |
+| View along X / Y / Z | Snap and fit the camera along a volume axis |
+| Fit view | Recenter and frame the complete volume |
+| Focus volume | Enlarge the volume in place; keep slice, cutaway, windowing, palette and lighting available |
 | Escape / Exit focus | Return to the workspace |
-| Locate slice in 3D | Outline the selected voxel-center plane |
-| Cutaway at slice | Hide voxels before the selected plane to expose the remaining interior |
+| Slice plane | Outline the selected voxel-center plane |
+| Cutaway | Hide voxels before the selected plane to expose the remaining interior |
 
 The axis triad shows **volume X/Y/Z**, not patient anatomical directions. The
 slice locator and cutaway apply only when 2D and 3D display the same volume and
 the 2D view is a single slice. Cutaway retains the half-volume at or after the
-selected slice along the selected array axis. **Reverse cutaway** retains the opposite half; the plane label names the retained axis direction. It does not edit or export data.
+selected slice along the selected array axis. **Reverse cutaway** retains the opposite half. It does not edit or export data.
 Annotation boxes describe their original positions and are not cut away.
 
 ## Slice inspection
@@ -96,11 +104,13 @@ and width controls affect the 2D view independently of the 3D controls. Slider
 tracks use the study's initial window for useful adjustment resolution; numeric
 entry permits a wider range. Values are not labelled as calibrated HU.
 
-**Expand image** opens a modal inspector with a large fitted image, previous/next
-buttons, an editable slice number, a wide navigation slider, windowing and zoom.
-Drag the enlarged image to pan when zoomed; **Fit image** restores 100% fit.
-**Back to workspace**, Escape, or clicking the backdrop closes the inspector.
-Nearest-neighbor image sampling preserves the visible source pixels. Both views preserve physical aspect ratios from voxel spacing; slice captions report the physical field of view. The expanded inspector keeps the study identifier visible and includes a physical scale bar that follows zoom.
+**Focus slice** enlarges the slice in place, the same way **Focus volume**
+enlarges the 3D view. It keeps the plane selector, previous/next buttons, an
+editable slice number, windowing and zoom. Drag the enlarged image to pan when
+zoomed; **Fit image** restores 100% fit. **Exit focus** or Escape returns to the
+workspace. In phone portrait, a wide slice is drawn turned 90° to use the screen,
+and is captioned as turned.
+Nearest-neighbor image sampling preserves the visible source pixels. Both views preserve physical aspect ratios from voxel spacing; slice captions report the physical field of view. Slice views include a physical scale bar that follows zoom.
 
 ## Appearance
 
@@ -110,7 +120,7 @@ Nearest-neighbor image sampling preserves the visible source pixels. Both views 
 | Materials | Five named density bands, editable thresholds and opacity |
 | Threat | Red density highlight; does not itself identify threats |
 
-**Lighting & density** reveals ambient, diffuse, specular, depth cue and density
+**Lighting** reveals ambient, diffuse, specular, depth cue and density
 cutoff. Material bands are hidden until requested. Quality selects Fast,
 Balanced or High ray-march sampling. Opacity is corrected for the physical distance represented by each ray sample, so changing sampling quality does not intentionally change optical thickness. Extremely long rays use a coarser step to preserve full-volume coverage within the step budget. High costs more GPU work; choose Balanced
 or Fast on slower hardware. No performance benchmark is implied by the labels.

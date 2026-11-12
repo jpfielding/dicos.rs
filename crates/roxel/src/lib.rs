@@ -10,6 +10,7 @@ pub mod loader;
 pub mod renderer;
 pub mod slice_view;
 pub mod state;
+mod touch;
 pub mod transfer;
 pub mod ui;
 pub mod volume;

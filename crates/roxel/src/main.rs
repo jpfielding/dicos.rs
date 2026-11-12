@@ -294,7 +294,7 @@ impl ApplicationHandler<AppEvent> for RoxelApp {
         #[cfg(not(target_arch = "wasm32"))]
         let attrs = WindowAttributes::default()
             .with_title("Roxel — Volume workspace")
-            .with_min_inner_size(winit::dpi::LogicalSize::new(1100, 720))
+            .with_min_inner_size(native::min_window_size())
             .with_inner_size(native::capture_window_size());
         // On the web the canvas is sized by the page's CSS.
         #[cfg(target_arch = "wasm32")]
@@ -588,6 +588,12 @@ mod native {
         eprintln!("Screenshot saved: {}", path.display());
     }
 
+    /// Minimum window size; a review capture may request a smaller (phone) viewport.
+    pub(super) fn min_window_size() -> winit::dpi::LogicalSize<u32> {
+        let capture = capture_window_size();
+        winit::dpi::LogicalSize::new(capture.width.min(1100), capture.height.min(720))
+    }
+
     pub(super) fn capture_window_size() -> winit::dpi::LogicalSize<u32> {
         // Optional reproducible review viewport; ordinary launches keep the default.
         if std::env::var_os("ROXEL_SCREENSHOT").is_some() {
@@ -595,8 +601,8 @@ mod native {
                 if let Some((w, h)) = value.split_once('x') {
                     if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
                         return winit::dpi::LogicalSize::new(
-                            w.clamp(1100, 3840),
-                            h.clamp(720, 2160),
+                            w.clamp(320, 3840),
+                            h.clamp(320, 2160),
                         );
                     }
                 }

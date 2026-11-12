@@ -81,6 +81,16 @@ jobs:
       - name: Package all crates
         run: cargo package --workspace --locked
 
+  # Compare each publishable crate's public API against its latest crates.io
+  # release and fail if the change needs a bigger version bump than the
+  # workspace version gives it. `publish = false` crates (roxel) are skipped.
+  semver:
+    name: cargo semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+
   # Codec interop against reference tools + checked-in fixtures.
   interop:
     name: interop (openjpeg + fixtures)

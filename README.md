@@ -89,7 +89,9 @@ from DICOS files. Uses `wgpu` for GPU ray-casting and `egui` for the UI.
 - **Right panel** -- CPU-rendered 2D slice viewer with orientation selector,
   window/level controls, slice index slider, and MIP composite toggle.
 
-Requires a GPU with Vulkan, Metal, or DX12 support.
+Requires a GPU with Vulkan, Metal, or DX12 support. A browser build (WebGPU)
+runs at <https://jpfielding.github.io/dicos.rs/>; see
+[crates/roxel/README.md](crates/roxel/README.md#web-demo).
 
 ## Workspace Structure
 

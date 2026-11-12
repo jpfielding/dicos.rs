@@ -195,7 +195,18 @@ Leave everything else alone, especially the `dicos` and codec crates, which alre
 
 ---
 
+## 5a. Findings during implementation (2026-11-11)
+- **Devcontainer was already unbuildable:**
+  - `msitools` is in neither EPEL 10 architecture, and nothing in the repo uses it. It was removed.
+  - `gcc` was missing, so cargo had no `cc` linker even for native builds. It was added.
+  - Under buildah/podman, `ARG USER_GID=$USER_UID` reached the `user` stage unexpanded. The args are now re-declared in that stage.
+- **Theme:** `theme::apply` used `set_style`, which sets the style of the *current* theme only. A light OS or browser preference therefore got egui's stock light widgets. This affected native too. The theme is now pinned with `ctx.set_theme(Theme::Dark)`.
+- **Sidecar selection on the web:** the bytes loader parses every selected `.dcs`/`.dcm`. The native directory scan's "threat in stem" rule would skip the sample's `tdr.dcs`.
+- **Pre-existing, not fixed (follow-up):** this sample's TDR stores its PTO box in **mm from the volume corner** (`BoundingBoxTopLeft` 460.9/180.8/62.5 inside a 680×440×200 mm volume). `parse_threats` treats the values as voxel indices and clamps them to the grid, so the box draws at the corner, not around the knife. Native has the same bug.
+- **Sizes:** after wasm-opt (`s`), the wasm is 3.3 MB and the JS glue 89 KB. Trunk 0.22.1 fetched wasm-bindgen 0.2.122 and wasm-opt version_131. In the Chromium 152 preview, the sample (16.8 MB CT plus TDR) loads in about 0.5 s locally.
+
 ## 6. Follow-ups (out of scope for this branch)
+- Fix `parse_threats` units for PTO boxes stored in mm (see §5a).
 - Drag and drop on the web (DOM `drop` listener → `FileReader` → `LoadSource::Bytes`).
 - Parsing in a Web Worker so the UI doesn't freeze.
 - A WebGL2 fallback (`Rgba16Float` 3D textures are filterable on WebGL2).

@@ -9,10 +9,14 @@ RUN set -eux -o pipefail && \
     dnf install -y epel-release && \
     dnf -y update
 RUN set -eux -o pipefail && \
-    dnf install -y ca-certificates curl-minimal git git-lfs iproute jq make msitools ncurses nss-tools procps sudo wget which zsh zip && \
+    dnf install -y ca-certificates curl-minimal git git-lfs iproute jq gcc make ncurses nss-tools procps sudo wget which zsh zip && \
     dnf install -y mesa-libGL-devel libX11-devel libXrandr-devel libXxf86dga libXxf86vm libXi-devel libXcursor-devel libXinerama-devel
 
 FROM base as user
+# Re-declared: buildah/podman passes the inherited `$USER_UID` default through
+# unexpanded, so groupadd would get the literal string.
+ARG USER_UID=1000
+ARG USER_GID=${USER_UID}
 
 # Create the user
 RUN groupadd --gid ${USER_GID} ${USERNAME} && \

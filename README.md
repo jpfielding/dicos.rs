@@ -1,5 +1,12 @@
 # dicos.rs
 
+> **[▶ Try Roxel in your browser](https://jpfielding.github.io/dicos.rs/)**: the
+> GPU volume viewer compiled to WebAssembly. It opens a sample CT scan with a
+> threat report, or you can load your own `.dcs` files. Needs WebGPU (a recent
+> desktop Chrome, Edge, or Safari).
+
+[![Roxel inspection workspace](docs/images/roxel-workspace.png)](https://jpfielding.github.io/dicos.rs/)
+
 A pure-Rust library and toolkit for working with **DICOS** (Digital Imaging and
 Communication in Security) files. DICOS is the NEMA IIC 1 standard used by
 security screening equipment (CT scanners, X-ray systems) to encode volumetric

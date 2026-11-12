@@ -18,7 +18,7 @@
 //! ```
 
 use crate::camera::Camera;
-use crate::loader::{LoadOutcome, LoadedLayer, VolumeLoader};
+use crate::loader::{LoadOutcome, LoadSource, LoadedLayer, VolumeLoader};
 use crate::renderer::{RenderParams, VolumeRenderer};
 use crate::state::UiState;
 use crate::transfer::{TransferFunction, TransferPreset};
@@ -432,14 +432,15 @@ impl App {
         self.loader.loading().is_some()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_path(&mut self, path: &std::path::Path) {
-        self.request_load(path.to_path_buf());
+        self.request_load(LoadSource::Path(path.to_path_buf()));
     }
 
     /// Kick off a background load, clearing any stale error message.
-    fn request_load(&mut self, path: PathBuf) {
+    fn request_load(&mut self, source: LoadSource) {
         self.ui.load_error = None;
-        self.loader.request(path);
+        self.loader.request(source);
     }
 
     /// Install the layers produced by a completed background load, replacing

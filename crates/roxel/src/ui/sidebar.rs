@@ -1,5 +1,6 @@
 //! Left sidebar: metadata, layers, threats, camera presets.
 
+use crate::loader::LoadSource;
 use crate::state::UiState;
 
 /// Left sidebar: metadata, layers, camera presets.
@@ -29,7 +30,7 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                             .add_filter("DICOS", &["dcs", "dcm"])
                             .pick_file()
                         {
-                            state.actions.file_to_load = Some(path);
+                            state.actions.file_to_load = Some(LoadSource::Path(path));
                         }
                     }
                     if panel
@@ -40,7 +41,7 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                         .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            state.actions.file_to_load = Some(path);
+                            state.actions.file_to_load = Some(LoadSource::Path(path));
                         }
                     }
                 });

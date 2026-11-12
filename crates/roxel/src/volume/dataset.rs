@@ -147,6 +147,7 @@ pub(super) fn parse_numbers(value: &Value) -> Vec<f64> {
 /// by name, and stacks the frames from each file into a single 3D volume.
 ///
 /// Catches panics from codec code to prevent aborting the application.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_dicos_path(path: &std::path::Path) -> Result<Volume, DicosError> {
     let path = path.to_path_buf();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -165,11 +166,15 @@ pub fn load_dicos_path(path: &std::path::Path) -> Result<Volume, DicosError> {
 }
 
 /// Load a single DICOS file and extract the volume.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_dicos_volume(path: &std::path::Path) -> Result<Volume, DicosError> {
-    let file = std::fs::File::open(path).map_err(DicosError::Io)?;
-    let reader = std::io::BufReader::new(file);
-    let dataset = reader::parse(reader)?;
+    let bytes = std::fs::read(path).map_err(DicosError::Io)?;
+    load_dicos_bytes(&bytes)
+}
 
+/// Parse a single in-memory DICOS file and extract the volume.
+pub fn load_dicos_bytes(bytes: &[u8]) -> Result<Volume, DicosError> {
+    let dataset = reader::parse(std::io::Cursor::new(bytes))?;
     volume_from_dataset(&dataset)
 }
 
@@ -209,6 +214,7 @@ fn slice_sort_key(ds: &Dataset, filename_fallback: f64) -> f64 {
 /// spatial metadata: `ImagePositionPatient` Z coordinate (preferred), then
 /// `SliceLocation`, then `InstanceNumber`, falling back to filename order
 /// when none of those tags are present.
+#[cfg(not(target_arch = "wasm32"))]
 fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map_err(DicosError::Io)?

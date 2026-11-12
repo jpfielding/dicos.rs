@@ -5,6 +5,7 @@
 //! and loads threat-report sidecar files that carry ROIs separately from the
 //! voxel data.
 
+#[cfg(not(target_arch = "wasm32"))]
 use dicos::error::DicosError;
 use dicos::reader;
 use dicos::tag;
@@ -197,6 +198,7 @@ pub(super) fn parse_threats(ds: &Dataset, dims: [usize; 3]) -> Vec<ThreatBox> {
 }
 
 /// Parse threat boxes from a DICOS file without requiring pixel data.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_threats_from_file(
     path: &std::path::Path,
     dims: [usize; 3],
@@ -212,6 +214,7 @@ pub fn load_threats_from_file(
 /// Files whose stem includes "threat" (case-insensitive) are parsed and
 /// merged. This supports scanner outputs where threat ROIs are stored in
 /// separate report objects from the voxel volume.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_threat_sidecars_from_dir(dir: &std::path::Path, dims: [usize; 3]) -> Vec<ThreatBox> {
     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
@@ -242,6 +245,44 @@ pub fn load_threat_sidecars_from_dir(dir: &std::path::Path, dims: [usize; 3]) ->
         match load_threats_from_file(&file, dims) {
             Ok(mut parsed) => all.append(&mut parsed),
             Err(e) => log::debug!("Skipping threat sidecar {}: {e}", file.display()),
+        }
+    }
+
+    recolor_threats(&mut all);
+    all
+}
+
+/// Load threat report sidecars from in-memory `(file name, bytes)` pairs.
+///
+/// Applies the same selection as [`load_threat_sidecars_from_dir`]: only
+/// `.dcs`/`.dcm` names whose stem contains "threat" (case-insensitive) are
+/// parsed, in name order. Unparseable files are skipped.
+pub fn load_threat_sidecars_from_bytes(
+    files: &[(String, Vec<u8>)],
+    dims: [usize; 3],
+) -> Vec<ThreatBox> {
+    let mut selected: Vec<&(String, Vec<u8>)> = files
+        .iter()
+        .filter(|(name, _)| {
+            let path = std::path::Path::new(name);
+            let ext_ok = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .is_some_and(|e| e == "dcs" || e == "dcm");
+            let stem_ok = path
+                .file_stem()
+                .is_some_and(|s| s.to_string_lossy().to_ascii_lowercase().contains("threat"));
+            ext_ok && stem_ok
+        })
+        .collect();
+    selected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut all = Vec::new();
+    for (name, bytes) in selected {
+        match reader::parse(std::io::Cursor::new(bytes.as_slice())) {
+            Ok(dataset) => all.append(&mut parse_threats(&dataset, dims)),
+            Err(e) => log::debug!("Skipping threat sidecar {name}: {e}"),
         }
     }
 
@@ -451,6 +492,40 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    #[test]
+    fn load_threat_sidecars_from_bytes_selects_and_parses() {
+        let mut ds = minimal_dataset(4, 4);
+        let mut roi = Dataset::new();
+        roi.put_string(tag::BOUNDING_BOX_TOP_LEFT, Vr::DS, "1\\1\\0");
+        roi.put_string(tag::BOUNDING_BOX_BOTTOM_RIGHT, Vr::DS, "3\\2\\0");
+        ds.insert(Element::new(
+            tag::THREAT_ROI_SEQUENCE,
+            Vr::SQ,
+            Value::Sequence(vec![roi]),
+        ));
+        let mut threat_bytes = Vec::new();
+        dicos::writer::write(&mut threat_bytes, &ds).expect("write threat file");
+        let mut plain_bytes = Vec::new();
+        dicos::writer::write(&mut plain_bytes, &minimal_dataset(4, 4)).expect("write plain file");
+
+        let files = vec![
+            ("ct.dcs".to_string(), plain_bytes.clone()),
+            ("TDR_Threat.DCS".to_string(), threat_bytes.clone()),
+            ("threat_notes.txt".to_string(), threat_bytes),
+            ("threat_garbage.dcs".to_string(), b"not dicos".to_vec()),
+        ];
+        let result = load_threat_sidecars_from_bytes(&files, [4, 4, 1]);
+        assert_eq!(
+            result.len(),
+            1,
+            "only the valid threat sidecar yields a box"
+        );
+        assert_eq!(result[0].min, [1, 1, 0]);
+        assert_eq!(result[0].max, [3, 2, 0]);
+
+        assert!(load_threat_sidecars_from_bytes(&files[..1], [4, 4, 1]).is_empty());
     }
 
     // -----------------------------------------------------------------------

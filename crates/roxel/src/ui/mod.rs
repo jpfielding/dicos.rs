@@ -17,6 +17,7 @@ mod sidebar;
 mod slice_panel;
 pub(crate) mod theme;
 
+use crate::loader::LoadSource;
 use crate::state::UiState;
 use crate::transfer::ColorBand;
 
@@ -181,7 +182,8 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
                     {
                         state.actions.file_to_load = rfd::FileDialog::new()
                             .add_filter("DICOS", &["dcs", "dcm"])
-                            .pick_file();
+                            .pick_file()
+                            .map(LoadSource::Path);
                     }
                     ui.label(
                         egui::RichText::new(".dcs and .dcm files  ·  Multi-volume folders")

@@ -185,6 +185,7 @@ pub fn load_dicos_bytes(bytes: &[u8]) -> Result<Volume, DicosError> {
 /// 2. `SliceLocation` (tag 0020,1041).
 /// 3. `InstanceNumber` (tag 0020,0013).
 /// 4. `filename_fallback` — position in alphabetically sorted file list.
+#[cfg(not(target_arch = "wasm32"))]
 fn slice_sort_key(ds: &Dataset, filename_fallback: f64) -> f64 {
     // Try ImagePositionPatient Z component (backslash-separated DS: "x\y\z").
     if let Some(s) = ds.get_string(tag::IMAGE_POSITION_PATIENT) {

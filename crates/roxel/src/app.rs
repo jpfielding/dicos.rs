@@ -85,6 +85,9 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
 
+        #[cfg(target_arch = "wasm32")]
+        crate::web::set_context(egui_ctx.clone());
+
         let renderer = VolumeRenderer::new(&device, surface_format);
         let mut camera = Camera::default();
         camera.set_coronal();
@@ -103,6 +106,17 @@ impl App {
             shift_down: false,
             pointer_pos: egui::Pos2::ZERO,
         }
+    }
+
+    /// Wake the event loop when egui asks for an immediate repaint from outside
+    /// a frame (e.g. an async file read finishing).
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_redraw_waker(&self, window: Arc<winit::window::Window>) {
+        self.egui_ctx.set_request_repaint_callback(move |info| {
+            if info.delay.is_zero() {
+                window.request_redraw();
+            }
+        });
     }
 
     pub fn handle_event(&mut self, window: &winit::window::Window, event: &WindowEvent) -> bool {
@@ -189,6 +203,18 @@ impl App {
         width: u32,
         height: u32,
     ) -> bool {
+        // Hand any bytes delivered by the browser (file picker / fetch) to the loader.
+        #[cfg(target_arch = "wasm32")]
+        for item in crate::web::take() {
+            match item {
+                Ok(source) => self.request_load(source),
+                Err(msg) => {
+                    log::error!("{msg}");
+                    self.ui.load_error = Some(msg);
+                }
+            }
+        }
+
         // Install any completed background load before drawing this frame.
         if let Some(outcome) = self.loader.poll() {
             match outcome {

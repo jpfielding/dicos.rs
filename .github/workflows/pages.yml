@@ -1,0 +1,75 @@
+name: Pages
+
+# Build the roxel browser demo (wasm32 + WebGPU) and publish it to GitHub Pages.
+# One-time owner setup: Settings → Pages → Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with TRUNK_VERSION in .devcontainer/Dockerfile.
+  TRUNK_VERSION: "0.22.1"
+  SAMPLE_DIR: "testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk
+        run: |
+          set -euo pipefail
+          asset="trunk-x86_64-unknown-linux-musl.tar.gz"
+          base="https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}"
+          curl -fsSLO "${base}/${asset}"
+          echo "$(curl -fsSL "${base}/${asset}.sha256")  ${asset}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar xzf "${asset}" -C "$HOME/.local/bin" trunk
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        working-directory: crates/roxel
+        run: trunk build --release
+
+      - name: Bundle sample scan
+        run: |
+          mkdir -p crates/roxel/dist/samples/fishtank-knife
+          cp "${SAMPLE_DIR}/ct.dcs" "${SAMPLE_DIR}/tdr.dcs" crates/roxel/dist/samples/fishtank-knife/
+          du -sh crates/roxel/dist crates/roxel/dist/*.wasm
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: crates/roxel/dist
+
+  deploy:
+    # Deploy only from main; workflow_dispatch on a branch just builds.
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -50,6 +50,8 @@ fn study(ctx: &egui::Context) -> UiState {
             window_center: 238.0,
             window_width: 2524.0,
             rescale_intercept: 0.0,
+            rescale_slope: 1.0,
+            signed_pixels: false,
             modality: "CT".into(),
             voxel_spacing: [20.0; 3],
             threats: vec![

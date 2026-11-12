@@ -584,6 +584,8 @@ mod tests {
                 window_center: 100.0,
                 window_width: 200.0,
                 rescale_intercept: 0.0,
+                rescale_slope: 1.0,
+                signed_pixels: false,
                 modality: "CT".into(),
                 voxel_spacing: [1.0; 3],
                 threats: vec![],

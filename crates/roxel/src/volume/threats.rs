@@ -254,9 +254,11 @@ pub fn load_threat_sidecars_from_dir(dir: &std::path::Path, dims: [usize; 3]) ->
 
 /// Load threat report sidecars from in-memory `(file name, bytes)` pairs.
 ///
-/// Applies the same selection as [`load_threat_sidecars_from_dir`]: only
-/// `.dcs`/`.dcm` names whose stem contains "threat" (case-insensitive) are
-/// parsed, in name order. Unparseable files are skipped.
+/// Every `.dcs`/`.dcm` file is parsed, in name order. Unlike
+/// [`load_threat_sidecars_from_dir`], names need not contain "threat": these
+/// files were chosen explicitly (e.g. a picker selection of `ct.dcs` +
+/// `tdr.dcs`). Files without threat ROIs contribute nothing; unparseable files
+/// are skipped.
 pub fn load_threat_sidecars_from_bytes(
     files: &[(String, Vec<u8>)],
     dims: [usize; 3],
@@ -264,16 +266,11 @@ pub fn load_threat_sidecars_from_bytes(
     let mut selected: Vec<&(String, Vec<u8>)> = files
         .iter()
         .filter(|(name, _)| {
-            let path = std::path::Path::new(name);
-            let ext_ok = path
+            std::path::Path::new(name)
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_ascii_lowercase())
-                .is_some_and(|e| e == "dcs" || e == "dcm");
-            let stem_ok = path
-                .file_stem()
-                .is_some_and(|s| s.to_string_lossy().to_ascii_lowercase().contains("threat"));
-            ext_ok && stem_ok
+                .is_some_and(|e| e == "dcs" || e == "dcm")
         })
         .collect();
     selected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -526,6 +523,20 @@ mod tests {
         assert_eq!(result[0].max, [3, 2, 0]);
 
         assert!(load_threat_sidecars_from_bytes(&files[..1], [4, 4, 1]).is_empty());
+    }
+
+    /// The web demo's bundled sample names its report `tdr.dcs` (no "threat"
+    /// in the stem); its PTO box must still load.
+    #[test]
+    fn load_threat_sidecars_from_bytes_reads_sample_tdr() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512/tdr.dcs"
+        );
+        let bytes = std::fs::read(path).expect("sample tdr.dcs");
+        let boxes =
+            load_threat_sidecars_from_bytes(&[("tdr.dcs".to_string(), bytes)], [256, 256, 128]);
+        assert_eq!(boxes.len(), 1, "{boxes:?}");
     }
 
     // -----------------------------------------------------------------------

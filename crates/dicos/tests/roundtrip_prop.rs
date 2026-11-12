@@ -158,6 +158,9 @@ prop_compose! {
             if frames > 1 {
                 ds.put_string(tag::NUMBER_OF_FRAMES, Vr::IS, frames.to_string());
             }
+            // Native encoding follows BitsAllocated. Pin 16 so a random
+            // scalar BitsAllocated cannot disagree with these 16-bit samples.
+            ds.put_u16(tag::BITS_ALLOCATED, Vr::US, 16);
             let frame_pixels = rows as usize * cols as usize;
             let frame_vecs: Vec<Vec<u16>> =
                 px.chunks(frame_pixels).map(<[u16]>::to_vec).collect();

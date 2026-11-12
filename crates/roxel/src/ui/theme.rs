@@ -5,6 +5,10 @@ pub const PANEL: Color32 = Color32::from_rgb(23, 31, 40);
 pub const MUTED: Color32 = Color32::from_rgb(184, 196, 208);
 pub const ACCENT: Color32 = Color32::from_rgb(105, 211, 191);
 pub fn apply(ctx: &egui::Context) {
+    // The workspace is dark-only. Pin the theme so a light OS/browser preference
+    // doesn't switch egui to its stock light style (set_style only sets the
+    // style of the current theme).
+    ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = PANEL;

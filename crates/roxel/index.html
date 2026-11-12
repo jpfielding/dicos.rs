@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Roxel — DICOS volume viewer</title>
+    <link data-trunk rel="rust" href="Cargo.toml" data-bin="roxel" data-wasm-opt="s" />
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #111418; color: #d8dee9;
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+      #roxel { display: block; width: 100%; height: 100%; outline: none; }
+      #roxel-error { display: none; position: fixed; inset: 0; padding: 2rem; max-width: 46rem;
+        margin: auto; height: fit-content; background: #1b2028; border: 1px solid #3b4252;
+        border-radius: 8px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <canvas id="roxel"></canvas>
+    <div id="roxel-error" role="alert"></div>
+    <noscript>Roxel needs JavaScript and WebGPU.</noscript>
+    <script>
+      // Fail with a readable message before the wasm loads, instead of a blank canvas.
+      (async () => {
+        const fail = (why) => {
+          const el = document.getElementById("roxel-error");
+          el.textContent = why + "\n\nRoxel's web build needs WebGPU with the " +
+            "'float32-filterable' feature: a recent desktop Chrome, Edge, or Safari (macOS 26+).";
+          el.style.display = "block";
+          document.getElementById("roxel").style.display = "none";
+        };
+        if (!navigator.gpu) return fail("This browser does not expose WebGPU.");
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) return fail("No WebGPU adapter is available.");
+          if (!adapter.features.has("float32-filterable"))
+            return fail("This GPU does not support 'float32-filterable'.");
+        } catch (e) {
+          fail("WebGPU adapter request failed: " + e);
+        }
+      })();
+    </script>
+  </body>
+</html>

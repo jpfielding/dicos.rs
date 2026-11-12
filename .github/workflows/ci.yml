@@ -52,6 +52,23 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  # Keep the roxel browser build (wasm32 + WebGPU) from rotting silently.
+  wasm-check:
+    name: roxel wasm32 clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (wasm32)
+        run: cargo clippy -p roxel --target wasm32-unknown-unknown
+
   # Confirm every publishable crate still packages cleanly. Catches missing
   # versions on path deps, stray files, and bad metadata before a tag is cut.
   package:

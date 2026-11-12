@@ -13,3 +13,5 @@ pub mod state;
 pub mod transfer;
 pub mod ui;
 pub mod volume;
+#[cfg(target_arch = "wasm32")]
+pub mod web;

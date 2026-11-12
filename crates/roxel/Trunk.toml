@@ -1,0 +1,4 @@
+[build]
+target = "index.html"
+# Relative, so the same build works at https://<user>.github.io/dicos.rs/ and locally.
+public_url = "./"

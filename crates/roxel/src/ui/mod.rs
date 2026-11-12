@@ -168,7 +168,7 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
                             .color(theme::MUTED),
                     );
                     ui.add_space(16.0);
-                    if ui
+                    let open_file = ui
                         .add_enabled(
                             state.loading_file.is_none(),
                             egui::Button::new(
@@ -177,16 +177,38 @@ pub(crate) fn draw_ui(ctx: &egui::Context, state: &mut UiState) {
                             .fill(theme::ACCENT)
                             .min_size(egui::vec2(150.0, 38.0)),
                         )
-                        .clicked()
-                    {
+                        .clicked();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if open_file {
                         state.actions.file_to_load = rfd::FileDialog::new()
                             .add_filter("DICOS", &["dcs", "dcm"])
-                            .pick_file();
+                            .pick_file()
+                            .map(crate::loader::LoadSource::Path);
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if open_file {
+                            crate::web::pick_files();
+                        }
+                        ui.add_space(8.0);
+                        if ui
+                            .add_enabled(
+                                state.loading_file.is_none(),
+                                egui::Button::new("Load sample").min_size(egui::vec2(150.0, 38.0)),
+                            )
+                            .clicked()
+                        {
+                            crate::web::load_sample();
+                        }
                     }
                     ui.label(
-                        egui::RichText::new(".dcs and .dcm files  ·  Multi-volume folders")
-                            .small()
-                            .color(theme::MUTED),
+                        egui::RichText::new(if cfg!(target_arch = "wasm32") {
+                            ".dcs and .dcm files  ·  Select a CT with its threat report"
+                        } else {
+                            ".dcs and .dcm files  ·  Multi-volume folders"
+                        })
+                        .small()
+                        .color(theme::MUTED),
                     );
                 });
             });

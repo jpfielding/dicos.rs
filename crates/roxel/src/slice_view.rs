@@ -4,6 +4,7 @@
 //! into RGBA images for display via egui. No GPU required -- operates directly
 //! on the `Volume` struct's voxel data.
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::volume::{ThreatBox, Volume};
@@ -298,24 +299,25 @@ impl SliceView {
         let alpha_scale = self.alpha_scale;
         let orientation = self.orientation;
 
-        let pixels: Vec<egui::Color32> = (0..h)
-            .into_par_iter()
-            .flat_map_iter(|v| {
-                (0..w).map(move |u| {
-                    Self::composite_pixel(
-                        vol,
-                        orientation,
-                        u,
-                        v,
-                        depth,
-                        w_min,
-                        w_range,
-                        tf,
-                        alpha_scale,
-                    )
-                })
+        let row = |v: usize| {
+            (0..w).map(move |u| {
+                Self::composite_pixel(
+                    vol,
+                    orientation,
+                    u,
+                    v,
+                    depth,
+                    w_min,
+                    w_range,
+                    tf,
+                    alpha_scale,
+                )
             })
-            .collect();
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let pixels: Vec<egui::Color32> = (0..h).into_par_iter().flat_map_iter(row).collect();
+        #[cfg(target_arch = "wasm32")]
+        let pixels: Vec<egui::Color32> = (0..h).flat_map(row).collect();
 
         egui::ColorImage::new([w, h], pixels)
     }

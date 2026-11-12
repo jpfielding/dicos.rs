@@ -18,29 +18,49 @@ pub(crate) fn draw_left_sidebar(ctx: &egui::Context, state: &mut UiState) {
                 // load is in flight (only one load may run at a time).
                 let is_loading = state.loading_file.is_some();
                 panel.add_enabled_ui(!is_loading, |panel| {
-                    if panel
+                    let open_file = panel
                         .add_sized(
                             [panel.available_width(), 34.0],
                             egui::Button::new("Open file…"),
                         )
-                        .clicked()
+                        .clicked();
+                    #[cfg(not(target_arch = "wasm32"))]
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("DICOS", &["dcs", "dcm"])
-                            .pick_file()
+                        if open_file {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("DICOS", &["dcs", "dcm"])
+                                .pick_file()
+                            {
+                                state.actions.file_to_load =
+                                    Some(crate::loader::LoadSource::Path(path));
+                            }
+                        }
+                        if panel
+                            .add_sized(
+                                [panel.available_width(), 34.0],
+                                egui::Button::new("Open folder…"),
+                            )
+                            .clicked()
                         {
-                            state.actions.file_to_load = Some(path);
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                state.actions.file_to_load =
+                                    Some(crate::loader::LoadSource::Path(path));
+                            }
                         }
                     }
-                    if panel
-                        .add_sized(
-                            [panel.available_width(), 34.0],
-                            egui::Button::new("Open folder…"),
-                        )
-                        .clicked()
+                    #[cfg(target_arch = "wasm32")]
                     {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            state.actions.file_to_load = Some(path);
+                        if open_file {
+                            crate::web::pick_files();
+                        }
+                        if panel
+                            .add_sized(
+                                [panel.available_width(), 34.0],
+                                egui::Button::new("Load sample"),
+                            )
+                            .clicked()
+                        {
+                            crate::web::load_sample();
                         }
                     }
                 });

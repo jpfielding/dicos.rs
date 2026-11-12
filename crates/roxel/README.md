@@ -20,6 +20,42 @@ separate named layers; it does not automatically stack those layers. Failed
 files are logged. See the [API review](../../docs/reviews/dicos-api-review.md)
 for existing ingestion limitations.
 
+## Web demo
+
+A browser build (wasm32 + WebGPU) runs at
+<https://jpfielding.github.io/dicos.rs/>. It opens a bundled synthetic sample
+(a backpack with a fishtank and a knife threat report) on first launch. Use
+**Open file…** to choose your own `.dcs` files; select the CT and its threat
+report together to see the threat boxes. **Load sample** reloads the bundled scan.
+
+**Browser support:** WebGPU with the `float32-filterable` feature, which means
+a recent desktop Chrome, Edge, or Safari (macOS 26+). Unsupported browsers see an
+explanation instead of a blank page.
+
+**Run it locally** (the devcontainer already has the wasm target and Trunk):
+
+```sh
+rustup target add wasm32-unknown-unknown    # outside the devcontainer
+cargo install --locked trunk                # or use a release binary
+cd crates/roxel
+trunk build --release
+mkdir -p dist/samples/fishtank-knife
+cp ../../testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512/{ct,tdr}.dcs \
+   dist/samples/fishtank-knife/
+trunk serve --release --no-autoreload       # http://127.0.0.1:8080
+```
+
+`trunk serve` rebuilds into `dist/`. If it clears the folder, copy the sample in again.
+
+**Limits compared with the desktop build:**
+
+- There is no Open folder and no drag and drop.
+- Files are parsed on the main thread, so the page pauses while a large scan loads.
+- A panic in a codec aborts the tab, because wasm has no `catch_unwind`.
+- When the GPU lacks 16-bit normalized textures (WebGPU never exposes them),
+  the volume is stored as `Rgba16Float`, which has about 11 bits of precision
+  near the top of the range instead of 16.
+
 ## Inspect a study
 
 The library sits on the left, the 3D view in the center, and the slice inspector

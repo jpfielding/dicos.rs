@@ -75,5 +75,8 @@
     "codex": "mkdir -p ${localEnv:HOME}/.codex || true",
     "bash history": "touch ${localEnv:HOME}/.bash_history_${localWorkspaceFolderBasename}"
   },
-  "forwardPorts": []
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": { "label": "roxel web (trunk serve)", "onAutoForward": "notify" }
+  }
 }

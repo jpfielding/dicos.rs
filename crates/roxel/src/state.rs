@@ -14,12 +14,13 @@
 
 use crate::app::VolumeLayer;
 use crate::camera::Camera;
+use crate::loader::LoadSource;
 use crate::renderer::Quality;
 use crate::slice_view::SliceView;
 use crate::transfer::{self, ColorBand, TransferPreset};
 
 use std::path::PathBuf;
-use std::time::Instant;
+use web_time::Instant;
 
 /// UI state that can be passed into egui closures without borrowing the whole App.
 pub(crate) struct UiState {
@@ -174,7 +175,7 @@ impl Default for RenderSettings {
 /// Transient action flags set by UI closures and drained by `App::render`.
 #[derive(Default)]
 pub(crate) struct UiActions {
-    pub(crate) file_to_load: Option<PathBuf>,
+    pub(crate) file_to_load: Option<LoadSource>,
     /// Request to upload a different volume to the 3D renderer.
     pub(crate) upload_3d_index: Option<usize>,
     pub(crate) preset_changed: bool,

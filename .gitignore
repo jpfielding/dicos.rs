@@ -30,3 +30,6 @@ voxels.raw
 # not committed (README links to the v2.0.0 release download).
 /roxel-lrg.gif
 
+
+# Trunk output for the roxel web build
+/crates/roxel/dist/

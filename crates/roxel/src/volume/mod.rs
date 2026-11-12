@@ -6,10 +6,12 @@
 mod dataset;
 mod threats;
 
-pub use dataset::{load_dicos_path, load_dicos_volume, volume_from_dataset};
-pub use threats::{
-    load_threat_sidecars_from_dir, load_threats_from_file, threat_color_for_index, ThreatBox,
-};
+pub use dataset::{load_dicos_bytes, volume_from_dataset};
+#[cfg(not(target_arch = "wasm32"))]
+pub use dataset::{load_dicos_path, load_dicos_volume};
+pub use threats::{load_threat_sidecars_from_bytes, threat_color_for_index, ThreatBox};
+#[cfg(not(target_arch = "wasm32"))]
+pub use threats::{load_threat_sidecars_from_dir, load_threats_from_file};
 
 /// A loaded 3D volume ready for rendering.
 #[derive(Debug)]

@@ -18,7 +18,7 @@
 //! ```
 
 use crate::camera::Camera;
-use crate::loader::{LoadOutcome, LoadedLayer, VolumeLoader};
+use crate::loader::{LoadOutcome, LoadSource, LoadedLayer, VolumeLoader};
 use crate::renderer::{RenderParams, VolumeRenderer};
 use crate::state::UiState;
 use crate::transfer::{TransferFunction, TransferPreset};
@@ -26,7 +26,8 @@ use crate::volume::{self, ThreatBox, Volume};
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 use winit::event::WindowEvent;
 
 /// A named volume layer loaded from a DICOS file.
@@ -84,6 +85,9 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
 
+        #[cfg(target_arch = "wasm32")]
+        crate::web::set_context(egui_ctx.clone());
+
         let renderer = VolumeRenderer::new(&device, surface_format);
         let mut camera = Camera::default();
         camera.set_coronal();
@@ -102,6 +106,17 @@ impl App {
             shift_down: false,
             pointer_pos: egui::Pos2::ZERO,
         }
+    }
+
+    /// Wake the event loop when egui asks for an immediate repaint from outside
+    /// a frame (e.g. an async file read finishing).
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_redraw_waker(&self, window: Arc<winit::window::Window>) {
+        self.egui_ctx.set_request_repaint_callback(move |info| {
+            if info.delay.is_zero() {
+                window.request_redraw();
+            }
+        });
     }
 
     pub fn handle_event(&mut self, window: &winit::window::Window, event: &WindowEvent) -> bool {
@@ -181,13 +196,27 @@ impl App {
         response.repaint || needs_repaint
     }
 
+    /// Draw one frame. Returns how long until the next frame is needed:
+    /// `Duration::ZERO` for immediately, `Duration::MAX` for "only on input".
     pub fn render(
         &mut self,
         window: &winit::window::Window,
         surface_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-    ) -> bool {
+    ) -> Duration {
+        // Hand any bytes delivered by the browser (file picker / fetch) to the loader.
+        #[cfg(target_arch = "wasm32")]
+        for item in crate::web::take() {
+            match item {
+                Ok(source) => self.request_load(source),
+                Err(msg) => {
+                    log::error!("{msg}");
+                    self.ui.load_error = Some(msg);
+                }
+            }
+        }
+
         // Install any completed background load before drawing this frame.
         if let Some(outcome) = self.loader.poll() {
             match outcome {
@@ -402,10 +431,20 @@ impl App {
         // Keep the frame loop pumping while a background load is in flight so
         // we continue polling (and animating the spinner) without user input.
         if self.loader.loading().is_some() {
-            self.egui_ctx.request_repaint();
+            return Duration::ZERO;
         }
 
-        self.egui_ctx.has_requested_repaint()
+        // Honor egui's requested delay instead of `has_requested_repaint()`,
+        // which is also true for *delayed* requests and made the caller redraw
+        // every frame (a full ray-cast) while idle.
+        let mut delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        if let Some(deadline) = self.ui.transfer.bands_debounce_deadline {
+            delay = delay.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        delay
     }
 
     /// Request a background load of a file or directory. Called from main for
@@ -431,14 +470,15 @@ impl App {
         self.loader.loading().is_some()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_path(&mut self, path: &std::path::Path) {
-        self.request_load(path.to_path_buf());
+        self.request_load(LoadSource::Path(path.to_path_buf()));
     }
 
     /// Kick off a background load, clearing any stale error message.
-    fn request_load(&mut self, path: PathBuf) {
+    fn request_load(&mut self, source: LoadSource) {
         self.ui.load_error = None;
-        self.loader.request(path);
+        self.loader.request(source);
     }
 
     /// Install the layers produced by a completed background load, replacing

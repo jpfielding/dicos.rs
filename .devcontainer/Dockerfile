@@ -39,7 +39,7 @@ ENV PATH ${HOME}/bin:${PATH}
 RUN mkdir -p ${SDK_HOME}
 
 # rust — keep RUST_VERSION in sync with /rust-toolchain.toml (single source of truth at runtime)
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.99.1
 ENV PATH ${HOME}/.cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         bash -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal -c rustfmt,clippy \

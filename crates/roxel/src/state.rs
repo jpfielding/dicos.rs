@@ -19,7 +19,7 @@ use crate::slice_view::SliceView;
 use crate::transfer::{self, ColorBand, TransferPreset};
 
 use std::path::PathBuf;
-use std::time::Instant;
+use web_time::Instant;
 
 /// UI state that can be passed into egui closures without borrowing the whole App.
 pub(crate) struct UiState {

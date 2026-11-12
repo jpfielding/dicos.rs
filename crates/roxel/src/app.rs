@@ -26,7 +26,8 @@ use crate::volume::{self, ThreatBox, Volume};
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 use winit::event::WindowEvent;
 
 /// A named volume layer loaded from a DICOS file.

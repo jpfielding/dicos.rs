@@ -341,6 +341,12 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
                 continue;
             }
         };
+        // Non-image files (e.g. a TDR) carry no pixel data; skip them before
+        // validation so their attributes cannot fail the load.
+        if ds.get(tag::PIXEL_DATA).is_none() {
+            log::debug!("Skipping {}: no PixelData", path.display());
+            continue;
+        }
         match volume_from_dataset(&ds) {
             Ok(vol) => slices.push((path, sort_metadata(&ds), vol)),
             // An unsupported pixel representation would otherwise silently
@@ -1126,9 +1132,12 @@ mod tests {
         // TDR-like file: parses, but has no pixel data or spatial tags.
         let mut tdr = Dataset::new();
         tdr.put_string(tag::MODALITY, Vr::CS, "OT");
+        // Rows=0 would fail volume validation if the file were not skipped.
+        tdr.put_u16(tag::ROWS, Vr::US, 0);
         let mut buf = Vec::new();
         dicos::write(&mut buf, &tdr).expect("write should succeed");
-        std::fs::write(dir.join("tdr.dcs"), buf).expect("write tdr");
+        // Named to sort before the slices, so it would be the first entry.
+        std::fs::write(dir.join("000-tdr.dcs"), buf).expect("write tdr");
 
         let result = load_dicos_directory(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1138,5 +1147,22 @@ mod tests {
             vec![100, 101, 102],
             "slices must follow IPP z order"
         );
+    }
+
+    /// The normal comes from the first slice that has IOP, even if earlier
+    /// slices lack it.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slice_sort_keys_use_first_available_orientation() {
+        let mk = |x: f32, iop: bool| {
+            let mut ds = Dataset::new();
+            ds.put_string(tag::IMAGE_POSITION_PATIENT, Vr::DS, format!("{x}\\0\\5"));
+            if iop {
+                ds.put_string(tag::IMAGE_ORIENTATION_PATIENT, Vr::DS, "0\\1\\0\\0\\0\\-1");
+            }
+            ds
+        };
+        let (a, b, c) = (mk(2.0, false), mk(1.0, true), mk(0.0, true));
+        assert_eq!(slice_sort_keys(&[&a, &b, &c]), vec![-2.0, -1.0, 0.0]);
     }
 }

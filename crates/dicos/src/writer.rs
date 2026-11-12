@@ -73,10 +73,10 @@ pub fn write_part10<W: Write>(writer: &mut W, ds: &Dataset) -> Result<u64, Dicos
         if elem.tag != tag::TRANSFER_SYNTAX_UID {
             continue;
         }
-        let implicit = elem
-            .value
-            .as_str()
-            .is_some_and(|uid| uid.trim() == transfer::IMPLICIT_VR_LITTLE_ENDIAN);
+        let implicit = elem.value.as_str().is_some_and(|uid| {
+            uid.trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                == transfer::IMPLICIT_VR_LITTLE_ENDIAN
+        });
         if implicit {
             *elem = Element::new(
                 tag::TRANSFER_SYNTAX_UID,
@@ -265,8 +265,11 @@ fn encode_value(
                 let b = encode_native_pixel_data(frames, bits_allocated)?;
                 Ok((b, false))
             }
-            PixelData::Encapsulated { frames, .. } => {
-                let b = encode_encapsulated_pixel_data(frames)?;
+            PixelData::Encapsulated { frames, offsets } => {
+                // An empty BOT means frame boundaries are unknown (the reader
+                // kept one item per fragment), so keep it empty rather than
+                // advertising guessed frame starts.
+                let b = encode_encapsulated_pixel_data(frames, !offsets.is_empty())?;
                 Ok((b, true)) // Encapsulated uses undefined length
             }
         },
@@ -312,19 +315,17 @@ fn encode_sequence(datasets: &[Dataset]) -> Result<Vec<u8>, DicosError> {
 /// Encodes native (uncompressed) pixel data using `BitsAllocated`.
 ///
 /// 8-bit samples are written as one byte each (values must fit in 0..=255)
-/// and padded to an even length as required by DICOM. 16-bit samples (the
-/// default when BitsAllocated is absent) are written little-endian. Other
-/// widths are rejected because the in-memory representation is `u16`.
+/// and padded to an even length as required by DICOM. Every other width
+/// (including absent) is written as 16-bit little-endian pairs, mirroring how
+/// the reader unpacks it, so parsed datasets round-trip byte for byte.
 fn encode_native_pixel_data(
     frames: &[Vec<u16>],
     bits_allocated: Option<u16>,
 ) -> Result<Vec<u8>, DicosError> {
-    match bits_allocated.unwrap_or(16) {
-        8 => encode_native_8bit(frames),
-        16 => Ok(encode_native_16bit(frames)),
-        other => Err(DicosError::Validation(format!(
-            "unsupported BitsAllocated {other} for native pixel data (supported: 8 and 16)"
-        ))),
+    if bits_allocated == Some(8) {
+        encode_native_8bit(frames)
+    } else {
+        Ok(encode_native_16bit(frames))
     }
 }
 
@@ -368,9 +369,13 @@ fn encode_native_16bit(frames: &[Vec<u16>]) -> Vec<u8> {
     buf
 }
 
-/// Encodes encapsulated (compressed) pixel data with a BOT rebuilt from the
-/// items actually written (one item per assembled frame, including padding).
-fn encode_encapsulated_pixel_data(frames: &[Vec<u8>]) -> Result<Vec<u8>, DicosError> {
+/// Encodes encapsulated (compressed) pixel data, one item per frame. When
+/// `with_bot` is set the BOT is rebuilt from the items actually written
+/// (including padding); otherwise an empty BOT is emitted.
+fn encode_encapsulated_pixel_data(
+    frames: &[Vec<u8>],
+    with_bot: bool,
+) -> Result<Vec<u8>, DicosError> {
     let mut items = Vec::new();
     let mut offsets = Vec::with_capacity(frames.len());
     let mut offset: u32 = 0;
@@ -410,6 +415,9 @@ fn encode_encapsulated_pixel_data(frames: &[Vec<u8>]) -> Result<Vec<u8>, DicosEr
     // Basic Offset Table item, one entry per emitted frame.
     buf.write_u16::<LittleEndian>(0xFFFE)?; // Item tag
     buf.write_u16::<LittleEndian>(0xE000)?;
+    if !with_bot {
+        offsets.clear();
+    }
     let bot_len = u32::try_from(offsets.len() * 4)
         .map_err(|_| DicosError::Validation("Basic Offset Table too large".into()))?;
     buf.write_u32::<LittleEndian>(bot_len)?;
@@ -871,5 +879,86 @@ mod tests {
             }
             other => panic!("expected encapsulated pixel data, got {other:?}"),
         }
+    }
+
+    /// An empty BOT means the frame boundaries are unknown (the reader kept
+    /// one entry per fragment). Rewriting must keep the BOT empty rather than
+    /// advertising one frame start per fragment.
+    #[test]
+    fn empty_bot_is_preserved_on_rewrite() {
+        let mut ds = Dataset::new();
+        ds.put_string(tag::TRANSFER_SYNTAX_UID, Vr::UI, transfer::JPEG_LS_LOSSLESS);
+        ds.put_string(tag::NUMBER_OF_FRAMES, Vr::IS, "1");
+        ds.insert(Element::new(
+            tag::PIXEL_DATA,
+            Vr::OB,
+            Value::PixelData(PixelData::encapsulated(
+                vec![vec![1, 2], vec![3, 4]],
+                vec![],
+            )),
+        ));
+
+        let rt = roundtrip(&ds);
+        match rt.pixel_data() {
+            Some(PixelData::Encapsulated { frames, offsets }) => {
+                assert_eq!(frames, &vec![vec![1, 2], vec![3, 4]]);
+                assert!(offsets.is_empty(), "BOT must stay empty: {offsets:?}");
+            }
+            other => panic!("expected encapsulated pixel data, got {other:?}"),
+        }
+        let again = roundtrip(&rt);
+        assert_eq!(rt.pixel_data(), again.pixel_data());
+    }
+
+    /// BitsAllocated other than 8 keeps the pre-existing 16-bit pairing so a
+    /// dataset the reader accepted can be written back byte for byte.
+    #[test]
+    fn roundtrip_native_pixels_with_32bit_allocation() {
+        for bits in [1u16, 32] {
+            let mut ds = Dataset::new();
+            ds.put_u16(tag::ROWS, Vr::US, 1);
+            ds.put_u16(tag::COLUMNS, Vr::US, 1);
+            ds.put_u16(tag::BITS_ALLOCATED, Vr::US, bits);
+            ds.insert(Element::new(
+                tag::PIXEL_DATA,
+                Vr::OW,
+                Value::PixelData(PixelData::native(vec![vec![513, 1027]])),
+            ));
+
+            let mut buf = Vec::new();
+            write(&mut buf, &ds).unwrap_or_else(|e| panic!("BitsAllocated {bits}: {e}"));
+            let buf_first = buf.clone();
+            let rt = reader::parse(io::Cursor::new(buf)).expect("parse should succeed");
+            assert_eq!(
+                rt.pixel_data(),
+                Some(&PixelData::native(vec![vec![513, 1027]])),
+                "BitsAllocated {bits}: samples changed"
+            );
+            let mut out = Vec::new();
+            write(&mut out, &rt).unwrap_or_else(|e| panic!("rewrite {bits}: {e}"));
+            assert_eq!(
+                out, buf_first,
+                "BitsAllocated {bits}: bytes changed on rewrite"
+            );
+        }
+    }
+
+    /// A NUL-padded Implicit VR UID (as built in memory) is still normalized.
+    #[test]
+    fn implicit_vr_uid_with_nul_padding_is_normalized() {
+        let mut ds = Dataset::new();
+        ds.insert(Element::new(
+            tag::TRANSFER_SYNTAX_UID,
+            Vr::UI,
+            Value::Str(format!("{}\0", transfer::IMPLICIT_VR_LITTLE_ENDIAN)),
+        ));
+        ds.put_u16(tag::ROWS, Vr::US, 1);
+
+        let rt = roundtrip(&ds);
+        assert_eq!(
+            rt.get_string(tag::TRANSFER_SYNTAX_UID),
+            Some(transfer::EXPLICIT_VR_LITTLE_ENDIAN)
+        );
+        assert_eq!(rt.rows(), Some(1));
     }
 }

@@ -186,52 +186,110 @@ pub fn load_dicos_bytes(bytes: &[u8]) -> Result<Volume, DicosError> {
     volume_from_dataset(&dataset)
 }
 
-/// Extract a sort key from a dataset for spatial slice ordering.
+/// Parse a multi-valued DS attribute into floats.
 ///
-/// Priority:
-/// 1. `ImagePositionPatient` Z coordinate (tag 0020,0032) — most accurate.
-/// 2. `SliceLocation` (tag 0020,1041).
-/// 3. `InstanceNumber` (tag 0020,0013).
-/// 4. `filename_fallback` — position in alphabetically sorted file list.
+/// After a real parse, multi-valued DS is stored as `Value::Strings`, so
+/// `get_string` only returns the first component. Use `get_strs` and also
+/// split a single backslash-separated string so in-memory unsplit values
+/// work too.
 #[cfg(not(target_arch = "wasm32"))]
-fn slice_sort_key(ds: &Dataset, filename_fallback: f64) -> f64 {
-    // Try ImagePositionPatient Z component. After a real parse, multi-valued
-    // DS is stored as Value::Strings, and get_string only returns the first
-    // component. Use get_strs (the same pattern as PIXEL_SPACING) and also
-    // split a single backslash-separated string so in-memory unsplit values
-    // still work.
-    if let Some(parts) = ds.get_strs(tag::IMAGE_POSITION_PATIENT) {
-        let comps: Vec<&str> = parts
-            .iter()
-            .flat_map(|p| p.split('\\'))
-            .map(|s| s.trim())
-            .collect();
-        if comps.len() >= 3 {
-            if let Ok(z) = comps[2].parse::<f64>() {
-                return z;
-            }
+fn ds_numbers(ds: &Dataset, t: tag::Tag) -> Option<Vec<f64>> {
+    let parts = ds.get_strs(t)?;
+    parts
+        .iter()
+        .flat_map(|p| p.split('\\'))
+        .map(|s| s.trim().parse::<f64>().ok())
+        .collect()
+}
+
+/// Copy only the tags [`slice_sort_keys`] reads, so the full dataset (and its
+/// pixel data) can be dropped while the directory is being loaded.
+#[cfg(not(target_arch = "wasm32"))]
+fn sort_metadata(ds: &Dataset) -> Dataset {
+    let mut meta = Dataset::new();
+    for t in [
+        tag::IMAGE_POSITION_PATIENT,
+        tag::IMAGE_ORIENTATION_PATIENT,
+        tag::SLICE_LOCATION,
+        tag::INSTANCE_NUMBER,
+    ] {
+        if let Some(elem) = ds.get(t) {
+            meta.insert(elem.clone());
         }
+    }
+    meta
+}
+
+/// Compute spatial sort keys for a whole stack of slices.
+///
+/// One strategy is chosen for the entire stack so keys are never a mix of
+/// millimetres and ordinals:
+/// 1. Every slice has `ImagePositionPatient`: project it onto the slice
+///    normal (`row x column` from the first `ImageOrientationPatient`
+///    found; otherwise +Z).
+///    This orders axial, sagittal, coronal and oblique stacks alike.
+/// 2. Every slice has `SliceLocation`.
+/// 3. Every slice has `InstanceNumber`.
+/// 4. Otherwise the input (alphabetical filename) order.
+#[cfg(not(target_arch = "wasm32"))]
+fn slice_sort_keys(datasets: &[&Dataset]) -> Vec<f64> {
+    let positions: Option<Vec<[f64; 3]>> = datasets
+        .iter()
+        .map(|ds| {
+            let v = ds_numbers(ds, tag::IMAGE_POSITION_PATIENT)?;
+            (v.len() >= 3).then(|| [v[0], v[1], v[2]])
+        })
+        .collect();
+    if let Some(positions) = positions {
+        // Use the first slice that carries an orientation.
+        let normal = datasets
+            .iter()
+            .find_map(|ds| ds_numbers(ds, tag::IMAGE_ORIENTATION_PATIENT).filter(|v| v.len() >= 6))
+            .map(|o| {
+                let (r, c) = ([o[0], o[1], o[2]], [o[3], o[4], o[5]]);
+                [
+                    r[1] * c[2] - r[2] * c[1],
+                    r[2] * c[0] - r[0] * c[2],
+                    r[0] * c[1] - r[1] * c[0],
+                ]
+            })
+            .filter(|n| n.iter().any(|v| v.abs() > 1e-9))
+            .unwrap_or([0.0, 0.0, 1.0]);
+        return positions
+            .iter()
+            .map(|p| p[0] * normal[0] + p[1] * normal[1] + p[2] * normal[2])
+            .collect();
     }
 
-    // Try SliceLocation.
-    if let Some(s) = ds.get_string(tag::SLICE_LOCATION) {
-        if let Ok(v) = s.trim().parse::<f64>() {
-            return v;
-        }
+    let locations: Option<Vec<f64>> = datasets
+        .iter()
+        .map(|ds| {
+            ds.get_string(tag::SLICE_LOCATION)?
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .collect();
+    if let Some(locations) = locations {
+        return locations;
     }
-    // Try InstanceNumber.
-    if let Some(n) = ds.get_u16(tag::INSTANCE_NUMBER) {
-        return f64::from(n);
+
+    let instances: Option<Vec<f64>> = datasets
+        .iter()
+        .map(|ds| ds.get_u16(tag::INSTANCE_NUMBER).map(f64::from))
+        .collect();
+    if let Some(instances) = instances {
+        return instances;
     }
-    filename_fallback
+
+    (0..datasets.len()).map(|i| i as f64).collect()
 }
 
 /// Load a directory of DICOS files as a single volume.
 ///
 /// Each file contributes one or more slices. Slices are ordered by DICOM
-/// spatial metadata: `ImagePositionPatient` Z coordinate (preferred), then
-/// `SliceLocation`, then `InstanceNumber`, falling back to filename order
-/// when none of those tags are present.
+/// spatial metadata using one strategy for the whole stack; see
+/// [`slice_sort_keys`].
 #[cfg(not(target_arch = "wasm32"))]
 fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
@@ -262,8 +320,12 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
     log::info!("Loading {} DICOS files from {}", files.len(), dir.display());
 
     // Parse each file once, extract sort key, keep dataset for volume extraction.
-    let mut entries: Vec<(f64, std::path::PathBuf, Dataset)> = Vec::with_capacity(files.len());
-    for (idx, path) in files.into_iter().enumerate() {
+    // Decode each file as it is parsed, keeping only the spatial tags needed
+    // for ordering. Sort keys then come only from files that contribute
+    // slices, so a TDR or other non-image file in the directory cannot change
+    // the ordering strategy for the stack.
+    let mut slices: Vec<(std::path::PathBuf, Dataset, Volume)> = Vec::with_capacity(files.len());
+    for path in files {
         let file = match std::fs::File::open(&path).map_err(DicosError::Io) {
             Ok(f) => f,
             Err(e) => {
@@ -272,10 +334,25 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
             }
         };
         let reader = std::io::BufReader::new(file);
-        match dicos::reader::parse(reader) {
-            Ok(ds) => {
-                let key = slice_sort_key(&ds, idx as f64);
-                entries.push((key, path, ds));
+        let ds = match dicos::reader::parse(reader) {
+            Ok(ds) => ds,
+            Err(e) => {
+                log::warn!("Skipping {}: {e}", path.display());
+                continue;
+            }
+        };
+        // Non-image files (e.g. a TDR) carry no pixel data; skip them before
+        // validation so their attributes cannot fail the load.
+        if ds.get(tag::PIXEL_DATA).is_none() {
+            log::debug!("Skipping {}: no PixelData", path.display());
+            continue;
+        }
+        match volume_from_dataset(&ds) {
+            Ok(vol) => slices.push((path, sort_metadata(&ds), vol)),
+            // An unsupported pixel representation would otherwise silently
+            // drop a slice and close the spatial gap; fail the whole load.
+            Err(e @ DicosError::InvalidValue { .. }) => {
+                return Err(DicosError::InvalidFile(format!("{}: {e}", path.display())));
             }
             Err(e) => {
                 log::warn!("Skipping {}: {e}", path.display());
@@ -283,11 +360,18 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
         }
     }
 
-    if entries.is_empty() {
+    if slices.is_empty() {
         return Err(DicosError::InvalidFile(
-            "No valid DICOS files could be parsed".into(),
+            "No DICOS files with image data could be loaded".into(),
         ));
     }
+
+    let keys = slice_sort_keys(&slices.iter().map(|(_, meta, _)| meta).collect::<Vec<_>>());
+    let mut entries: Vec<(f64, std::path::PathBuf, Volume)> = keys
+        .into_iter()
+        .zip(slices)
+        .map(|(key, (path, _, vol))| (key, path, vol))
+        .collect();
 
     // Sort by spatial key; use path as tiebreaker for determinism.
     entries.sort_by(|a, b| {
@@ -296,37 +380,48 @@ fn load_dicos_directory(dir: &std::path::Path) -> Result<Volume, DicosError> {
             .then_with(|| a.1.cmp(&b.1))
     });
 
-    // Extract the first volume to get dimensions and shared metadata.
-    let (_, first_path, first_ds) = entries.remove(0);
-    let first = volume_from_dataset(&first_ds)?;
+    // The first slice provides dimensions and shared metadata.
+    let (_, first_path, first) = entries.remove(0);
     let cols = first.dim_x;
     let rows = first.dim_y;
 
     let mut all_pixels = first.data;
     let mut total_slices = first.dim_z;
 
-    // Extract remaining volumes, appending their pixel data.
-    for (_, path, ds) in entries {
-        match volume_from_dataset(&ds) {
-            Ok(vol) => {
-                if vol.dim_x != cols || vol.dim_y != rows {
-                    log::warn!(
-                        "Skipping {}: dimensions {}x{} don't match expected {}x{}",
-                        path.display(),
-                        vol.dim_x,
-                        vol.dim_y,
-                        cols,
-                        rows
-                    );
-                    continue;
-                }
-                total_slices += vol.dim_z;
-                all_pixels.extend_from_slice(&vol.data);
-            }
-            Err(e) => {
-                log::warn!("Skipping {}: {e}", path.display());
-            }
+    // Append remaining slices.
+    for (_, path, vol) in entries {
+        if vol.dim_x != cols || vol.dim_y != rows {
+            log::warn!(
+                "Skipping {}: dimensions {}x{} don't match expected {}x{}",
+                path.display(),
+                vol.dim_x,
+                vol.dim_y,
+                cols,
+                rows
+            );
+            continue;
         }
+        // One intensity transform applies to the whole volume, so a slice
+        // with a different one would be displayed wrongly.
+        if vol.rescale_slope != first.rescale_slope
+            || vol.rescale_intercept != first.rescale_intercept
+            || vol.signed_pixels != first.signed_pixels
+        {
+            return Err(DicosError::InvalidFile(format!(
+                "{}: RescaleSlope/RescaleIntercept/PixelRepresentation \
+                 ({}, {}, signed={}) differ from {} ({}, {}, signed={})",
+                path.display(),
+                vol.rescale_slope,
+                vol.rescale_intercept,
+                vol.signed_pixels,
+                first_path.display(),
+                first.rescale_slope,
+                first.rescale_intercept,
+                first.signed_pixels
+            )));
+        }
+        total_slices += vol.dim_z;
+        all_pixels.extend_from_slice(&vol.data);
     }
 
     log::info!(
@@ -451,6 +546,24 @@ pub fn volume_from_dataset(ds: &Dataset) -> Result<Volume, DicosError> {
                 "signed pixel data with BitsAllocated={bits_allocated} is unsupported (expected 8 or 16)"
             ),
         });
+    }
+
+    // Signed samples are sign-extended from BitsAllocated. DICOM does not
+    // guarantee the unused high bits carry the sign, so a narrower BitsStored
+    // (e.g. 12-bit signed in 16-bit cells) cannot be interpreted correctly
+    // here; reject it rather than show wrong densities.
+    if signed_pixels {
+        if let Some(bits_stored) = ds.get_u16(tag::BITS_STORED) {
+            if bits_stored != bits_allocated {
+                return Err(DicosError::InvalidValue {
+                    group: tag::BITS_STORED.group,
+                    element: tag::BITS_STORED.element,
+                    reason: format!(
+                        "signed pixel data with BitsStored={bits_stored} < BitsAllocated={bits_allocated} is unsupported"
+                    ),
+                });
+            }
+        }
     }
 
     let modality = ds.modality().to_string();
@@ -596,6 +709,11 @@ mod tests {
     use dicos::types::Element;
     use dicos::vr::Vr;
 
+    /// Sort key of a single-slice stack (index fallback is 0).
+    fn slice_sort_key(ds: &Dataset, _filename_fallback: f64) -> f64 {
+        slice_sort_keys(&[ds])[0]
+    }
+
     /// Build a minimal single-pixel dataset with ImagePositionPatient set to the
     /// given Z coordinate.
     fn ds_with_z(z: f32) -> Dataset {
@@ -651,9 +769,41 @@ mod tests {
         ds.put_u16(tag::ROWS, Vr::US, 1);
         ds.put_u16(tag::COLUMNS, Vr::US, 1);
         ds.put_string(tag::MODALITY, Vr::CS, "CT");
-        // No spatial tags at all.
-        let key = slice_sort_key(&ds, 3.0);
-        assert!((key - 3.0).abs() < 1e-6, "Expected 3.0, got {key}");
+        // No spatial tags at all: keys follow input (filename) order.
+        let keys = slice_sort_keys(&[&ds, &ds, &ds]);
+        assert_eq!(keys, vec![0.0, 1.0, 2.0]);
+    }
+
+    /// Sagittal stack: X varies, Z is constant. Projecting IPP onto the
+    /// slice normal from ImageOrientationPatient orders by X.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slice_sort_keys_use_orientation_normal_for_sagittal() {
+        let mk = |x: f32| {
+            let mut ds = Dataset::new();
+            ds.put_string(tag::IMAGE_POSITION_PATIENT, Vr::DS, format!("{x}\\0\\5"));
+            // Row direction (0,1,0), column direction (0,0,-1): normal (-1,0,0).
+            ds.put_string(tag::IMAGE_ORIENTATION_PATIENT, Vr::DS, "0\\1\\0\\0\\0\\-1");
+            ds
+        };
+        let (a, b, c) = (mk(2.0), mk(1.0), mk(0.0));
+        let keys = slice_sort_keys(&[&a, &b, &c]);
+        // normal (-1,0,0): keys are -x, so x=2 sorts first, all distinct.
+        assert_eq!(keys, vec![-2.0, -1.0, 0.0]);
+    }
+
+    /// When only some slices have IPP, mixing mm keys with ordinals is wrong;
+    /// the whole stack falls back to InstanceNumber.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slice_sort_keys_partial_ipp_falls_back_for_whole_stack() {
+        let mut a = ds_with_z(-300.0);
+        a.put_u16(tag::INSTANCE_NUMBER, Vr::IS, 1);
+        let mut b = Dataset::new();
+        b.put_u16(tag::INSTANCE_NUMBER, Vr::IS, 2);
+        let mut c = ds_with_z(-100.0);
+        c.put_u16(tag::INSTANCE_NUMBER, Vr::IS, 3);
+        assert_eq!(slice_sort_keys(&[&a, &b, &c]), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -883,5 +1033,136 @@ mod tests {
             ),
             "expected InvalidValue for PixelRepresentation, got {result:?}"
         );
+    }
+
+    /// Signed data whose BitsStored is narrower than BitsAllocated cannot be
+    /// sign-extended correctly from the cell width, so it is rejected.
+    #[test]
+    fn signed_partial_bits_stored_is_rejected() {
+        let mut ds = dataset_with_pixels(&[0x0FFF], 16, true, "1", "0");
+        ds.put_u16(tag::BITS_STORED, Vr::US, 12);
+        let result = volume_from_dataset(&ds);
+        assert!(
+            matches!(
+                result,
+                Err(dicos::error::DicosError::InvalidValue { group, element, .. })
+                    if group == tag::BITS_STORED.group && element == tag::BITS_STORED.element
+            ),
+            "expected InvalidValue for BitsStored, got {result:?}"
+        );
+
+        // Full-width BitsStored is still accepted.
+        ds.put_u16(tag::BITS_STORED, Vr::US, 16);
+        assert!(volume_from_dataset(&ds).is_ok());
+    }
+
+    /// One intensity transform applies to the assembled volume, so slices
+    /// with a different RescaleSlope are rejected instead of mis-displayed.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn directory_with_mixed_rescale_slope_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "roxel-mixed-slope-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for (i, slope) in ["1", "2", "3"].iter().enumerate() {
+            let mut ds = dataset_with_pixels(&[10 * (i as u16 + 1)], 16, false, slope, "0");
+            ds.put_u16(tag::INSTANCE_NUMBER, Vr::IS, i as u16 + 1);
+            let mut buf = Vec::new();
+            dicos::write(&mut buf, &ds).expect("write should succeed");
+            std::fs::write(dir.join(format!("s{i}.dcm")), buf).expect("write slice");
+        }
+        let result = load_dicos_directory(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(result, Err(dicos::error::DicosError::InvalidFile(ref m)) if m.contains("RescaleSlope")),
+            "expected mixed-slope rejection, got {result:?}"
+        );
+    }
+
+    /// A slice that fails pixel-representation validation fails the whole
+    /// directory load instead of being skipped (which would close the gap).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn directory_with_unsupported_middle_slice_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "roxel-bits-stored-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for (i, bits_stored) in [16u16, 12, 16].iter().enumerate() {
+            let mut ds = dataset_with_pixels(&[1], 16, true, "1", "0");
+            ds.put_u16(tag::BITS_STORED, Vr::US, *bits_stored);
+            ds.put_u16(tag::INSTANCE_NUMBER, Vr::IS, i as u16 + 1);
+            let mut buf = Vec::new();
+            dicos::write(&mut buf, &ds).expect("write should succeed");
+            std::fs::write(dir.join(format!("s{i}.dcm")), buf).expect("write slice");
+        }
+        let result = load_dicos_directory(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(result, Err(dicos::error::DicosError::InvalidFile(ref m)) if m.contains("BitsStored")),
+            "expected BitsStored rejection, got {result:?}"
+        );
+    }
+
+    /// A non-image file (e.g. a TDR) next to the slices must not drop the
+    /// stack out of IPP ordering: keys come only from contributing slices.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn directory_with_tdr_keeps_ipp_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "roxel-tdr-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Files a, b, c at z = 2, 0, 1 with InstanceNumber reversed (3, 2, 1).
+        for (name, z, instance) in [("a", 2u16, 3u16), ("b", 0, 2), ("c", 1, 1)] {
+            let mut ds = dataset_with_pixels(&[100 + z], 16, false, "1", "0");
+            ds.put_string(tag::IMAGE_POSITION_PATIENT, Vr::DS, format!("0\\0\\{z}"));
+            ds.put_u16(tag::INSTANCE_NUMBER, Vr::IS, instance);
+            let mut buf = Vec::new();
+            dicos::write(&mut buf, &ds).expect("write should succeed");
+            std::fs::write(dir.join(format!("{name}.dcm")), buf).expect("write slice");
+        }
+        // TDR-like file: parses, but has no pixel data or spatial tags.
+        let mut tdr = Dataset::new();
+        tdr.put_string(tag::MODALITY, Vr::CS, "OT");
+        // Rows=0 would fail volume validation if the file were not skipped.
+        tdr.put_u16(tag::ROWS, Vr::US, 0);
+        let mut buf = Vec::new();
+        dicos::write(&mut buf, &tdr).expect("write should succeed");
+        // Named to sort before the slices, so it would be the first entry.
+        std::fs::write(dir.join("000-tdr.dcs"), buf).expect("write tdr");
+
+        let result = load_dicos_directory(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let vol = result.expect("directory should load");
+        assert_eq!(
+            vol.data,
+            vec![100, 101, 102],
+            "slices must follow IPP z order"
+        );
+    }
+
+    /// The normal comes from the first slice that has IOP, even if earlier
+    /// slices lack it.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slice_sort_keys_use_first_available_orientation() {
+        let mk = |x: f32, iop: bool| {
+            let mut ds = Dataset::new();
+            ds.put_string(tag::IMAGE_POSITION_PATIENT, Vr::DS, format!("{x}\\0\\5"));
+            if iop {
+                ds.put_string(tag::IMAGE_ORIENTATION_PATIENT, Vr::DS, "0\\1\\0\\0\\0\\-1");
+            }
+            ds
+        };
+        let (a, b, c) = (mk(2.0, false), mk(1.0, true), mk(0.0, true));
+        assert_eq!(slice_sort_keys(&[&a, &b, &c]), vec![-2.0, -1.0, 0.0]);
     }
 }

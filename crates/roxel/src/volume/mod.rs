@@ -83,14 +83,17 @@ impl Volume {
         for (i, &v) in self.data.iter().enumerate() {
             let val = self.stored_sample(v);
             if val > threshold {
+                // Shift by a negative minimum so weights are never negative
+                // (signed data); unsigned data keeps its original weights.
+                let w = val - min_val.min(0.0);
                 let z = i / dxy;
                 let rem = i % dxy;
                 let y = rem / dx;
                 let x = rem % dx;
-                sum_x += x as f64 * val;
-                sum_y += y as f64 * val;
-                sum_z += z as f64 * val;
-                total_weight += val;
+                sum_x += x as f64 * w;
+                sum_y += y as f64 * w;
+                sum_z += z as f64 * w;
+                total_weight += w;
             }
         }
 
@@ -153,9 +156,18 @@ impl Volume {
         let stride_z = dx * dy;
         let data = &self.data;
         // Gradients use the signed stored value so a sample of -1 is not
-        // treated as 65535. The density channel keeps the raw bits for the
-        // shader, which applies the same signed interpretation and rescale.
+        // treated as 65535. The density channel must be monotonic in the
+        // stored value so the GPU's linear filter blends real values: signed
+        // samples are stored offset-binary (stored + 32768), which the shader
+        // undoes (see renderer::density_decode).
         let stored = |i: usize| self.stored_sample(data[i]) as f32;
+        let density = |raw: u16| {
+            if self.signed_pixels {
+                raw ^ 0x8000
+            } else {
+                raw
+            }
+        };
 
         for z in 0..dz {
             let z_base = z * stride_z;
@@ -208,7 +220,7 @@ impl Volume {
                         (stored(idx + stride_z) - stored(idx - stride_z)) * 0.5
                     };
 
-                    packed[pi] = data[idx];
+                    packed[pi] = density(data[idx]);
                     packed[pi + 1] = to_unorm16(gx * inv_range + 0.5);
                     packed[pi + 2] = to_unorm16(gy * inv_range + 0.5);
                     packed[pi + 3] = to_unorm16(gz * inv_range + 0.5);
@@ -350,5 +362,52 @@ mod tests {
         let gx = packed[5];
         let expected = ((2.0_f32 / 65535.0 + 0.5) * 65535.0).round() as u16;
         assert_eq!(gx, expected);
+    }
+
+    /// Signed density is offset-binary so the GPU's linear filter blends
+    /// real values: -1000 next to +40 must decode to about -480, not +32288.
+    #[test]
+    fn signed_density_is_offset_binary_and_filters_linearly() {
+        let mut vol = test_volume(1);
+        vol.dim_x = 2;
+        vol.data = vec![(-1000i16) as u16, 40];
+        vol.signed_pixels = true;
+        let packed = vol.pack_for_gpu();
+        let (a, b) = (f32::from(packed[0]), f32::from(packed[4]));
+        assert_eq!(a - 32768.0, -1000.0);
+        assert_eq!(b - 32768.0, 40.0);
+        // Hardware linear filtering of a unorm texture is an affine blend.
+        let midpoint = (a + b) * 0.5 - 32768.0;
+        assert_eq!(midpoint, -480.0);
+    }
+
+    /// Unsigned density keeps the raw stored bits.
+    #[test]
+    fn unsigned_density_is_unchanged() {
+        let mut vol = test_volume(1);
+        vol.data = vec![40000];
+        assert_eq!(vol.pack_for_gpu()[0], 40000);
+    }
+
+    /// Negative samples must not pull the centre of mass outside the volume.
+    #[test]
+    fn center_of_mass_with_negative_samples_stays_inside() {
+        let mut vol = test_volume(1);
+        vol.dim_x = 3;
+        vol.data = vec![(-100i16) as u16, (-2i16) as u16, 3];
+        vol.signed_pixels = true;
+        let c = vol.center_of_mass();
+        assert!((0.0..=1.0).contains(&c[0]), "centre outside volume: {c:?}");
+    }
+
+    /// Unsigned data with a nonzero baseline keeps its original weighting.
+    #[test]
+    fn center_of_mass_unsigned_weights_unchanged() {
+        let mut vol = test_volume(1);
+        vol.dim_x = 3;
+        vol.data = vec![1000, 1200, 2000];
+        // threshold = 1100, so voxels 1 and 2 count with weights 1200, 2000.
+        let expected = ((1.0 * 1200.0 + 2.0 * 2000.0) / 3200.0 / 3.0) as f32;
+        assert_eq!(vol.center_of_mass()[0], expected);
     }
 }

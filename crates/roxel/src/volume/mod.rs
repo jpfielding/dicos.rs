@@ -83,9 +83,9 @@ impl Volume {
         for (i, &v) in self.data.iter().enumerate() {
             let val = self.stored_sample(v);
             if val > threshold {
-                // Weight relative to the minimum so weights are never
-                // negative (signed data), keeping the centre inside the volume.
-                let w = val - min_val;
+                // Shift by a negative minimum so weights are never negative
+                // (signed data); unsigned data keeps its original weights.
+                let w = val - min_val.min(0.0);
                 let z = i / dxy;
                 let rem = i % dxy;
                 let y = rem / dx;
@@ -398,5 +398,16 @@ mod tests {
         vol.signed_pixels = true;
         let c = vol.center_of_mass();
         assert!((0.0..=1.0).contains(&c[0]), "centre outside volume: {c:?}");
+    }
+
+    /// Unsigned data with a nonzero baseline keeps its original weighting.
+    #[test]
+    fn center_of_mass_unsigned_weights_unchanged() {
+        let mut vol = test_volume(1);
+        vol.dim_x = 3;
+        vol.data = vec![1000, 1200, 2000];
+        // threshold = 1100, so voxels 1 and 2 count with weights 1200, 2000.
+        let expected = ((1.0 * 1200.0 + 2.0 * 2000.0) / 3200.0 / 3.0) as f32;
+        assert_eq!(vol.center_of_mass()[0], expected);
     }
 }

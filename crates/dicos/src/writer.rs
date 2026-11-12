@@ -927,9 +927,19 @@ mod tests {
 
             let mut buf = Vec::new();
             write(&mut buf, &ds).unwrap_or_else(|e| panic!("BitsAllocated {bits}: {e}"));
+            let buf_first = buf.clone();
             let rt = reader::parse(io::Cursor::new(buf)).expect("parse should succeed");
+            assert_eq!(
+                rt.pixel_data(),
+                Some(&PixelData::native(vec![vec![513, 1027]])),
+                "BitsAllocated {bits}: samples changed"
+            );
             let mut out = Vec::new();
             write(&mut out, &rt).unwrap_or_else(|e| panic!("rewrite {bits}: {e}"));
+            assert_eq!(
+                out, buf_first,
+                "BitsAllocated {bits}: bytes changed on rewrite"
+            );
         }
     }
 

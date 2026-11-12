@@ -153,7 +153,8 @@ impl App {
                 return true;
             }
         }
-        if response.consumed || self.ui.slice_expanded {
+        // The camera only answers input while the 3D view is on screen.
+        if response.consumed || !self.ui.volume_visible() {
             return true;
         }
 
@@ -215,7 +216,7 @@ impl App {
     /// `consumed` is computed, so the viewport rectangle (which never overlaps a
     /// panel) decides whether a gesture belongs to the camera.
     fn handle_touch(&mut self, touch: &winit::event::Touch) -> bool {
-        if self.ui.slice_expanded || !self.renderer.is_ready() {
+        if !self.ui.volume_visible() || !self.renderer.is_ready() {
             return false;
         }
         let scale = self.egui_ctx.pixels_per_point();
@@ -232,6 +233,9 @@ impl App {
         let gestures = self.touches.update(touch.id, phase, pos, inside);
         for gesture in &gestures {
             match *gesture {
+                // "Pan" on the Camera page hands the one-finger drag to panning,
+                // so nothing needs two fingers.
+                Gesture::Orbit { dx, dy } if self.ui.drag_pans => self.ui.camera.pan_pixels(dx, dy),
                 Gesture::Orbit { dx, dy } => self.ui.camera.rotate(dx * 0.005, -dy * 0.005),
                 Gesture::Pan { dx, dy } => self.ui.camera.pan_pixels(dx, dy),
                 Gesture::Zoom(factor) => self.ui.camera.zoom(factor),
@@ -395,44 +399,46 @@ impl App {
             .map(|layer| layer.volume.threats.as_slice())
             .unwrap_or(&[]);
 
-        // Render 3D volume.
-        self.renderer.render(
-            &self.queue,
-            &mut encoder,
-            surface_view,
-            RenderParams {
-                camera: &self.ui.camera,
-                viewport: [
-                    self.ui.viewport.width().max(1.0) as u32,
-                    self.ui.viewport.height().max(1.0) as u32,
-                ],
-                viewport_rect: Some([
-                    self.ui.viewport.left() * full_output.pixels_per_point,
-                    self.ui.viewport.top() * full_output.pixels_per_point,
-                    self.ui.viewport.width().max(1.0) * full_output.pixels_per_point,
-                    self.ui.viewport.height().max(1.0) * full_output.pixels_per_point,
-                ]),
-                clip_plane: if self.ui.cutaway
-                    && !self.ui.slice_view.composite
-                    && self.ui.library.active_3d_index == Some(self.ui.slice_view.volume_index)
-                {
-                    self.ui
-                        .library
-                        .volumes
-                        .get(self.ui.slice_view.volume_index)
-                        .map(|layer| {
-                            self.ui
-                                .slice_view
-                                .clip_plane(&layer.volume, self.ui.reverse_cutaway)
-                        })
-                } else {
-                    None
+        // Render the 3D volume, unless the 2D slice or a page covers its area.
+        if self.ui.volume_visible() {
+            self.renderer.render(
+                &self.queue,
+                &mut encoder,
+                surface_view,
+                RenderParams {
+                    camera: &self.ui.camera,
+                    viewport: [
+                        self.ui.viewport.width().max(1.0) as u32,
+                        self.ui.viewport.height().max(1.0) as u32,
+                    ],
+                    viewport_rect: Some([
+                        self.ui.viewport.left() * full_output.pixels_per_point,
+                        self.ui.viewport.top() * full_output.pixels_per_point,
+                        self.ui.viewport.width().max(1.0) * full_output.pixels_per_point,
+                        self.ui.viewport.height().max(1.0) * full_output.pixels_per_point,
+                    ]),
+                    clip_plane: if self.ui.cutaway
+                        && !self.ui.slice_view.composite
+                        && self.ui.library.active_3d_index == Some(self.ui.slice_view.volume_index)
+                    {
+                        self.ui
+                            .library
+                            .volumes
+                            .get(self.ui.slice_view.volume_index)
+                            .map(|layer| {
+                                self.ui
+                                    .slice_view
+                                    .clip_plane(&layer.volume, self.ui.reverse_cutaway)
+                            })
+                    } else {
+                        None
+                    },
+                    threats: active_3d_threats,
+                    show_threats: self.ui.library.show_threats,
+                    settings: &self.ui.settings,
                 },
-                threats: active_3d_threats,
-                show_threats: self.ui.library.show_threats,
-                settings: &self.ui.settings,
-            },
-        );
+            );
+        }
 
         self.egui_renderer.update_buffers(
             &self.device,
@@ -552,6 +558,11 @@ impl App {
         }
 
         self.ui.library.loaded_path = Some(path);
+        // A newly opened study starts on the 3D view with its controls open
+        // (phone layouts would otherwise stay on the Study page).
+        self.ui.phone_tab = crate::ui::layout::PhoneTab::View3d;
+        self.ui.sheet_open = true;
+        self.ui.bands_open = false;
         self.activate_volumes(first_pack);
         self.log_threat_status();
     }

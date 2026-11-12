@@ -18,7 +18,7 @@ use crate::loader::LoadSource;
 use crate::renderer::Quality;
 use crate::slice_view::SliceView;
 use crate::transfer::{self, ColorBand, TransferPreset};
-use crate::ui::layout::{Layout, PhoneTab};
+use crate::ui::layout::{Layout, PhoneTab, SlicePage, VolumePage};
 
 use std::path::PathBuf;
 use web_time::Instant;
@@ -32,17 +32,28 @@ pub(crate) struct UiState {
     pub(crate) show_slice_locator: bool,
     pub(crate) cutaway: bool,
     pub(crate) reverse_cutaway: bool,
+    /// "Focus slice": the 2D slice fills the workspace.
     pub(crate) slice_expanded: bool,
-    pub(crate) expanded_zoom: f32,
+    /// "Focus volume": the 3D view fills the workspace.
     pub(crate) focus_volume: bool,
     /// Layout chosen from the available logical size (refreshed every frame).
     pub(crate) layout: Layout,
-    /// Compact layouts: the tab shown in the sheet / side panel.
+    /// Compact layouts: the selected tab.
     pub(crate) phone_tab: PhoneTab,
-    /// Portrait layout: whether the sheet above the tab bar is open.
+    /// Compact layouts: whether the selected view's controls sheet is open.
     pub(crate) sheet_open: bool,
-    /// Compact focus mode: whether the display adjustments sheet is open.
+    /// Compact focus modes: whether the controls sheet is open.
     pub(crate) focus_adjust_open: bool,
+    /// Compact layouts: the page of the 3D controls sheet.
+    pub(crate) volume_page: VolumePage,
+    /// Compact layouts: the page of the 2D controls sheet.
+    pub(crate) slice_page: SlicePage,
+    /// Compact layouts: the material-band editor replaces the Display page.
+    pub(crate) bands_open: bool,
+    /// Compact layouts: the band whose opacity the editor shows.
+    pub(crate) selected_band: usize,
+    /// Touch: a one-finger drag (and the arrow buttons) pan instead of orbit.
+    pub(crate) drag_pans: bool,
 
     /// Loaded volume layers and threat selection state.
     pub(crate) library: VolumeLibrary,
@@ -76,6 +87,15 @@ impl UiState {
         }
     }
 
+    /// Whether the 3D volume is on screen: the central area belongs to it
+    /// unless the 2D slice or a compact page has taken that area over.
+    pub(crate) fn volume_visible(&self) -> bool {
+        if self.library.volumes.is_empty() || self.slice_expanded {
+            return false;
+        }
+        !self.layout.is_compact() || self.focus_volume || self.phone_tab == PhoneTab::View3d
+    }
+
     /// Build the initial UI state around a freshly configured camera.
     pub(crate) fn new(camera: Camera) -> Self {
         Self {
@@ -87,12 +107,16 @@ impl UiState {
             cutaway: false,
             reverse_cutaway: false,
             slice_expanded: false,
-            expanded_zoom: 100.0,
             focus_volume: false,
             layout: Layout::Desktop,
             phone_tab: PhoneTab::Slice,
             sheet_open: true,
             focus_adjust_open: false,
+            volume_page: VolumePage::Camera,
+            slice_page: SlicePage::Slice,
+            bands_open: false,
+            selected_band: 1,
+            drag_pans: false,
             library: VolumeLibrary::default(),
             transfer: TransferState::default(),
             settings: RenderSettings::default(),

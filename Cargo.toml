@@ -56,7 +56,7 @@ wgpu = "27"
 winit = "0.30"
 egui = "0.33"
 egui-wgpu = { version = "0.33", features = ["winit"] }
-egui-winit = "0.33"
+egui-winit = { version = "0.33", default-features = false }
 glam = "0.29"
 pollster = "0.4"
 rfd = "0.15"
